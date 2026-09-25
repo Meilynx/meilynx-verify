@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.2.0 (2026-09-25)
+
+- `verify-pack.py` from meilynx-proxy `5e8a9cb`.
+- Chain `schema_version` v1.10 (`llm_request` with content attestation): the v1.9 layout plus six `content` fields (SPEC §4.3, §4.4).
+- Stored-content check: on every v1.10 record, the stored prompt, response and findings digests are recomputed from the record itself, so a record whose content was edited after sealing fails verification even though that content is outside the hash.
+- RFC 8785 (JCS) canonical JSON in the standard library only, with ECMAScript number form.
+- `--self-test` assertions 19a–19g: v1.10 fixture hashes, the production recompute path, fail-closed version guards, content digests paired with the proxy, offline tamper detection.
+- SPEC §8 states what v1.10 still leaves unbound, and that `redacted` masks only what a detector located.
+
 ## 0.1.0 (2026-09-25)
 
 First public release.

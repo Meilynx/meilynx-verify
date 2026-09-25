@@ -673,6 +673,149 @@ def compute_event_hash_v1_9_mcp(
     return h.hexdigest()
 
 
+# ---------------------------------------------------------------------------
+# MEI-2424 — RFC 8785 (JCS) canonical JSON, for the v1.10 content digests.
+#
+# The proxy computes `stored_prompt_sha256_jcs` / `findings_sha256_jcs` with
+# serde_jcs over the record's own `messages` / `findings`. Recomputing them
+# here is what lets this reproducer check that the content a record carries
+# is the content it was sealed over. JCS is not "sorted keys, compact": keys
+# sort by UTF-16 code units and numbers use the ECMAScript form (1.0 -> 1,
+# 1e-7 -> 1e-7, 1e21 -> 1e+21), which is where a naive json.dumps diverges.
+# ---------------------------------------------------------------------------
+
+def _jcs_number(x):
+    if isinstance(x, bool):
+        raise ValueError('JCS: bool is not a number')
+    if isinstance(x, int):
+        if abs(x) < 2 ** 53:
+            return str(x)
+        x = float(x)
+    if x != x or x in (float('inf'), float('-inf')):
+        raise ValueError('JCS: NaN and infinities are not representable')
+    if x == 0:
+        return '0'
+    sign = '-' if x < 0 else ''
+    r = repr(abs(x))  # shortest round-trip digits, as ECMAScript uses
+    mant, _, exp = r.partition('e')
+    exp = int(exp) if exp else 0
+    ip, _, fp = mant.partition('.')
+    ip = ip.lstrip('0')
+    if ip:
+        n = len(ip) + exp
+        digits = (ip + fp).rstrip('0')
+    else:
+        stripped = fp.lstrip('0')
+        n = exp - (len(fp) - len(stripped))
+        digits = stripped.rstrip('0')
+    k = len(digits)
+    if k <= n <= 21:
+        out = digits + '0' * (n - k)
+    elif 0 < n <= 21:
+        out = digits[:n] + '.' + digits[n:]
+    elif -6 < n <= 0:
+        out = '0.' + '0' * (-n) + digits
+    else:
+        e = n - 1
+        out = digits[0] + ('.' + digits[1:] if k > 1 else '') + 'e' + ('+' if e >= 0 else '-') + str(abs(e))
+    return sign + out
+
+
+def jcs_dumps(value):
+    """RFC 8785 canonical form of a JSON value parsed by the json module."""
+    if value is None:
+        return 'null'
+    if value is True:
+        return 'true'
+    if value is False:
+        return 'false'
+    if isinstance(value, (int, float)):
+        return _jcs_number(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return '[' + ','.join(jcs_dumps(v) for v in value) + ']'
+    if isinstance(value, dict):
+        keys = sorted(value.keys(), key=lambda k: k.encode('utf-16-be'))
+        return '{' + ','.join(json.dumps(k, ensure_ascii=False) + ':' + jcs_dumps(value[k]) for k in keys) + '}'
+    raise ValueError(f'JCS: unsupported type {type(value).__name__}')
+
+
+def sha256_jcs(value):
+    return hashlib.sha256(jcs_dumps(value).encode('utf-8')).hexdigest()
+
+
+def compute_event_hash_v1_10_llm_request(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    join_context, content,
+):
+    """MEI-2424 — v1.10 llm_request hash: the v1.9 layout (v1.2 prefix + kind
+    + the three join keys, fed with presence tags even when no join key was
+    asserted) followed by the six content-attestation fields in
+    `LlmContentFields::HASH_FEED_ORDER`. `capture_policy` is a required
+    string; the five digests are optional strings. Mirror of
+    `compute_event_hash_v1_10_llm_request` in sqlite.rs.
+
+    The prompt, response and findings stay outside the preimage; their
+    digests are inside it. `check_llm_content` closes the loop by
+    recomputing the stored digests from the record's own content."""
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_LLM_REQUEST.encode('utf-8'))
+    join = join_context or {}
+    h.update(encode_optional_str(join.get('correlation_id')))
+    h.update(encode_optional_str(join.get('session_id')))
+    h.update(encode_optional_str(join.get('agent_name')))
+    h.update(content['capture_policy'].encode('utf-8'))
+    h.update(encode_optional_str(content.get('prompt_sha256_jcs')))
+    h.update(encode_optional_str(content.get('response_sha256')))
+    h.update(encode_optional_str(content.get('stored_prompt_sha256_jcs')))
+    h.update(encode_optional_str(content.get('stored_response_sha256')))
+    h.update(encode_optional_str(content.get('findings_sha256_jcs')))
+    return h.hexdigest()
+
+
+def check_llm_content(event):
+    """MEI-2424 — for a v1.10 record, check that the content it carries is the
+    content it was sealed over: the stored-prompt, stored-response and
+    findings digests (all inside the hash) must match the record's own
+    `messages`, `response_text` and `findings`. A digest that is absent means
+    nothing was retained, so the record must carry no content on that axis.
+    Returns a list of problems; empty means the content checks out. Records
+    on older schema versions carry no digests and return no problems."""
+    if (event.get('schema_version') or 'v1') != 'v1.10':
+        return []
+    content = event.get('content')
+    if not isinstance(content, dict):
+        return ['v1.10 record has no content payload']
+    problems = []
+    messages = event.get('messages') or []
+    stored_prompt = content.get('stored_prompt_sha256_jcs')
+    if stored_prompt is not None:
+        if sha256_jcs(messages) != stored_prompt:
+            problems.append('messages do not match stored_prompt_sha256_jcs (the prompt was changed after sealing)')
+    elif messages:
+        problems.append('messages present but no stored_prompt_sha256_jcs was sealed')
+    response_text = event.get('response_text')
+    stored_response = content.get('stored_response_sha256')
+    if stored_response is not None:
+        if response_text is None or hashlib.sha256(response_text.encode('utf-8')).hexdigest() != stored_response:
+            problems.append('response_text does not match stored_response_sha256 (the response was changed after sealing)')
+    elif response_text is not None:
+        problems.append('response_text present but no stored_response_sha256 was sealed')
+    findings_digest = content.get('findings_sha256_jcs')
+    if findings_digest is not None and sha256_jcs(event.get('findings') or []) != findings_digest:
+        problems.append('findings do not match findings_sha256_jcs (the findings were changed after sealing)')
+    return problems
+
+
 def compute_event_hash_dispatch(
     schema_version,
     sequence_number, timestamp_utc, event_id, request_id,
@@ -680,7 +823,7 @@ def compute_event_hash_dispatch(
     total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     event_kind=EVENT_KIND_LLM_REQUEST, auth_session=None, admin_action=None,
-    mcp_event=None, coverage=None, join_context=None,
+    mcp_event=None, coverage=None, join_context=None, content=None,
 ):
     """MEI-639 — Python mirror of compute_event_hash_dispatch in sqlite.rs.
 
@@ -694,10 +837,17 @@ def compute_event_hash_dispatch(
     # contains it. An event carrying join_context on an older schema_version
     # would be presenting an UNHASHED join key as evidence — rewritable after
     # the fact without breaking the chain.
-    if join_context is not None and schema_version != 'v1.9':
+    # MEI-2424 — the same rule for the content attestation: its digests are
+    # hashed only in the v1.10 bucket.
+    if content is not None and schema_version != 'v1.10':
+        raise ValueError(
+            f"MEI-2424: content attestation present on a {schema_version!r} event — "
+            f"content digests are hashed only in the v1.10 bucket."
+        )
+    if join_context is not None and schema_version not in ('v1.9', 'v1.10'):
         raise ValueError(
             f"MEI-2151: join_context present on a {schema_version!r} event — "
-            f"caller-asserted join keys are hashed only in the v1.9 bucket."
+            f"caller-asserted join keys are hashed only in the v1.9 and v1.10 buckets."
         )
     if schema_version in ('v1', 'v1.1'):
         return compute_event_hash(
@@ -883,6 +1033,27 @@ def compute_event_hash_dispatch(
         raise ValueError(
             f"MEI-2151: schema_version v1.9 is defined only for llm_request "
             f"and mcp.* events; got event_kind {event_kind!r}"
+        )
+    if schema_version == 'v1.10':
+        # MEI-2424 — llm_request sealed under a declared capture policy. The
+        # join keys are optional here (presence-tagged either way).
+        if content is None:
+            raise ValueError(
+                "MEI-2424: schema_version v1.10 requires a content payload; an "
+                "LLM event sealed with no capture policy must stay in its "
+                "pre-v1.10 bucket."
+            )
+        if event_kind != EVENT_KIND_LLM_REQUEST:
+            raise ValueError(
+                f"MEI-2424: schema_version v1.10 is defined only for llm_request "
+                f"events; got event_kind {event_kind!r}"
+            )
+        return compute_event_hash_v1_10_llm_request(
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            join_context, content,
         )
     raise ValueError(
         f"MEI-639: unknown schema_version {schema_version!r} — "
@@ -1635,6 +1806,38 @@ _V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD = dict(
 V1_9_LLM_REQUEST_FIXTURE_HASH = "7b48689b1658d27c27e149d182297cfd10a168769e50097a482e7dbebbefaf0a"
 V1_9_MCP_TOOL_CALL_FIXTURE_HASH = "d6a68730a4ad2aa3e2ddb8c1534e1f22ff4a5b99a0bce678fdfd5bc12d0e2a14"
 
+# MEI-2424 — v1.10 llm_request fixtures. Paired with
+# meilynx-audit/tests/mei2424_content_chain_round_trip.rs; neither side may
+# drift independently. The stored response digest is deliberately absent so
+# the pin covers its presence tag.
+_V1_10_CONTENT_FIXTURE_PAYLOAD = dict(
+    capture_policy='redacted',
+    prompt_sha256_jcs='1' * 64,
+    response_sha256='2' * 64,
+    stored_prompt_sha256_jcs='3' * 64,
+    findings_sha256_jcs='5' * 64,
+)
+V1_10_LLM_REQUEST_FIXTURE_HASH = "e6a655927bfc7e6933aa020de625e3459cd4ce1158dc26c2d564eed923c7eb43"
+V1_10_LLM_REQUEST_JOIN_FIXTURE_HASH = "86b2ab42b6c2cb7b28c750de2d3466210509bcda0ace58fc3340db0d1587214e"
+
+# MEI-2424 — content-digest fixtures. Paired with
+# meilynx-proxy/src/audit_capture.rs::content_digests_are_pinned_for_the_verifier:
+# the record's `messages` / `response_text` / `findings` exactly as the proxy
+# serializes them, and the digests the proxy seals over them.
+_V1_10_DIGEST_FIXTURE_RECORD = {
+    'messages': [{'role': 'user', 'content': 'R\u00e9sum\u00e9 for client caf\u00e9, SSN 123-45-6789.'}],
+    'response_text': 'Noted.',
+    # Parsed from the proxy's exact serialization: `score` is written 1.0 and
+    # must canonicalize to 1 (the ES6 number rule a naive dump gets wrong).
+    'findings': json.loads(
+        '[{"validator":"pii-detection","severity":"high","message":"SSN detected",'
+        '"code":"pii-ssn","category":"pii","latency_ms":0,"locus":"user","score":1.0}]'
+    ),
+}
+V1_10_DIGEST_FIXTURE_PROMPT = "ba5adc603cb95f7951ed1e2bfb3de1b66d9eeb232ff94af907fa933ff03260f6"
+V1_10_DIGEST_FIXTURE_RESPONSE = "ad49d1a5366d1125bfd9a017997b7a28a9de6c669288ec46d42eab12351ecc05"
+V1_10_DIGEST_FIXTURE_FINDINGS = "c39486077115ab8f01410a60ab472c0e7b6e948a59950b4a98d1be5b9b44111b"
+
 _V1_2_AUTH_FIXTURE_PAYLOAD = dict(
     user_email="cassio@meilynx.com",
     user_id="9382725d-3bc4-4c88-9655-3f743b0e13f9",
@@ -1707,6 +1910,7 @@ def recompute_event_hash(event, seq, previous_hash):
         mcp_event=event.get('mcp_event'),
         coverage=event.get('coverage'),
         join_context=event.get('join_context'),
+        content=event.get('content'),
     )
 
 
@@ -1855,6 +2059,12 @@ def verify_manifest_with(fetch, manifest, quiet=False):
         hash_ok = (recomputed == stored_hash)
         chain_ok = (stored_prev == expected_prev_hash)
 
+        # MEI-2424 — a v1.10 record's hash covers the digests of its content;
+        # this checks the content itself still matches them.
+        for problem in check_llm_content(event):
+            report(f"FAIL seq={seq}: {problem}")
+            all_passed = False
+
         manifest_recomputed = entry.get('recomputed_event_hash', '')
         if manifest_recomputed and recomputed != manifest_recomputed:
             report(
@@ -1965,6 +2175,116 @@ def offline_self_test():
     return ok
 
 
+def content_self_test():
+    """MEI-2424 — the v1.10 content attestation: fixture hashes paired with the
+    Rust tests, the production recompute path, the fail-closed dispatcher
+    guards, the JCS digests paired with the proxy's sealer, and the offline
+    content check (a record whose prompt was edited after sealing fails even
+    though its hash still verifies)."""
+    import tempfile
+
+    ok = True
+
+    def check(label, passed, detail=''):
+        nonlocal ok
+        print(f"SELF-TEST assertion {label} {'PASS' if passed else 'FAIL'}{': ' + detail if detail else ''}")
+        ok = ok and passed
+
+    # 19a / 19b — direct fn, without and with a join key.
+    got = compute_event_hash_v1_10_llm_request(
+        timestamp_utc="2026-05-17T00:00:00+00:00", join_context=None,
+        content=_V1_10_CONTENT_FIXTURE_PAYLOAD, **_FIXTURE,
+    )
+    check('19a', got == V1_10_LLM_REQUEST_FIXTURE_HASH, 'v1.10 llm_request fixture hash matches')
+    got = compute_event_hash_v1_10_llm_request(
+        timestamp_utc="2026-05-17T00:00:00+00:00", join_context=_V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD,
+        content=_V1_10_CONTENT_FIXTURE_PAYLOAD, **_FIXTURE,
+    )
+    check('19b', got == V1_10_LLM_REQUEST_JOIN_FIXTURE_HASH, 'v1.10 llm_request fixture hash (with join) matches')
+
+    # 19c — the production recompute path.
+    event = dict(
+        schema_version='v1.10', timestamp_utc='2026-05-17T00:00:00Z',
+        event_id=_FIXTURE['event_id'], request_id=_FIXTURE['request_id'],
+        model_requested=_FIXTURE['model_requested'], action=_FIXTURE['action'],
+        input_tokens=_FIXTURE['input_tokens'], output_tokens=_FIXTURE['output_tokens'],
+        total_tokens=_FIXTURE['total_tokens'], estimated_cost_usd=_FIXTURE['estimated_cost_usd'],
+        content=dict(_V1_10_CONTENT_FIXTURE_PAYLOAD),
+    )
+    got = recompute_event_hash(event, _FIXTURE['sequence_number'], _FIXTURE['previous_hash'])
+    check('19c', got == V1_10_LLM_REQUEST_FIXTURE_HASH, 'verify_manifest recompute path handles v1.10 llm_request')
+
+    # 19d — fail closed: content outside v1.10, and v1.10 without content.
+    rejected = True
+    for stale in ('v1', 'v1.1', 'v1.2', 'v1.9'):
+        try:
+            compute_event_hash_dispatch(
+                stale, 42, '2026-05-17T00:00:00+00:00', 'e', 'r', 'm', 'Allow', 0, 0,
+                None, None, None, None, None, None, 'prev',
+                join_context=_V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD if stale == 'v1.9' else None,
+                content=_V1_10_CONTENT_FIXTURE_PAYLOAD,
+            )
+            rejected = False
+        except ValueError:
+            pass
+    try:
+        compute_event_hash_dispatch(
+            'v1.10', 42, '2026-05-17T00:00:00+00:00', 'e', 'r', 'm', 'Allow', 0, 0,
+            None, None, None, None, None, None, 'prev',
+        )
+        rejected = False
+    except ValueError:
+        pass
+    check('19d', rejected, 'content outside v1.10, and v1.10 without content, are rejected')
+
+    # 19e — the JCS digests match the proxy's sealer on the same record.
+    rec = _V1_10_DIGEST_FIXTURE_RECORD
+    digests_ok = (
+        sha256_jcs(rec['messages']) == V1_10_DIGEST_FIXTURE_PROMPT
+        and hashlib.sha256(rec['response_text'].encode('utf-8')).hexdigest() == V1_10_DIGEST_FIXTURE_RESPONSE
+        and sha256_jcs(rec['findings']) == V1_10_DIGEST_FIXTURE_FINDINGS
+    )
+    check('19e', digests_ok, 'JCS content digests match the proxy sealer')
+
+    # 19f / 19g — offline: a sealed v1.10 record verifies; the same record with
+    # its prompt edited after sealing still hash-verifies (the prompt is
+    # outside the preimage) but fails the content check.
+    genesis = genesis_hash()
+    sealed = dict(
+        schema_version='v1.10', sequence_number=0, timestamp_utc='2026-01-01T00:00:00+00:00',
+        event_id='evt-0', request_id='req-0', model_requested='gpt-4.1-mini', action='Block',
+        input_tokens=11, output_tokens=0, estimated_cost_usd=None, previous_hash=genesis,
+        messages=rec['messages'], response_text=rec['response_text'], findings=rec['findings'],
+        content=dict(
+            capture_policy='full',
+            prompt_sha256_jcs=V1_10_DIGEST_FIXTURE_PROMPT,
+            response_sha256=V1_10_DIGEST_FIXTURE_RESPONSE,
+            stored_prompt_sha256_jcs=V1_10_DIGEST_FIXTURE_PROMPT,
+            stored_response_sha256=V1_10_DIGEST_FIXTURE_RESPONSE,
+            findings_sha256_jcs=V1_10_DIGEST_FIXTURE_FINDINGS,
+        ),
+    )
+    sealed['event_hash'] = recompute_event_hash(sealed, 0, genesis)
+    manifest = {'hash_version': 'v1', 'prefix': 'audit/self-test/',
+                'events': [{'sequence': 0, 'recomputed_event_hash': sealed['event_hash']}]}
+    with tempfile.TemporaryDirectory() as tmp:
+        records = Path(tmp) / 'records'
+        records.mkdir()
+        path = records / record_file_name(0)
+        path.write_bytes(json.dumps(sealed).encode('utf-8'))
+        check('19f', verify_manifest_with(local_fetcher(records), manifest, quiet=True),
+              'offline verification passes a sealed v1.10 record')
+        edited = json.loads(json.dumps(sealed))
+        edited['messages'][0]['content'] = edited['messages'][0]['content'].replace('123-45-6789', '[PII:ssn]')
+        path.write_bytes(json.dumps(edited).encode('utf-8'))
+        still_hashes = recompute_event_hash(edited, 0, genesis) == sealed['event_hash']
+        detected = not verify_manifest_with(local_fetcher(records), manifest, quiet=True)
+        check('19g', still_hashes and detected,
+              'a prompt edited after sealing is detected by the content check')
+
+    return ok
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -2006,6 +2326,7 @@ def main():
     if args.self_test:
         ok = run_self_test()
         ok = offline_self_test() and ok
+        ok = content_self_test() and ok
         sys.exit(0 if ok else 1)
 
     if not (args.bucket or args.records) or not args.manifest:
