@@ -5,9 +5,9 @@ enough that a verifier can be written from it without reading Meilynx code.
 `verify-pack.py` in this repository is one such verifier; its `--self-test`
 pins the values below against fixture hashes.
 
-Status: describes chain records with `schema_version` v1 through v1.9 and
+Status: describes chain records with `schema_version` v1 through v1.10 and
 pack manifest `schema_version` 1.0, as produced by meilynx-proxy at commit
-`df7c422` (2026-09-25).
+`5e8a9cb` (2026-09-25).
 
 ## 1. Records
 
@@ -29,7 +29,7 @@ Every record carries at least these fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.9"`). Absent means `"v1"`. |
+| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.10"`). Absent means `"v1"`. |
 | `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`). Absent means `llm_request`. |
 | `sequence_number` | integer | Position in the chain, starting at 0. |
 | `timestamp_utc` | string | RFC 3339 UTC timestamp, nanosecond precision, `Z` suffix. |
@@ -44,10 +44,11 @@ Every record carries at least these fields:
 | `event_hash` | string | Hex SHA-256 of this record's preimage (§3). |
 
 Kind-specific payloads live under `admin_action`, `auth_session`,
-`mcp_event`, `coverage`, and `join_context`. LLM records also carry
+`mcp_event`, `coverage`, `join_context` and `content`. LLM records also carry
 `messages`, `response_text`, `findings`, `policy_version`,
 `raw_request`/`raw_response` and routing metadata; **only the fields listed
-in the preimage tables (§4) are covered by `event_hash`**.
+in the preimage tables (§4) are covered by `event_hash`**. From v1.10 the
+content of an LLM record is bound through digests (§4.4).
 
 ## 2. Chain linkage and genesis
 
@@ -183,15 +184,66 @@ verification.
 **v1.9 MCP kinds** — v1.7 fields, then the three `join_context` fields as
 above. 38 fields.
 
+**v1.10 `llm_request`** — the three `join_context` fields as in v1.9 (each
+presence-tagged; a v1.10 record need not carry `join_context`, in which case
+all three are fed as absent), then from `content`: `capture_policy`
+(string), `prompt_sha256_jcs`, `response_sha256`,
+`stored_prompt_sha256_jcs`, `stored_response_sha256`,
+`findings_sha256_jcs` (all optional strings). 25 fields. A record carries
+`content` only when the proxy's policy declared a capture policy; a
+`content` payload on any other version, or a v1.10 record without one, is
+invalid and fails verification.
+
 MCP kinds are: `mcp.tool_call`, `mcp.policy_decision`, `mcp.tool_result`,
 `mcp.tools_list.served`, `mcp.error`, `mcp.catalog_drift`. Any MCP hasher
 called with a non-MCP kind is an error.
 
 `*_sha256_jcs` values are hex SHA-256 digests over the JSON Canonicalization
-Scheme (RFC 8785) serialization of the payload in question. The verifier
-checks that the digest string is what the record hashed; it does not
-recompute the digest from a payload, because the payload is not part of the
-record.
+Scheme (RFC 8785) serialization of the payload in question. For MCP records
+the verifier checks that the digest string is what the record hashed; it does
+not recompute the digest from a payload, because the payload is not part of
+the record. For v1.10 LLM records it also recomputes the stored-content
+digests (§4.4).
+
+### 4.4 LLM content attestation (v1.10)
+
+`capture_policy` names what the record retains:
+
+- `full`: the prompt and response as captured.
+- `redacted`: the prompt and response with every span a detector located
+  replaced by its placeholder; raw request/response copies are dropped, and
+  tool-call inputs in the response are set to `null`. If the masking cannot
+  be applied, that side is not retained at all.
+- `hash_only`: no prompt, response or tool-call content; digests only.
+
+The six `content` fields:
+
+| Field | Digest of |
+|---|---|
+| `prompt_sha256_jcs` | JCS of the message list as captured, before the policy |
+| `response_sha256` | UTF-8 bytes of the response text as captured; absent when there was no response (a block, a provider error) |
+| `stored_prompt_sha256_jcs` | JCS of the record's own `messages`; absent when no prompt was retained |
+| `stored_response_sha256` | UTF-8 bytes of the record's own `response_text`; absent when no response was retained |
+| `findings_sha256_jcs` | JCS of the record's own `findings` |
+
+Because the digests are in the preimage and the content they describe is in
+the record, a verifier checks, for every v1.10 record:
+
+1. `stored_prompt_sha256_jcs`, when present, equals SHA-256(JCS(`messages`));
+   when absent, `messages` is empty.
+2. `stored_response_sha256`, when present, equals SHA-256(`response_text`);
+   when absent, `response_text` is absent.
+3. `findings_sha256_jcs`, when present, equals SHA-256(JCS(`findings`)).
+
+A record whose content was edited after sealing still hash-verifies (the
+content is outside the preimage) and fails these checks. `prompt_sha256_jcs`
+and `response_sha256` cover content the record may no longer hold: whoever
+holds the original can show it is what the record was sealed over.
+
+JCS follows RFC 8785: object keys sorted by UTF-16 code units, no
+whitespace, strings escaped as in RFC 8785 §3.2.2.2, numbers in ECMAScript
+form (`1.0` → `1`, `1e-7` → `1e-7`, `1e21` → `1e+21`). A plain sorted-keys
+JSON dump differs on numbers and must not be used.
 
 ## 5. Reference values
 
@@ -291,9 +343,15 @@ and a reviewer should run both.
 - **Completeness.** The chain proves that the records it contains are intact
   and in order. It cannot show that an interaction which never reached the
   proxy was recorded.
-- **Unhashed fields.** For LLM records, `messages`, `response_text`,
-  `findings`, `raw_request`, `raw_response` and routing metadata are stored
-  in the record but not in the preimage. For MCP records the payload is
-  bound through its digest fields.
+- **Unhashed fields.** For LLM records before v1.10, `messages`,
+  `response_text`, `findings`, `raw_request`, `raw_response` and routing
+  metadata are stored in the record but not in the preimage. From v1.10 the
+  prompt, response and findings are bound through their digests (§4.4);
+  `raw_request`, `raw_response`, response tool calls and routing metadata
+  remain unbound. For MCP records the payload is bound through its digest
+  fields.
+- **Whether a detector missed something.** Under `redacted`, only spans a
+  detector located are masked. The stored copy can still contain sensitive
+  text no detector recognized.
 - **Authorship of the chain.** Only a signed pack (§7) binds an identity to
   a window.
