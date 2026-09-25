@@ -1,0 +1,39 @@
+name: verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  self-test-and-fixtures:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.9", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Self-test (pinned fixture hashes + offline path)
+        run: python verify-pack.py --self-test
+      - name: Verify the shipped fixture chain offline
+        run: python verify-pack.py --records fixtures/records --manifest fixtures/manifest.json
+      - name: A tampered record must fail
+        run: |
+          cp -r fixtures/records /tmp/records
+          python - <<'EOF'
+          import json
+          p = '/tmp/records/00000000000000000001.bin'
+          d = json.load(open(p)); d['input_tokens'] += 1
+          json.dump(d, open(p, 'w'))
+          EOF
+          if python verify-pack.py --records /tmp/records --manifest fixtures/manifest.json; then
+            echo "tampered chain verified — verifier is broken" >&2; exit 1
+          fi
+      - name: Fixtures were generated from this verifier
+        run: |
+          python fixtures/generate.py --out /tmp/regen
+          diff -r /tmp/regen fixtures/records
+          diff /tmp/regen.manifest.json fixtures/manifest.json

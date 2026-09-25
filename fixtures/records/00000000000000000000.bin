@@ -1,0 +1,24 @@
+{
+ "schema_version": "v1.3",
+ "event_kind": "admin_action",
+ "sequence_number": 0,
+ "timestamp_utc": "2026-09-01T09:00:00.000000000Z",
+ "event_id": "00000000-0000-4000-8000-000000000000",
+ "request_id": "00000000-0000-4000-8000-000000000000",
+ "model_requested": "",
+ "action": "allow",
+ "input_tokens": 0,
+ "output_tokens": 0,
+ "estimated_cost_usd": null,
+ "findings": [],
+ "messages": [],
+ "response_text": null,
+ "admin_action": {
+  "action_type": "proxy_startup",
+  "actor": "system:pid:1",
+  "description": "Proxy server started",
+  "metadata_json": "{\"proxy_version\":\"fixture\"}"
+ },
+ "previous_hash": "c2989403cf897daccd825cc41377b804343c5a4851eac1daf32b58eb1fa4edf8",
+ "event_hash": "11392f69b86436027ae3c6781d35498d3d7aba0afdc9831bdb4d3eef1a0fd320"
+}

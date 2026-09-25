@@ -1,0 +1,36 @@
+{
+ "schema_version": "v1.1",
+ "sequence_number": 2,
+ "timestamp_utc": "2026-09-01T09:00:09.000000000Z",
+ "event_id": "00000000-0000-4000-8000-000000000002",
+ "request_id": "22222222-2222-4222-8222-222222222222",
+ "model_requested": "gpt-4.1-mini",
+ "model_executed": null,
+ "provider": null,
+ "workflow": "advisor-copilot",
+ "action": "block",
+ "policy_reason": "Blocked by rule 'PII detection'",
+ "input_tokens": 38,
+ "output_tokens": 0,
+ "estimated_cost_usd": 1.5e-05,
+ "policy_version": "0000000000000000000000000000000000000000000000000000000000000000",
+ "findings": [
+  {
+   "validator": "pii-detection",
+   "severity": "medium",
+   "message": "Potential ssn detected \u2014 [PII:ssn] (11 chars)",
+   "code": "pii-ssn",
+   "category": "pii",
+   "locus": "user"
+  }
+ ],
+ "messages": [
+  {
+   "role": "user",
+   "content": "Her SSN is 000-00-0000; summarize what I should verify."
+  }
+ ],
+ "response_text": null,
+ "previous_hash": "2269eb538a1746967e38b73ccb7933044762d2758c0e3e564d3383c14a781dc4",
+ "event_hash": "04906bfdb9788b998690f9ad6393e20ebdf8e24178e228a4cf6899cc2940bef9"
+}

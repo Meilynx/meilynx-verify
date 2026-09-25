@@ -1,0 +1,29 @@
+{
+ "schema_version": "v1.1",
+ "sequence_number": 1,
+ "timestamp_utc": "2026-09-01T09:00:05.000000000Z",
+ "event_id": "00000000-0000-4000-8000-000000000001",
+ "request_id": "11111111-1111-4111-8111-111111111111",
+ "model_requested": "gpt-4.1-mini",
+ "model_executed": "gpt-4.1-mini-2025-04-14",
+ "provider": "openai",
+ "workflow": "advisor-copilot",
+ "action": "allow",
+ "input_tokens": 19,
+ "output_tokens": 46,
+ "total_tokens": 65,
+ "cached_input_tokens": 0,
+ "reasoning_tokens": 0,
+ "estimated_cost_usd": 8.1e-05,
+ "policy_version": "0000000000000000000000000000000000000000000000000000000000000000",
+ "findings": [],
+ "messages": [
+  {
+   "role": "user",
+   "content": "In two sentences, what is a rebalancing review?"
+  }
+ ],
+ "response_text": "A rebalancing review checks a portfolio's current allocation against its target and adjusts positions to bring it back in line.",
+ "previous_hash": "11392f69b86436027ae3c6781d35498d3d7aba0afdc9831bdb4d3eef1a0fd320",
+ "event_hash": "2269eb538a1746967e38b73ccb7933044762d2758c0e3e564d3383c14a781dc4"
+}
