@@ -21,12 +21,24 @@ library when run offline. The format it checks is documented in
 python3 verify-pack.py --self-test
 
 # 2. Verify the sample chain shipped with this repository
-python3 verify-pack.py --records fixtures/records --manifest fixtures/manifest.json
+#    (the sample is not signed, which --allow-unsigned acknowledges)
+python3 verify-pack.py --records fixtures/records --manifest fixtures/manifest.json --allow-unsigned
 ```
 
-Exit code `0` means every record verified and the chain is intact. Exit code
-`1` names the first record that failed and why (hash mismatch, chain break,
-missing record, unknown record kind).
+Exit codes, the same online and offline:
+
+| Code | Meaning |
+|---|---|
+| `0` | Every record verified, and on a signed pack the signature too. An unsigned pack reaches `0` only with `--allow-unsigned`, and the output still says authenticity is not established. |
+| `1` | Verification failed. The output names the first record that failed and why (hash mismatch, chain break, missing record, unknown record kind), or why the signature failed. |
+| `2` | This verifier cannot evaluate the pack: an unsupported hash version, signature method or bundle format (use a newer release), or an unusable `--trusted-root`. |
+| `3` | The records verified, but the pack is unsigned, so nothing shows who produced the manifest. |
+
+When more than one applies, `1` outranks `2`, and `2` outranks `3`.
+
+The sample chain carries no signature, so step 2 prints "AUTHENTICITY NOT
+ESTABLISHED" and relies on `--allow-unsigned` for its `0`. Without the flag it
+exits `3`.
 
 Try it on a tampered copy:
 
@@ -51,7 +63,7 @@ A **pack** is what a Meilynx proxy's `integrity-pack` command produces:
 |---|---|
 | `manifest.json` | The window verified (`from_sequence`..`to_sequence`), the hash algorithm and version, the genesis hash, and one entry per record with the hash the generator recomputed |
 | `records/<seq>.bin` | The chain records themselves, one JSON document per file, named by 20-digit zero-padded sequence number (the layout of the write-once bucket they came from) |
-| `manifest.json.sig`, `manifest.json.bundle` | Present on a signed pack: a detached keyless-Sigstore signature over `manifest.json` and its Rekor transparency-log proof |
+| `manifest.json.sigstore.json` | Present on a signed pack: a Sigstore bundle holding a keyless cosign signature over `manifest.json`, the signing certificate, and the Rekor transparency-log proof |
 
 Records are exported alongside the manifest with
 `verify-pack.py --bucket … --export-records DIR` by someone who has read
@@ -64,6 +76,51 @@ Online form, for a reviewer who has been granted read access to the bucket:
 pip install google-cloud-storage && gcloud auth application-default login
 python3 verify-pack.py --bucket <bucket> --manifest manifest.json
 ```
+
+## Signed packs
+
+On a signed pack the verifier checks the signature before it checks the
+records, with the Python standard library only and no network access. It
+confirms all of the following:
+
+- the signature verifies over the exact bytes of `manifest.json`;
+- the Rekor transparency-log entry is authentic: its signed entry timestamp,
+  its inclusion proof, and the signed checkpoint of the log;
+- the logged entry is this signature, over this manifest, with this
+  certificate;
+- the certificate chains to a Sigstore Fulcio certificate authority that was
+  trusted when the entry was logged, and was itself valid at that time;
+- the certificate names the Meilynx signing identity:
+  - identity `https://github.com/Meilynx/meilynx-proxy/.github/workflows/integrity-pack-signed.yml@refs/heads/main`
+  - OIDC issuer `https://token.actions.githubusercontent.com`
+
+A pack whose manifest says it is signed, and whose signature is missing or
+fails any of these checks, exits `1` with the reason. A signed pack that has
+had its signature removed and been relabelled as unsigned exits `3`, not `0`.
+
+The trust anchors (the Fulcio certificates and the Rekor log key) are the
+Sigstore public-good values, written out in `verify-pack.py` as
+`SIGSTORE_PUBLIC_GOOD_TRUST_ROOT` with the `sigstore/root-signing` commit
+they came from. To use anchors you fetched and checked yourself, pass
+`--trusted-root trusted_root.json`. When Sigstore rotates a key, a pack signed
+under the new key needs a release of this verifier that carries it, or
+`--trusted-root`.
+
+The verifier does not check the Certificate Transparency timestamps (SCTs)
+embedded in the signing certificate. The Rekor entry it does check contains
+that certificate. As an optional second opinion that also checks SCTs, cosign
+runs the same assertion:
+
+```bash
+cosign verify-blob --bundle manifest.json.sigstore.json \
+  --certificate-identity https://github.com/Meilynx/meilynx-proxy/.github/workflows/integrity-pack-signed.yml@refs/heads/main \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+  manifest.json
+```
+
+`fixtures/run-signature-cases.py` runs the verifier against a set of signed
+and tampered test packs, and with `--cosign cosign` compares every verdict
+with cosign's.
 
 ## What a passing verdict means, and what it does not
 
@@ -83,13 +140,14 @@ It does **not** prove:
   hashed is listed per record version in [SPEC.md](SPEC.md). For LLM-lane
   records the prompt and response text is stored in the record but is not in
   the preimage; for MCP-lane records a digest of the payload is.
-- who wrote the record. A signed pack (`manifest.json.sig`) binds the
-  manifest to the signing identity; the chain itself is not signed.
+- who wrote the record. A signed pack (`manifest.json.sigstore.json`) binds
+  the manifest to the signing identity, and the manifest binds each record's
+  hash; the records themselves are not signed individually.
 
 ## Versions
 
 The verifier understands chain records with `schema_version` v1 through
-v1.9. A record of an unknown version or kind fails verification rather than
+v1.10. A record of an unknown version or kind fails verification rather than
 being skipped. Changes to the verifier are listed in
 [CHANGELOG.md](CHANGELOG.md). The canonical source of this file is the
 `meilynx-integrity-pack` crate in the proxy; releases here are byte-identical
