@@ -16,11 +16,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: Self-test (pinned fixture hashes + offline path)
+      - name: Self-test (pinned fixture hashes, offline path, signature checks)
         run: python verify-pack.py --self-test
-      - name: Verify the shipped fixture chain offline
-        run: python verify-pack.py --records fixtures/records --manifest fixtures/manifest.json
-      - name: A tampered record must fail
+      - name: Verify the shipped fixture chain offline (unsigned, so --allow-unsigned)
+        run: python verify-pack.py --records fixtures/records --manifest fixtures/manifest.json --allow-unsigned
+      - name: An unsigned chain is not a pass without --allow-unsigned (exit 3)
+        run: |
+          set +e
+          python verify-pack.py --records fixtures/records --manifest fixtures/manifest.json
+          rc=$?
+          if [ "$rc" -ne 3 ]; then
+            echo "unsigned chain exited $rc, expected 3" >&2; exit 1
+          fi
+      - name: A tampered record must fail (exit 1, even with --allow-unsigned)
         run: |
           cp -r fixtures/records /tmp/records
           python - <<'EOF'
@@ -29,11 +37,34 @@ jobs:
           d = json.load(open(p)); d['input_tokens'] += 1
           json.dump(d, open(p, 'w'))
           EOF
-          if python verify-pack.py --records /tmp/records --manifest fixtures/manifest.json; then
-            echo "tampered chain verified — verifier is broken" >&2; exit 1
+          set +e
+          python verify-pack.py --records /tmp/records --manifest fixtures/manifest.json --allow-unsigned
+          rc=$?
+          if [ "$rc" -ne 1 ]; then
+            echo "tampered chain exited $rc, expected 1: verifier is broken" >&2; exit 1
           fi
       - name: Fixtures were generated from this verifier
         run: |
           python fixtures/generate.py --out /tmp/regen
           diff -r /tmp/regen fixtures/records
           diff /tmp/regen.manifest.json fixtures/manifest.json
+      - name: Embedded signature test vectors match their generator
+        run: python fixtures/generate-signature-vectors.py --check
+      - name: Every tampered signed pack fails with its exit code and reason
+        run: python fixtures/run-signature-cases.py
+
+  cosign-cross-check:
+    # The same signed-pack cases, each also put to cosign. The two verdicts
+    # must agree, except on the cases the runner lists where verify-pack.py
+    # is the stricter of the two.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: sigstore/cosign-installer@v4.1.1
+        with:
+          cosign-release: 'v3.1.3'
+      - name: verify-pack.py and cosign agree
+        run: python fixtures/run-signature-cases.py --cosign cosign

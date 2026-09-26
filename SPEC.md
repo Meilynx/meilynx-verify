@@ -313,30 +313,109 @@ with the manifest as a failure.
 
 ## 7. Signed packs (window B)
 
-A window B pack adds a detached signature over the exact bytes of
-`manifest.json`, described inside the manifest itself:
+### 7.1 Descriptor and bundle
+
+A window B pack adds a signature over the exact bytes of `manifest.json`,
+described inside the manifest itself:
 
 ```json
 "signature": {
   "method": "cosign-sigstore-keyless",
   "signed_artifact": "manifest.json",
-  "signature_file": "manifest.json.sig",
-  "bundle_file": "manifest.json.bundle",
+  "signature_file": "manifest.json.sigstore.json",
+  "bundle_file": null,
   "transparency_log": "rekor"
 }
 ```
 
-Verify with cosign:
+`signature_file` names a file next to `manifest.json`: a Sigstore bundle
+(media type `application/vnd.dev.sigstore.bundle.v0.3+json`) as written by
+`cosign sign-blob --bundle`. It holds:
+
+- a message signature over SHA-256 of `manifest.json`;
+- the signing certificate (a short-lived Fulcio certificate, ECDSA P-256 key);
+- exactly one Rekor v1 `hashedrekord` 0.0.1 entry, with its signed entry
+  timestamp, inclusion proof and signed checkpoint.
+
+`bundle_file` is `null`: the transparency-log proof travels inside the bundle.
+
+A manifest is **signed-mode** when any of these holds:
+- `window` is `"B"`;
+- `signing_deferred` is not `true` (a missing field counts);
+- it carries a `signature` descriptor.
+
+A signed-mode manifest without a valid bundle fails. Every entry of a signed
+manifest must carry `recomputed_event_hash`, because that field is what
+extends the signature from the manifest to the records.
+
+### 7.2 Verification
+
+A verifier accepts the bundle only if every check below holds:
+
+1. `messageSignature.messageDigest` is SHA-256 of the manifest bytes, and the
+   ECDSA signature verifies over it under the certificate's key.
+2. The log key is identified by `logId.keyId` (the SHA-256 of its DER public
+   key) and is trusted and valid at `integratedTime`.
+3. The signed entry timestamp verifies over the RFC 8785 JSON of `body`,
+   `integratedTime`, `logID` (hex) and `logIndex`.
+4. The inclusion proof, checked as in RFC 9162 §2.1.3.2 over
+   `SHA-256(0x00 || body)`, reaches `rootHash`.
+5. The checkpoint's tree size and root hash match the inclusion proof, and the
+   checkpoint is signed by the log key.
+6. The logged `hashedrekord` records this manifest's SHA-256, this signature,
+   and this certificate.
+7. The certificate chains to a trusted Fulcio CA that is valid at
+   `integratedTime`, and every certificate in the chain is valid then. The
+   signing certificate must carry the digitalSignature key usage and the
+   codeSigning extended key usage, must not be a CA, and must have no unknown
+   critical extensions.
+8. `integratedTime` falls within the signing certificate's validity.
+9. The certificate's subjectAltName equals the expected identity, and its
+   Fulcio issuer extension (OID `1.3.6.1.4.1.57264.1.8`, falling back to
+   `.1.1`) equals the expected issuer. For Meilynx packs these are:
+   - identity `https://github.com/Meilynx/meilynx-proxy/.github/workflows/integrity-pack-signed.yml@refs/heads/main`
+   - OIDC issuer `https://token.actions.githubusercontent.com`
+
+Trust anchors (Fulcio CA chains and the Rekor log key, each with its
+validity window) come from the Sigstore public-good `trusted_root.json`,
+never from the bundle. `verify-pack.py` embeds a copy and accepts
+`--trusted-root` to substitute another. Certificate Transparency timestamps
+(SCTs) in the certificate are not checked. RFC 3161 timestamps, Rekor v2
+entries and DSSE envelopes are outside this format: a verifier reports them
+as unsupported, never as a pass.
+
+### 7.3 Verdicts
+
+| Exit | Meaning |
+|---|---|
+| 0 | Records verified, and for a signed pack the signature. An unsigned pack reaches 0 only when the reader passes `--allow-unsigned`. |
+| 1 | A record or the signature failed. The reason is one of: signature required by manifest but missing; manifest bytes changed since signing; untrusted certificate chain; signer identity mismatch; OIDC issuer mismatch; invalid transparency-log proof; transparency-log entry does not match this signature; signed outside certificate validity; malformed signature material. |
+| 2 | Cannot evaluate: unsupported hash version, signature method or bundle format, or unusable trust anchors. |
+| 3 | Unsigned pack: records verified, authenticity not established. |
+
+1 outranks 2, which outranks 3. The codes are the same whether the records
+are read from the bucket or from an exported record set.
+
+### 7.4 When this section changes
+
+The following require a new verifier release:
+- a Fulcio CA or Rekor key rotation;
+- the end of Rekor v1 for new entries;
+- any change to how packs are signed.
+
+Packs signed under an anchor that a release carries keep verifying under
+later releases.
+
+Cross-check with cosign, which runs the same assertion (and also checks SCTs):
 
 ```
-cosign verify-blob --signature manifest.json.sig --bundle manifest.json.bundle \
-  --certificate-identity <signer identity> \
-  --certificate-oidc-issuer <issuer> manifest.json
+cosign verify-blob --bundle manifest.json.sigstore.json \
+  --certificate-identity <identity above> \
+  --certificate-oidc-issuer <issuer above> manifest.json
 ```
 
 The signature attests who produced the manifest and that it has not changed
-since; the chain hashes attest the records. The two are independent checks
-and a reviewer should run both.
+since; the chain hashes attest the records.
 
 ## 8. What the chain does not cover
 
