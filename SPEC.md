@@ -5,9 +5,9 @@ enough that a verifier can be written from it without reading Meilynx code.
 `verify-pack.py` in this repository is one such verifier; its `--self-test`
 pins the values below against fixture hashes.
 
-Status: describes chain records with `schema_version` v1 through v1.10 and
+Status: describes chain records with `schema_version` v1 through v1.11 and
 pack manifest `schema_version` 1.0, as produced by meilynx-proxy at commit
-`5e8a9cb` (2026-09-25).
+`ce114ab` (2026-09-28).
 
 ## 1. Records
 
@@ -29,7 +29,7 @@ Every record carries at least these fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.10"`). Absent means `"v1"`. |
+| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.11"`). Absent means `"v1"`. |
 | `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`). Absent means `llm_request`. |
 | `sequence_number` | integer | Position in the chain, starting at 0. |
 | `timestamp_utc` | string | RFC 3339 UTC timestamp, nanosecond precision, `Z` suffix. |
@@ -194,6 +194,13 @@ all three are fed as absent), then from `content`: `capture_policy`
 `content` payload on any other version, or a v1.10 record without one, is
 invalid and fails verification.
 
+**v1.11 `llm_request`**: the v1.10 fields, then from `content`:
+`tool_calls_sha256_jcs` and `stored_tool_calls_sha256_jcs` (both optional
+strings). 27 fields. A record is v1.11 exactly when the model's response made
+at least one tool call; a record without tool calls stays v1.10. Tool-call
+digests on any other version, or a v1.11 record without
+`tool_calls_sha256_jcs`, are invalid and fail verification.
+
 MCP kinds are: `mcp.tool_call`, `mcp.policy_decision`, `mcp.tool_result`,
 `mcp.tools_list.served`, `mcp.error`, `mcp.catalog_drift`. Any MCP hasher
 called with a non-MCP kind is an error.
@@ -205,7 +212,7 @@ not recompute the digest from a payload, because the payload is not part of
 the record. For v1.10 LLM records it also recomputes the stored-content
 digests (§4.4).
 
-### 4.4 LLM content attestation (v1.10)
+### 4.4 LLM content attestation (v1.10, v1.11)
 
 `capture_policy` names what the record retains:
 
@@ -225,15 +232,20 @@ The six `content` fields:
 | `stored_prompt_sha256_jcs` | JCS of the record's own `messages`; absent when no prompt was retained |
 | `stored_response_sha256` | UTF-8 bytes of the record's own `response_text`; absent when no response was retained |
 | `findings_sha256_jcs` | JCS of the record's own `findings` |
+| `tool_calls_sha256_jcs` (v1.11) | JCS of the response's tool calls as captured |
+| `stored_tool_calls_sha256_jcs` (v1.11) | JCS of the record's own `tool_calls`; absent when none were retained |
 
 Because the digests are in the preimage and the content they describe is in
-the record, a verifier checks, for every v1.10 record:
+the record, a verifier checks, for every v1.10 and v1.11 record:
 
 1. `stored_prompt_sha256_jcs`, when present, equals SHA-256(JCS(`messages`));
    when absent, `messages` is empty.
 2. `stored_response_sha256`, when present, equals SHA-256(`response_text`);
    when absent, `response_text` is absent.
 3. `findings_sha256_jcs`, when present, equals SHA-256(JCS(`findings`)).
+4. `stored_tool_calls_sha256_jcs`, when present, equals
+   SHA-256(JCS(`tool_calls`)); when absent, `tool_calls` is absent. On a
+   v1.10 record, tool calls are not attested.
 
 A record whose content was edited after sealing still hash-verifies (the
 content is outside the preimage) and fails these checks. `prompt_sha256_jcs`
@@ -425,9 +437,9 @@ since; the chain hashes attest the records.
 - **Unhashed fields.** For LLM records before v1.10, `messages`,
   `response_text`, `findings`, `raw_request`, `raw_response` and routing
   metadata are stored in the record but not in the preimage. From v1.10 the
-  prompt, response and findings are bound through their digests (§4.4);
-  `raw_request`, `raw_response`, response tool calls and routing metadata
-  remain unbound. For MCP records the payload is bound through its digest
+  prompt, response and findings are bound through their digests (§4.4), and
+  from v1.11 the response's tool calls too; `raw_request`, `raw_response` and
+  routing metadata remain unbound. For MCP records the payload is bound through its digest
   fields.
 - **Whether a detector missed something.** Under `redacted`, only spans a
   detector located are masked. The stored copy can still contain sensitive
