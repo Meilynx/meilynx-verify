@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.4.0 (2026-09-28)
+
+- `verify-pack.py` from meilynx-proxy `ce114ab`.
+- Chain `schema_version` v1.11 (`llm_request` whose response made tool
+  calls): the v1.10 fields plus `tool_calls_sha256_jcs` and
+  `stored_tool_calls_sha256_jcs` (SPEC §4.3, §4.4). The stored-content check
+  now also recomputes the stored tool-call digest from the record's own
+  `tool_calls`.
+- Failure reports name the record that failed. When a record fails, the next
+  record's link is checked against the hashes the manifest commits for the
+  failed record; if none are committed, the link is reported as not checked
+  (`WARN`) rather than as a second failure.
+- `--self-test` adds v1.11 fixture hashes and tool-call digest vectors.
+
 ## 0.3.0 (2026-09-26)
 
 **Breaking:** an unsigned pack no longer exits `0`. Without `--allow-unsigned`

@@ -843,19 +843,68 @@ def compute_event_hash_v1_10_llm_request(
     return h.hexdigest()
 
 
+def compute_event_hash_v1_11_llm_request(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    join_context, content,
+):
+    """MEI-2456 — v1.11 llm_request hash: the v1.10 layout followed by the two
+    tool-call digests (`tool_calls_sha256_jcs`, then
+    `stored_tool_calls_sha256_jcs`), each an optional string. Mirror of
+    `compute_event_hash_v1_11_llm_request` in sqlite.rs.
+
+    The v1.10 feeds are duplicated rather than shared with
+    compute_event_hash_v1_10_llm_request, as every bucket duplicates its
+    predecessor, so a v1.11 change can never move a v1.10 hash. The tool calls
+    themselves stay outside the preimage; `check_llm_content` recomputes the
+    stored digest from the record's own `tool_calls`."""
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_LLM_REQUEST.encode('utf-8'))
+    join = join_context or {}
+    h.update(encode_optional_str(join.get('correlation_id')))
+    h.update(encode_optional_str(join.get('session_id')))
+    h.update(encode_optional_str(join.get('agent_name')))
+    h.update(content['capture_policy'].encode('utf-8'))
+    h.update(encode_optional_str(content.get('prompt_sha256_jcs')))
+    h.update(encode_optional_str(content.get('response_sha256')))
+    h.update(encode_optional_str(content.get('stored_prompt_sha256_jcs')))
+    h.update(encode_optional_str(content.get('stored_response_sha256')))
+    h.update(encode_optional_str(content.get('findings_sha256_jcs')))
+    h.update(encode_optional_str(content.get('tool_calls_sha256_jcs')))
+    h.update(encode_optional_str(content.get('stored_tool_calls_sha256_jcs')))
+    return h.hexdigest()
+
+
+def _has_tool_call_digests(content):
+    return isinstance(content, dict) and (
+        content.get('tool_calls_sha256_jcs') is not None
+        or content.get('stored_tool_calls_sha256_jcs') is not None
+    )
+
+
 def check_llm_content(event):
-    """MEI-2424 — for a v1.10 record, check that the content it carries is the
-    content it was sealed over: the stored-prompt, stored-response and
-    findings digests (all inside the hash) must match the record's own
-    `messages`, `response_text` and `findings`. A digest that is absent means
-    nothing was retained, so the record must carry no content on that axis.
+    """MEI-2424 — for a v1.10 or v1.11 record, check that the content it
+    carries is the content it was sealed over: the stored-prompt,
+    stored-response, findings and (MEI-2456) stored-tool-calls digests (all
+    inside the hash) must match the record's own `messages`, `response_text`,
+    `findings` and `tool_calls`. A digest that is absent means nothing was
+    retained, so the record must carry no content on that axis; a v1.10
+    record has no tool-call digest, so tool calls on one are unattested.
     Returns a list of problems; empty means the content checks out. Records
     on older schema versions carry no digests and return no problems."""
-    if (event.get('schema_version') or 'v1') != 'v1.10':
+    schema_version = event.get('schema_version') or 'v1'
+    if schema_version not in ('v1.10', 'v1.11'):
         return []
     content = event.get('content')
     if not isinstance(content, dict):
-        return ['v1.10 record has no content payload']
+        return [f'{schema_version} record has no content payload']
     problems = []
     messages = event.get('messages') or []
     stored_prompt = content.get('stored_prompt_sha256_jcs')
@@ -874,6 +923,13 @@ def check_llm_content(event):
     findings_digest = content.get('findings_sha256_jcs')
     if findings_digest is not None and sha256_jcs(event.get('findings') or []) != findings_digest:
         problems.append('findings do not match findings_sha256_jcs (the findings were changed after sealing)')
+    tool_calls = event.get('tool_calls')
+    stored_tool_calls = content.get('stored_tool_calls_sha256_jcs')
+    if stored_tool_calls is not None:
+        if tool_calls is None or sha256_jcs(tool_calls) != stored_tool_calls:
+            problems.append('tool_calls do not match stored_tool_calls_sha256_jcs (the tool calls were changed after sealing)')
+    elif tool_calls is not None:
+        problems.append('tool_calls present but no stored_tool_calls_sha256_jcs was sealed')
     return problems
 
 
@@ -899,16 +955,23 @@ def compute_event_hash_dispatch(
     # would be presenting an UNHASHED join key as evidence — rewritable after
     # the fact without breaking the chain.
     # MEI-2424 — the same rule for the content attestation: its digests are
-    # hashed only in the v1.10 bucket.
-    if content is not None and schema_version != 'v1.10':
+    # hashed only in the v1.10 and v1.11 buckets.
+    if content is not None and schema_version not in ('v1.10', 'v1.11'):
         raise ValueError(
             f"MEI-2424: content attestation present on a {schema_version!r} event — "
-            f"content digests are hashed only in the v1.10 bucket."
+            f"content digests are hashed only in the v1.10 and v1.11 buckets."
         )
-    if join_context is not None and schema_version not in ('v1.9', 'v1.10'):
+    # MEI-2456 — and the tool-call digests only in v1.11: the v1.10 hash does
+    # not read them, so a v1.10 record carrying one would present it unhashed.
+    if _has_tool_call_digests(content) and schema_version != 'v1.11':
+        raise ValueError(
+            f"MEI-2456: tool-call digests present on a {schema_version!r} event — "
+            f"they are hashed only in the v1.11 bucket."
+        )
+    if join_context is not None and schema_version not in ('v1.9', 'v1.10', 'v1.11'):
         raise ValueError(
             f"MEI-2151: join_context present on a {schema_version!r} event — "
-            f"caller-asserted join keys are hashed only in the v1.9 and v1.10 buckets."
+            f"caller-asserted join keys are hashed only in the v1.9, v1.10 and v1.11 buckets."
         )
     if schema_version in ('v1', 'v1.1'):
         return compute_event_hash(
@@ -1110,6 +1173,28 @@ def compute_event_hash_dispatch(
                 f"events; got event_kind {event_kind!r}"
             )
         return compute_event_hash_v1_10_llm_request(
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            join_context, content,
+        )
+    if schema_version == 'v1.11':
+        # MEI-2456 — v1.10 plus the tool-call digests. The writer stamps v1.11
+        # exactly when the captured tool-call digest is present, so a v1.11
+        # record without it has no defined preimage.
+        if content is None or content.get('tool_calls_sha256_jcs') is None:
+            raise ValueError(
+                "MEI-2456: schema_version v1.11 requires a content payload carrying "
+                "tool_calls_sha256_jcs; a record whose response made no tool call "
+                "stays in its v1.10 bucket."
+            )
+        if event_kind != EVENT_KIND_LLM_REQUEST:
+            raise ValueError(
+                f"MEI-2456: schema_version v1.11 is defined only for llm_request "
+                f"events; got event_kind {event_kind!r}"
+            )
+        return compute_event_hash_v1_11_llm_request(
             sequence_number, timestamp_utc, event_id, request_id,
             model_requested, action, input_tokens, output_tokens,
             total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
@@ -1899,6 +1984,44 @@ V1_10_DIGEST_FIXTURE_PROMPT = "ba5adc603cb95f7951ed1e2bfb3de1b66d9eeb232ff94af90
 V1_10_DIGEST_FIXTURE_RESPONSE = "ad49d1a5366d1125bfd9a017997b7a28a9de6c669288ec46d42eab12351ecc05"
 V1_10_DIGEST_FIXTURE_FINDINGS = "c39486077115ab8f01410a60ab472c0e7b6e948a59950b4a98d1be5b9b44111b"
 
+# MEI-2456 — v1.11 llm_request fixtures. Paired with
+# meilynx-audit/tests/mei2456_tool_calls_chain_round_trip.rs; neither side may
+# drift independently. The first pin carries both tool-call digests; the join
+# pin carries a hash_only-shaped payload (stored digests absent) so the
+# presence tag of a missing stored tool-call digest is covered too.
+_V1_11_CONTENT_FIXTURE_PAYLOAD = dict(
+    _V1_10_CONTENT_FIXTURE_PAYLOAD,
+    tool_calls_sha256_jcs='6' * 64,
+    stored_tool_calls_sha256_jcs='7' * 64,
+)
+_V1_11_HASH_ONLY_CONTENT_FIXTURE_PAYLOAD = dict(
+    capture_policy='hash_only',
+    prompt_sha256_jcs='1' * 64,
+    response_sha256=None,
+    findings_sha256_jcs='5' * 64,
+    tool_calls_sha256_jcs='6' * 64,
+)
+V1_11_LLM_REQUEST_FIXTURE_HASH = "afd2d6fa30b6de48b227afdec6291e889919af46dc382d96476bd8ebaa2fc2d8"
+V1_11_LLM_REQUEST_JOIN_HASH_ONLY_FIXTURE_HASH = "20da367bc79f4e9f1bfdb4203885b8ce5378c6ad9da33e1536935265f4a3bbfa"
+
+# MEI-2456 — tool-call digest fixture. Paired with
+# meilynx-proxy/src/audit_capture.rs::tool_call_digests_are_pinned_for_the_verifier:
+# the record's `tool_calls` exactly as the proxy serializes them, and the
+# digests the proxy seals over them (as captured, and under `redacted`, where
+# every `input` is null). The input exercises the JCS cases a naive dump gets
+# wrong: 1.0 -> 1, 1e21 -> 1e+21, an integer past 2**53 (rendered through a
+# double), -0.0 -> 0, 1e-7, key order by UTF-16 code unit across non-ASCII and
+# astral keys, and non-ASCII / control characters in strings.
+V1_11_DIGEST_FIXTURE_TOOL_CALLS_JSON = (
+    '[{"id":"toolu_01","name":"Read","input":{"file_path":"/work/café/naïve ☕.py",'
+    '"ratio":1.0,"big":1e21,"huge":12345678901234567890,"neg_zero":-0.0,"tiny":1e-7,'
+    '"n":[0.1,100,2.5e-8],"keys":{"é":1,"e":2,"\U0001F600":3,"｡":4},'
+    '"ctrl":"line\\nbreak\\t\\u0001"}},'
+    '{"id":"srvtoolu_02","name":"web_search","input":{"query":"東京 weather"}}]'
+)
+V1_11_DIGEST_FIXTURE_TOOL_CALLS = "656300fbe1f68f78edee99a3c826fbb4fbdd14793e5b9f07eda08bc3f83b5476"
+V1_11_DIGEST_FIXTURE_TOOL_CALLS_REDACTED = "29257c956f8d4585d7fbe2d7bafe2d83dd65852ff44e88e2a3327f3b6100174b"
+
 _V1_2_AUTH_FIXTURE_PAYLOAD = dict(
     user_email="cassio@meilynx.com",
     user_id="9382725d-3bc4-4c88-9655-3f743b0e13f9",
@@ -2079,7 +2202,33 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
         sys.exit(EXIT_CANNOT_EVALUATE)
 
     genesis = genesis_hash()
-    expected_prev_hash = genesis
+
+    # MEI-2476 — the hashes the next record's previous_hash may link to. After
+    # a record that passed, exactly the hash it verified at. After a record
+    # that failed, every hash the pack commits to for it: its own event_hash
+    # (when readable) and the manifest entry's stored_event_hash and
+    # recomputed_event_hash. The failed record already has its FAIL line; its
+    # successor is judged against what the chain claimed that record was, so
+    # one tampered record yields one FAIL, not a second, false "chain break"
+    # on the intact record after it.
+    #
+    # This cannot mask a tamper. The set widens only after a record has
+    # already failed, and the successor's own bytes are still bound by its own
+    # hash check: previous_hash is hashed, so editing it fails at the
+    # successor against the manifest's recomputed_event_hash. A manifest that
+    # carries no hashes adds nothing to the set, which is then the failed
+    # record's own event_hash, as before. When nothing in the pack attests the
+    # failed record's hash (such a manifest, and a record that is missing or
+    # unreadable), the set is empty and the successor's link is reported as
+    # not checked, never as passed.
+    next_link = {genesis}
+    prev_seq = None
+
+    def committed_hashes(entry, event_hash=''):
+        return {
+            h for h in (event_hash, entry.get('stored_event_hash', ''), entry.get('recomputed_event_hash', ''))
+            if isinstance(h, str) and h
+        }
 
     all_passed = True
     events_in_manifest = manifest.get('events', [])
@@ -2093,6 +2242,11 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
 
     for entry in sorted(events_in_manifest, key=lambda e: e['sequence']):
         seq = entry['sequence']
+        # The links this record may make, and the record they point back to.
+        # Until this record passes, the next one links against the hashes the
+        # pack commits to for it.
+        link_targets, link_seq = next_link, prev_seq
+        next_link, prev_seq = committed_hashes(entry), seq
 
         try:
             raw = fetch(seq)
@@ -2110,6 +2264,7 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
 
         stored_prev = event.get('previous_hash', '')
         stored_hash = event.get('event_hash', '')
+        next_link = committed_hashes(entry, stored_hash)
 
         # MEI-1096 — dispatch on the event's own schema_version + event_kind
         # (v1/v1.1 llm, v1.2 auth, v1.3 admin), the same recompute path
@@ -2123,13 +2278,16 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             continue
 
         hash_ok = (recomputed == stored_hash)
-        chain_ok = (stored_prev == expected_prev_hash)
+        link_checked = bool(link_targets)
+        chain_ok = not link_checked or (isinstance(stored_prev, str) and stored_prev in link_targets)
 
         # MEI-2424 — a v1.10 record's hash covers the digests of its content;
         # this checks the content itself still matches them.
+        content_ok = True
         for problem in check_llm_content(event):
             report(f"FAIL seq={seq}: {problem}")
             all_passed = False
+            content_ok = False
 
         manifest_recomputed = entry.get('recomputed_event_hash', '')
         if require_manifest_hash and not manifest_recomputed:
@@ -2147,22 +2305,29 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             all_passed = False
             continue
 
-        if hash_ok and chain_ok:
+        if not link_checked:
+            verified = f"hash={stored_hash[:16]}... verified, but its " if hash_ok else "its "
+            report(
+                f"WARN seq={seq}: {verified}chain link to seq={link_seq} was not checked, because "
+                f"that record failed and nothing in the pack attests its hash."
+            )
+        elif hash_ok and chain_ok:
             report(f"PASS seq={seq} hash={stored_hash[:16]}... chain_ok")
-        else:
-            if not hash_ok:
-                report(
-                    f"FAIL seq={seq}: hash mismatch. "
-                    f"stored={stored_hash[:16]}... recomputed={recomputed[:16]}..."
-                )
-            if not chain_ok:
-                report(
-                    f"FAIL seq={seq}: chain break. "
-                    f"previous_hash={stored_prev[:16]}... expected={expected_prev_hash[:16]}..."
-                )
+        if not hash_ok:
+            report(
+                f"FAIL seq={seq}: hash mismatch. "
+                f"stored={stored_hash[:16]}... recomputed={recomputed[:16]}..."
+            )
+        if not chain_ok:
+            expected = ' or '.join(f"{h[:16]}..." for h in sorted(link_targets))
+            report(
+                f"FAIL seq={seq}: chain break. "
+                f"previous_hash={stored_prev[:16]}... expected={expected}"
+            )
+        if not (hash_ok and chain_ok):
             all_passed = False
-
-        expected_prev_hash = recomputed if hash_ok else stored_hash
+        elif content_ok:
+            next_link = {stored_hash}
 
     return all_passed
 
@@ -3225,8 +3390,8 @@ def report_pack_signature(manifest, manifest_bytes, manifest_path, args):
 def offline_self_test():
     """Exercise the offline (`--records`) path end to end on a synthetic
     two-record v1 chain: a clean chain verifies, a one-byte tamper to the
-    first record's token count fails at that record AND breaks linkage at
-    the next. Runs with no network and no Google client library, so a
+    first record's token count fails verification, and a missing record is a
+    failure. Runs with no network and no Google client library, so a
     reviewer can confirm the offline verifier itself works before trusting
     its verdict on a real pack."""
     import tempfile
@@ -3284,9 +3449,9 @@ def offline_self_test():
         print(f"SELF-TEST assertion 18b {'PASS' if clean_jsonl else 'FAIL'}: offline JSONL records file verifies a clean chain")
         ok = ok and clean_jsonl
 
-        # Tamper: change one hashed field of record 0 after the fact. The
-        # stored hash no longer matches, and record 1's previous_hash no
-        # longer links to what record 0 now hashes to.
+        # Tamper: change one hashed field of record 0 after the fact. Its
+        # recomputed hash no longer matches the manifest. Which record each
+        # FAIL line names is pinned by attribution_self_test (22a-22f).
         tampered = dict(first)
         tampered['input_tokens'] = 12
         (records / record_file_name(0)).write_bytes(json.dumps(tampered).encode('utf-8'))
@@ -3299,6 +3464,124 @@ def offline_self_test():
         missing = not verify_manifest_with(local_fetcher(records), manifest, quiet=True)
         print(f"SELF-TEST assertion 18d {'PASS' if missing else 'FAIL'}: offline verification fails on a missing record")
         ok = ok and missing
+
+    return ok
+
+
+def attribution_self_test():
+    """MEI-2476 — every FAIL line names the record that failed. A four-record
+    v1 chain has record 1 tampered in one way per assertion. Each must print
+    exactly one `FAIL seq=1` line and no FAIL for the intact record 2, whose
+    previous_hash still names what the chain committed to for record 1. When
+    nothing in the pack attests record 1's hash, record 2's link is reported
+    as not checked, never as passed or broken."""
+    import contextlib
+    import io
+    import tempfile
+
+    ok = True
+
+    def check(label, passed, what, output):
+        nonlocal ok
+        print(f"SELF-TEST assertion {label} {'PASS' if passed else 'FAIL'}: {what}")
+        if not passed:
+            print('\n'.join(f"    | {line}" for line in output.splitlines()))
+        ok = ok and passed
+
+    genesis = genesis_hash()
+    events = []
+    for seq in range(4):
+        event = {
+            'schema_version': 'v1',
+            'sequence_number': seq,
+            'timestamp_utc': f'2026-01-01T00:00:0{seq}+00:00',
+            'event_id': f'evt-{seq}',
+            'request_id': f'req-{seq}',
+            'model_requested': 'gpt-4.1-mini',
+            'action': 'allow',
+            'input_tokens': 11,
+            'output_tokens': 7,
+            'total_tokens': 18,
+            'cache_creation_input_tokens': None,
+            'cache_read_input_tokens': None,
+            'cached_input_tokens': None,
+            'reasoning_tokens': None,
+            'estimated_cost_usd': 0.000123,
+            'previous_hash': events[-1]['event_hash'] if events else genesis,
+        }
+        event['event_hash'] = recompute_event_hash(event, seq, event['previous_hash'])
+        events.append(event)
+
+    def pack_manifest(with_hashes=True):
+        return {
+            'hash_version': 'v1',
+            'prefix': 'audit/self-test/',
+            'events': [
+                {'sequence': ev['sequence_number'], 'stored_event_hash': ev['event_hash'],
+                 'recomputed_event_hash': ev['event_hash']} if with_hashes
+                else {'sequence': ev['sequence_number']}
+                for ev in events
+            ],
+        }
+
+    def tampered_content():
+        record = dict(events[1], input_tokens=12)
+        return json.dumps(record).encode('utf-8')
+
+    def tampered_content_and_hash():
+        record = dict(events[1], input_tokens=12)
+        record['event_hash'] = recompute_event_hash(record, 1, record['previous_hash'])
+        return json.dumps(record).encode('utf-8')
+
+    def forged_manifest_entry():
+        manifest = pack_manifest()
+        manifest['events'][1].update(stored_event_hash='0' * 64, recomputed_event_hash='0' * 64)
+        return manifest
+
+    # (label, what, record 1 bytes or None when missing, manifest, record 2 unanchored)
+    cases = [
+        ('22a', 'a content edit to record 1', tampered_content(), pack_manifest(), False),
+        ('22b', 'a content edit to record 1 with its event_hash rewritten to match',
+         tampered_content_and_hash(), pack_manifest(), False),
+        ('22c', "a changed manifest hash for record 1", None, forged_manifest_entry(), False),
+        ('22d', 'a missing record 1', b'', pack_manifest(), False),
+        ('22e', 'an unreadable record 1', b'{not json', pack_manifest(), False),
+        ('22f', 'a missing record 1 with a manifest that carries no hashes', b'',
+         pack_manifest(with_hashes=False), True),
+    ]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        for label, what, record_one, manifest, unanchored in cases:
+            records = Path(tmp) / label
+            records.mkdir()
+            for ev in events:
+                (records / record_file_name(ev['sequence_number'])).write_bytes(json.dumps(ev).encode('utf-8'))
+            if record_one == b'':
+                (records / record_file_name(1)).unlink()
+            elif record_one is not None:
+                (records / record_file_name(1)).write_bytes(record_one)
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                failed = not verify_manifest_with(local_fetcher(records), manifest)
+            lines = out.getvalue().splitlines()
+            fails = [line for line in lines if line.startswith('FAIL seq=')]
+            one_fail_at_record_one = len(fails) == 1 and fails[0].startswith('FAIL seq=1:')
+            if unanchored:
+                successor_ok = (
+                    any(line.startswith('WARN seq=2:') and 'not checked' in line for line in lines)
+                    and not any(line.startswith('PASS seq=2 ') for line in lines)
+                )
+                verdict = "record 2's link reported as not checked"
+            else:
+                successor_ok = any(
+                    line.startswith(f"PASS seq=2 hash={events[2]['event_hash'][:16]}... chain_ok")
+                    for line in lines
+                )
+                verdict = 'record 2 passes'
+            check(label, failed and one_fail_at_record_one and successor_ok,
+                  f"{what} fails verification with exactly one FAIL line, at seq=1, and {verdict}",
+                  out.getvalue())
 
     return ok
 
@@ -3409,6 +3692,149 @@ def content_self_test():
         detected = not verify_manifest_with(local_fetcher(records), manifest, quiet=True)
         check('19g', still_hashes and detected,
               'a prompt edited after sealing is detected by the content check')
+
+    return ok
+
+
+def tool_calls_self_test():
+    """MEI-2456 — the v1.11 tool-call attestation: fixture hashes paired with
+    the Rust tests, the production recompute path, the fail-closed dispatcher
+    guards, the JCS tool-call digests paired with the proxy's sealer, and the
+    offline content check (a record whose tool input was edited after sealing
+    fails even though its hash still verifies)."""
+    import tempfile
+
+    ok = True
+
+    def check(label, passed, detail=''):
+        nonlocal ok
+        print(f"SELF-TEST assertion {label} {'PASS' if passed else 'FAIL'}{': ' + detail if detail else ''}")
+        ok = ok and passed
+
+    ts = "2026-05-17T00:00:00+00:00"
+
+    # 21a / 21b — direct fn: both tool digests, no join; then a hash_only
+    # payload (stored digests absent) with the MEI-2151 join fixture.
+    got = compute_event_hash_v1_11_llm_request(
+        timestamp_utc=ts, join_context=None, content=_V1_11_CONTENT_FIXTURE_PAYLOAD, **_FIXTURE,
+    )
+    check('21a', got == V1_11_LLM_REQUEST_FIXTURE_HASH, f'v1.11 llm_request fixture hash matches (got {got})')
+    got = compute_event_hash_v1_11_llm_request(
+        timestamp_utc=ts, join_context=_V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD,
+        content=_V1_11_HASH_ONLY_CONTENT_FIXTURE_PAYLOAD, **_FIXTURE,
+    )
+    check('21b', got == V1_11_LLM_REQUEST_JOIN_HASH_ONLY_FIXTURE_HASH,
+          f'v1.11 llm_request fixture hash (join, hash_only) matches (got {got})')
+
+    # 21c — the production recompute path, and v1.11 differs from v1.10 on the
+    # same v1.10 fields (the tool digests are entering the preimage).
+    event = dict(
+        schema_version='v1.11', timestamp_utc='2026-05-17T00:00:00Z',
+        event_id=_FIXTURE['event_id'], request_id=_FIXTURE['request_id'],
+        model_requested=_FIXTURE['model_requested'], action=_FIXTURE['action'],
+        input_tokens=_FIXTURE['input_tokens'], output_tokens=_FIXTURE['output_tokens'],
+        total_tokens=_FIXTURE['total_tokens'], estimated_cost_usd=_FIXTURE['estimated_cost_usd'],
+        content=dict(_V1_11_CONTENT_FIXTURE_PAYLOAD),
+    )
+    got = recompute_event_hash(event, _FIXTURE['sequence_number'], _FIXTURE['previous_hash'])
+    check('21c', got == V1_11_LLM_REQUEST_FIXTURE_HASH and got != V1_10_LLM_REQUEST_FIXTURE_HASH,
+          'verify_manifest recompute path handles v1.11 llm_request, distinct from v1.10')
+
+    # 21d — fail closed: tool digests outside v1.11, v1.11 without the
+    # captured digest, and v1.11 on a non-LLM kind.
+    rejected = True
+    for stale in ('v1.1', 'v1.9', 'v1.10'):
+        for payload in (_V1_11_CONTENT_FIXTURE_PAYLOAD,
+                        dict(_V1_10_CONTENT_FIXTURE_PAYLOAD, stored_tool_calls_sha256_jcs='7' * 64)):
+            try:
+                compute_event_hash_dispatch(
+                    stale, 42, ts, 'e', 'r', 'm', 'Allow', 0, 0,
+                    None, None, None, None, None, None, 'prev',
+                    join_context=_V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD if stale == 'v1.9' else None,
+                    content=payload,
+                )
+                rejected = False
+            except ValueError:
+                pass
+    for content in (None, _V1_10_CONTENT_FIXTURE_PAYLOAD,
+                    dict(_V1_10_CONTENT_FIXTURE_PAYLOAD, stored_tool_calls_sha256_jcs='7' * 64)):
+        try:
+            compute_event_hash_dispatch(
+                'v1.11', 42, ts, 'e', 'r', 'm', 'Allow', 0, 0,
+                None, None, None, None, None, None, 'prev', content=content,
+            )
+            rejected = False
+        except ValueError:
+            pass
+    try:
+        compute_event_hash_dispatch(
+            'v1.11', 42, ts, 'e', 'r', 'm', 'Allow', 0, 0,
+            None, None, None, None, None, None, 'prev',
+            event_kind='admin.action', content=_V1_11_CONTENT_FIXTURE_PAYLOAD,
+        )
+        rejected = False
+    except ValueError:
+        pass
+    check('21d', rejected,
+          'tool digests outside v1.11, v1.11 without the captured digest, and v1.11 on a non-LLM kind are rejected')
+
+    # 21e — the JCS tool-call digests match the proxy's sealer on the same calls.
+    calls = json.loads(V1_11_DIGEST_FIXTURE_TOOL_CALLS_JSON)
+    redacted = [dict(c, input=None) for c in calls]
+    got_full, got_redacted = sha256_jcs(calls), sha256_jcs(redacted)
+    check('21e', got_full == V1_11_DIGEST_FIXTURE_TOOL_CALLS and got_redacted == V1_11_DIGEST_FIXTURE_TOOL_CALLS_REDACTED,
+          f'JCS tool-call digests match the proxy sealer (got {got_full} / {got_redacted})')
+
+    # 21f / 21g / 21h — offline: a sealed v1.11 record verifies; the same
+    # record with a tool input edited after sealing still hash-verifies (the
+    # calls are outside the preimage) but fails the content check; and tool
+    # calls added to a sealed v1.10 record are unattested and fail too.
+    genesis = genesis_hash()
+    empty_digest = sha256_jcs([])
+    sealed = dict(
+        schema_version='v1.11', sequence_number=0, timestamp_utc='2026-01-01T00:00:00+00:00',
+        event_id='evt-0', request_id='req-0', model_requested='claude-opus-5-5', action='Allow',
+        input_tokens=11, output_tokens=5, estimated_cost_usd=None, previous_hash=genesis,
+        messages=[], response_text=None, findings=[], tool_calls=calls,
+        content=dict(
+            capture_policy='full',
+            prompt_sha256_jcs=empty_digest,
+            stored_prompt_sha256_jcs=empty_digest,
+            findings_sha256_jcs=empty_digest,
+            tool_calls_sha256_jcs=V1_11_DIGEST_FIXTURE_TOOL_CALLS,
+            stored_tool_calls_sha256_jcs=V1_11_DIGEST_FIXTURE_TOOL_CALLS,
+        ),
+    )
+    sealed['event_hash'] = recompute_event_hash(sealed, 0, genesis)
+    manifest = {'hash_version': 'v1', 'prefix': 'audit/self-test/',
+                'events': [{'sequence': 0, 'recomputed_event_hash': sealed['event_hash']}]}
+    with tempfile.TemporaryDirectory() as tmp:
+        records = Path(tmp) / 'records'
+        records.mkdir()
+        path = records / record_file_name(0)
+        path.write_bytes(json.dumps(sealed, ensure_ascii=False).encode('utf-8'))
+        check('21f', verify_manifest_with(local_fetcher(records), manifest, quiet=True),
+              'offline verification passes a sealed v1.11 record')
+        edited = json.loads(json.dumps(sealed))
+        edited['tool_calls'][0]['input']['file_path'] = '/etc/passwd'
+        path.write_bytes(json.dumps(edited).encode('utf-8'))
+        still_hashes = recompute_event_hash(edited, 0, genesis) == sealed['event_hash']
+        detected = not verify_manifest_with(local_fetcher(records), manifest, quiet=True)
+        check('21g', still_hashes and detected,
+              'a tool input edited after sealing is detected by the content check')
+
+        v1_10 = dict(sealed, schema_version='v1.10', tool_calls=None,
+                     content={k: v for k, v in sealed['content'].items() if 'tool_calls' not in k})
+        del v1_10['tool_calls']
+        v1_10['event_hash'] = recompute_event_hash(v1_10, 0, genesis)
+        v1_10_manifest = {'hash_version': 'v1', 'prefix': 'audit/self-test/',
+                          'events': [{'sequence': 0, 'recomputed_event_hash': v1_10['event_hash']}]}
+        path.write_bytes(json.dumps(v1_10).encode('utf-8'))
+        clean = verify_manifest_with(local_fetcher(records), v1_10_manifest, quiet=True)
+        path.write_bytes(json.dumps(dict(v1_10, tool_calls=calls)).encode('utf-8'))
+        injected = not verify_manifest_with(local_fetcher(records), v1_10_manifest, quiet=True)
+        check('21h', clean and injected,
+              'tool calls added to a sealed v1.10 record are reported as unattested')
 
     return ok
 
@@ -4255,7 +4681,9 @@ def main():
     if args.self_test:
         ok = run_self_test()
         ok = offline_self_test() and ok
+        ok = attribution_self_test() and ok
         ok = content_self_test() and ok
+        ok = tool_calls_self_test() and ok
         ok = signature_self_test() and ok
         sys.exit(0 if ok else 1)
 
