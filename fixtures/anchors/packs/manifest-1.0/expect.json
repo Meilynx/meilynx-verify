@@ -1,0 +1,11 @@
+{
+  "runs": [
+    {
+      "args": [],
+      "contains": [
+        "NOTICE: UNANCHORED — this pack predates"
+      ],
+      "exit": 0
+    }
+  ]
+}

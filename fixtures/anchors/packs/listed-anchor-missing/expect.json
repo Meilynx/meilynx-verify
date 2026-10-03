@@ -1,0 +1,16 @@
+{
+  "runs": [
+    {
+      "args": [
+        "--tsa-root",
+        "test-rsa=roots/rsa-root.der",
+        "--tsa-root",
+        "test-ec=roots/ec-root.der"
+      ],
+      "contains": [
+        "FAIL anchor seq=4: statement object is missing"
+      ],
+      "exit": 1
+    }
+  ]
+}

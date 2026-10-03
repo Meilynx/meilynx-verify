@@ -116,6 +116,13 @@ from pathlib import Path
 
 GENESIS_STRING = "meilynx-genesis-v1"
 SUPPORTED_HASH_VERSIONS = {"v1"}
+# Manifest schema versions this verifier understands. 1.1 adds the
+# `anchoring` section (chain-head anchors, MEI-2758 / ADR-0075).
+SUPPORTED_MANIFEST_SCHEMA_VERSIONS = ("1.0", "1.1")
+# Pack features this verifier checks, read by the release-sync gate
+# (check-meilynx-verify-sync.sh --covers) so a generator never ships a
+# feature the public verifier would silently skip.
+VERIFIER_CAPABILITIES = frozenset({"chain-anchors-v1"})
 
 # Exit codes (listed in the module docstring).
 EXIT_OK = 0
@@ -2786,6 +2793,21 @@ def exporting_fetcher(fetch, export_dir):
     return fetch_and_export
 
 
+def timestamp_recording_fetcher(fetch, times):
+    """Wrap `fetch` so the time of every record it returns is kept in
+    `times` (seq -> epoch seconds), for the anchor clock check."""
+
+    def fetch_and_record(seq):
+        raw = fetch(seq)
+        try:
+            times[seq] = _epoch_of_record(json.loads(raw))
+        except (ValueError, TypeError, AttributeError):
+            pass  # ADR-0013 A: deliberately swallowed — the chain walk reports an unreadable record itself
+        return raw
+
+    return fetch_and_record
+
+
 def verify_manifest(bucket_name, manifest, storage_client):
     """Walk each event in the manifest, re-fetch from GCS, recompute hash."""
     prefix = manifest.get('prefix', 'audit/')
@@ -3343,6 +3365,115 @@ def ecdsa_verify_der(c, public_point, digest, signature_der):
     return ecdsa_verify(c, public_point, digest, r, s)
 
 
+# ── RSA (PKCS#1 v1.5 and PSS) and the signature backend ───────────────────
+# Verification only, over public inputs, for RFC 3161 timestamp tokens
+# (MEI-2758). PKCS#1 v1.5 rebuilds the whole k-byte encoding and compares it,
+# never parsing the decrypted block, so there is no lenient-parser
+# forgery surface (Bleichenbacher 2006). PSS is EMSA-PSS-VERIFY (RFC 8017
+# §9.1.2) with MGF1 over the signature hash and a salt as long as that hash.
+
+RSA_MIN_BITS = 2048
+RSA_MAX_BITS = 8192
+_RSA_HASH_LEN = {"sha256": 32, "sha384": 48, "sha512": 64}
+_DIGEST_INFO_PREFIX = {
+    "sha256": bytes.fromhex("3031300d060960864801650304020105000420"),
+    "sha384": bytes.fromhex("3041300d060960864801650304020205000430"),
+    "sha512": bytes.fromhex("3051300d060960864801650304020305000440"),
+}
+
+
+def _rsa_public(n, e, signature):
+    """s^e mod n as a k-byte string, or None when the signature is not a
+    k-byte value below n (RFC 8017 §8.2.2 step 1, §5.2.2)."""
+    k = (n.bit_length() + 7) // 8
+    if len(signature) != k:
+        return None
+    s = int.from_bytes(signature, "big")
+    if s >= n:
+        return None
+    return pow(s, e, n).to_bytes(k, "big")
+
+
+def rsa_pkcs1v15_verify(n, e, hash_name, digest, signature):
+    """True iff `signature` is RSASSA-PKCS1-v1_5 over the already hashed
+    `digest` under (n, e)."""
+    em = _rsa_public(n, e, signature)
+    if em is None or len(digest) != _RSA_HASH_LEN[hash_name]:
+        return False
+    t = _DIGEST_INFO_PREFIX[hash_name] + digest
+    k = len(em)
+    if k < len(t) + 11:
+        return False
+    return em == b"\x00\x01" + b"\xff" * (k - len(t) - 3) + b"\x00" + t
+
+
+def _mgf1(hash_name, seed, length):
+    out = b""
+    counter = 0
+    while len(out) < length:
+        out += hashlib.new(hash_name, seed + struct.pack(">I", counter)).digest()
+        counter += 1
+    return out[:length]
+
+
+def rsa_pss_verify(n, e, hash_name, digest, signature, salt_len):
+    """True iff `signature` is RSASSA-PSS over the already hashed `digest`
+    under (n, e), MGF1 with the same hash, and a salt of `salt_len` bytes."""
+    em_full = _rsa_public(n, e, signature)
+    h_len = _RSA_HASH_LEN[hash_name]
+    if em_full is None or len(digest) != h_len:
+        return False
+    em_bits = n.bit_length() - 1
+    em_len = (em_bits + 7) // 8
+    em = em_full[len(em_full) - em_len:]
+    if len(em_full) > em_len and em_full[0] != 0:
+        return False
+    if em_len < h_len + salt_len + 2 or em[-1] != 0xBC:
+        return False
+    masked_db, h = em[:em_len - h_len - 1], em[em_len - h_len - 1:-1]
+    unused_bits = 8 * em_len - em_bits
+    if unused_bits and masked_db[0] >> (8 - unused_bits):
+        return False
+    db = bytes(a ^ b for a, b in zip(masked_db, _mgf1(hash_name, h, len(masked_db))))
+    db = bytes([db[0] & (0xFF >> unused_bits)]) + db[1:]
+    pad_len = em_len - h_len - salt_len - 2
+    if db[:pad_len] != b"\x00" * pad_len or db[pad_len] != 0x01:
+        return False
+    salt = db[len(db) - salt_len:] if salt_len else b""
+    m_prime = b"\x00" * 8 + digest + salt
+    return hashlib.new(hash_name, m_prime).digest() == h
+
+
+class SigBackend:
+    """The signature primitives every check goes through. One backend, so a
+    reviewer reads one place to see which algorithms this verifier runs."""
+
+    def ecdsa(self, curve, public_point, digest, signature_der):
+        raise NotImplementedError
+
+    def rsa_pkcs1v15(self, n, e, hash_name, digest, signature):
+        raise NotImplementedError
+
+    def rsa_pss(self, n, e, hash_name, digest, signature, salt_len):
+        raise NotImplementedError
+
+
+class StdlibBackend(SigBackend):
+    """Pure-stdlib implementations (this file has no dependencies)."""
+
+    def ecdsa(self, curve, public_point, digest, signature_der):
+        return ecdsa_verify_der(curve, public_point, digest, signature_der)
+
+    def rsa_pkcs1v15(self, n, e, hash_name, digest, signature):
+        return rsa_pkcs1v15_verify(n, e, hash_name, digest, signature)
+
+    def rsa_pss(self, n, e, hash_name, digest, signature, salt_len):
+        return rsa_pss_verify(n, e, hash_name, digest, signature, salt_len)
+
+
+SIG_BACKEND = StdlibBackend()
+
+
 OID_EC_PUBLIC_KEY = "1.2.840.10045.2.1"
 SIGNATURE_HASHES = {
     "1.2.840.10045.4.3.2": hashlib.sha256,  # ecdsa-with-SHA256
@@ -3430,7 +3561,7 @@ class Certificate:
         self.not_before = _der_time(validity[0][0], der[validity[0][1]:validity[0][2]])
         self.not_after = _der_time(validity[1][0], der[validity[1][1]:validity[1][2]])
         self.spki = der[tbs[6][3]:tbs[6][2]]
-        self.curve, self.public_point = parse_ec_public_key(self.spki)
+        self._load_public_key()
 
         self.extensions = {}
         rest = tbs[7:]
@@ -3457,6 +3588,11 @@ class Certificate:
                 if oid in self.extensions:
                     raise DerError(f"duplicate extension {oid}")
                 self.extensions[oid] = (critical, der[parts[1][1]:parts[1][2]])
+
+    def _load_public_key(self):
+        """The Fulcio path accepts EC keys only (P-256 / P-384)."""
+        self.key_kind = "ec"
+        self.curve, self.public_point = parse_ec_public_key(self.spki)
 
     @staticmethod
     def _signature_algorithm(der, node):
@@ -3550,7 +3686,7 @@ class Certificate:
 
     def signed_by(self, issuer_cert):
         digest = SIGNATURE_HASHES[self.signature_algorithm](self.tbs).digest()
-        return ecdsa_verify_der(issuer_cert.curve, issuer_cert.public_point, digest, self.signature)
+        return SIG_BACKEND.ecdsa(issuer_cert.curve, issuer_cert.public_point, digest, self.signature)
 
 
 KEY_USAGE_DIGITAL_SIGNATURE = 0x8000
@@ -3562,6 +3698,8 @@ def verify_certificate_chain(leaf, chain, at_time):
     Returns None when valid, else a short reason."""
     try:
         for cert in [leaf] + chain:
+            if cert.key_kind != "ec":
+                return "certificate key is not an EC key"
             unknown = cert.unknown_critical_extensions()
             if unknown:
                 return f"unknown critical extension {unknown[0]}"
@@ -3708,7 +3846,7 @@ def verify_checkpoint(envelope, log, key_id, tree_size, root):
             raw = base64.b64decode(parts[2], validate=True)
         except (ValueError, binascii.Error):
             continue
-        if raw[:4] == key_id[:4] and ecdsa_verify_der(log["curve"], log["point"], digest, raw[4:]):
+        if raw[:4] == key_id[:4] and SIG_BACKEND.ecdsa(log["curve"], log["point"], digest, raw[4:]):
             return None
     return "checkpoint is not signed by the transparency log"
 
@@ -3780,7 +3918,7 @@ def verify_sigstore_bundle(bundle, artifact_digest, expected_identity, expected_
     signature = _b64(message.get("signature"), "signature")
     if _b64(digest_info.get("digest"), "message digest") != artifact_digest:
         raise SignatureInvalid(REASON_MANIFEST_CHANGED, "the digest recorded in the bundle differs from manifest.json")
-    if not ecdsa_verify_der(leaf.curve, leaf.public_point, artifact_digest, signature):
+    if not SIG_BACKEND.ecdsa(leaf.curve, leaf.public_point, artifact_digest, signature):
         raise SignatureInvalid(REASON_MANIFEST_CHANGED, "the signature does not verify over manifest.json")
 
     # 2. The transparency-log entry is authentic.
@@ -3801,7 +3939,7 @@ def verify_sigstore_bundle(bundle, artifact_digest, expected_identity, expected_
         "body": body_b64, "integratedTime": integrated_time,
         "logID": key_id.hex(), "logIndex": log_index,
     }).encode("utf-8")
-    if not ecdsa_verify_der(log["curve"], log["point"], hashlib.sha256(set_payload).digest(),
+    if not SIG_BACKEND.ecdsa(log["curve"], log["point"], hashlib.sha256(set_payload).digest(),
                             _b64(promise, "signed entry timestamp")):
         raise SignatureInvalid(REASON_TLOG_INVALID, "signed entry timestamp does not verify")
     proof = entry.get("inclusionProof")
@@ -3958,6 +4096,1312 @@ UNSIGNED_NOTICE = (
     "The chain check shows the records are intact and correctly linked. "
     "It cannot show who produced this manifest."
 )
+
+
+# ── Chain-head anchors (MEI-2758, ADR-0075) ────────────────────────────────
+# RFC 3161 timestamp tokens over chain-head statements, stored next to the
+# chain as anchors/{chain}/{seq:020}.json (the statement) and
+# anchors/{chain}/{seq:020}.{tsa_id}.tsr (one token per witness). Every rule
+# below mirrors the proxy's verifier (crates/meilynx-audit/src/anchor/verify.rs)
+# and is never weaker; failure codes use the same names, so a defect is
+# reported identically by both. The two proxy-only checks (the request nonce
+# and genTime against the live clock) cannot be made offline; in their place
+# a record whose own clock is ahead of the anchor that covers it is a NOTICE.
+
+ANCHOR_STATEMENT_VERSION = "meilynx.anchor.v1"
+ANCHOR_HASH_ALG = "sha-256"
+ANCHOR_IMPRINT_DOMAIN = b"meilynx-anchor-v1\n"
+ANCHOR_CLOCK_TOLERANCE_SECONDS = 300
+_JSON_SAFE_MAX = (1 << 53) - 1
+LEGACY_FLAT_CHAIN = "legacy-flat"
+
+OID_SIGNED_DATA = "1.2.840.113549.1.7.2"
+OID_CT_TST_INFO = "1.2.840.113549.1.9.16.1.4"
+OID_ATTR_CONTENT_TYPE = "1.2.840.113549.1.9.3"
+OID_ATTR_MESSAGE_DIGEST = "1.2.840.113549.1.9.4"
+OID_ATTR_SIGNING_TIME = "1.2.840.113549.1.9.5"
+OID_ATTR_SIGNING_CERT_V1 = "1.2.840.113549.1.9.16.2.12"
+OID_ATTR_SIGNING_CERT_V2 = "1.2.840.113549.1.9.16.2.47"
+OID_ATTR_CMS_ALG_PROTECTION = "1.2.840.113549.1.9.52"
+OID_SHA256 = "2.16.840.1.101.3.4.2.1"
+OID_SHA384 = "2.16.840.1.101.3.4.2.2"
+OID_SHA512 = "2.16.840.1.101.3.4.2.3"
+OID_RSA_ENCRYPTION = "1.2.840.113549.1.1.1"
+OID_RSASSA_PSS = "1.2.840.113549.1.1.10"
+OID_MGF1 = "1.2.840.113549.1.1.8"
+OID_SUBJECT_KEY_ID = "2.5.29.14"
+OID_TIME_STAMPING = "1.3.6.1.5.5.7.3.8"
+TSA_DIGESTS = {OID_SHA256: "sha256", OID_SHA384: "sha384", OID_SHA512: "sha512"}
+TSA_RSA_SIGNATURES = {
+    "1.2.840.113549.1.1.11": "sha256",
+    "1.2.840.113549.1.1.12": "sha384",
+    "1.2.840.113549.1.1.13": "sha512",
+}
+TSA_ECDSA_SIGNATURES = {
+    "1.2.840.10045.4.3.2": "sha256",
+    "1.2.840.10045.4.3.3": "sha384",
+    "1.2.840.10045.4.3.4": "sha512",
+}
+_TSA_ALLOWED_SIGNED_ATTRIBUTES = {
+    OID_ATTR_CONTENT_TYPE, OID_ATTR_MESSAGE_DIGEST, OID_ATTR_SIGNING_TIME,
+    OID_ATTR_SIGNING_CERT_V2, OID_ATTR_CMS_ALG_PROTECTION,
+}
+_TSA_MAX_PATH_DEPTH = 4
+
+
+class AnchorFailure(Exception):
+    """One anchor check failed. `code` matches the proxy's
+    AnchorVerifyError::code() wherever the check is shared."""
+
+    def __init__(self, code, detail=""):
+        super().__init__(f"{code}: {detail}" if detail else code)
+        self.code = code
+        self.detail = detail
+
+
+def _tsa_digest_alg(buf, node):
+    """AlgorithmIdentifier of an allowlisted digest -> hashlib name. SHA-1,
+    MD5 and anything else are refused; parameters must be absent or NULL."""
+    kids = _der_children(buf, node[1], node[2])
+    if not kids or kids[0][0] != 0x06 or len(kids) > 2:
+        raise DerError("malformed AlgorithmIdentifier")
+    oid = _der_oid(buf[kids[0][1]:kids[0][2]])
+    if oid not in TSA_DIGESTS:
+        raise AnchorFailure("algorithm_not_allowed", f"digest {oid}")
+    if len(kids) == 2 and (kids[1][0] != 0x05 or kids[1][2] != kids[1][1]):
+        raise DerError("unexpected digest algorithm parameters")
+    return TSA_DIGESTS[oid]
+
+
+def _tsa_alg_id(buf, node):
+    """AlgorithmIdentifier -> (oid, params node or None)."""
+    if node[0] != 0x30:
+        raise DerError("AlgorithmIdentifier is not a SEQUENCE")
+    kids = _der_children(buf, node[1], node[2])
+    if not kids or kids[0][0] != 0x06 or len(kids) > 2:
+        raise DerError("malformed AlgorithmIdentifier")
+    return _der_oid(buf[kids[0][1]:kids[0][2]]), (kids[1] if len(kids) == 2 else None)
+
+
+def _null_or_absent(buf, params):
+    return params is None or (params[0] == 0x05 and params[1] == params[2])
+
+
+def _tsa_pss_params(buf, params):
+    """RSASSA-PSS-params: hash == MGF1 hash, salt == hash length, trailer 1.
+    The DEFAULT values are SHA-1, so an omitted hash or MGF is refused."""
+    if params is None or params[0] != 0x30:
+        raise DerError("RSASSA-PSS-params missing")
+    fields = _der_children(buf, params[1], params[2])
+    i = 0
+    if i < len(fields) and fields[i][0] == 0xA0:
+        inner = _der_children(buf, fields[i][1], fields[i][2])
+        if len(inner) != 1:
+            raise DerError("malformed RSASSA-PSS hashAlgorithm")
+        hash_name = _tsa_digest_alg(buf, inner[0])
+        i += 1
+    else:
+        raise AnchorFailure("algorithm_not_allowed", "RSASSA-PSS default (SHA-1)")
+    if i < len(fields) and fields[i][0] == 0xA1:
+        inner = _der_children(buf, fields[i][1], fields[i][2])
+        if len(inner) != 1:
+            raise DerError("malformed RSASSA-PSS maskGenAlgorithm")
+        mgf_oid, mgf_params = _tsa_alg_id(buf, inner[0])
+        if mgf_oid != OID_MGF1:
+            raise AnchorFailure("algorithm_not_allowed", f"MGF {mgf_oid}")
+        if mgf_params is None:
+            raise DerError("MGF1 without a hash")
+        mgf_hash = _tsa_digest_alg(buf, mgf_params)
+        i += 1
+    else:
+        raise AnchorFailure("algorithm_not_allowed", "MGF1 default (SHA-1)")
+    salt = 20
+    if i < len(fields) and fields[i][0] == 0xA2:
+        inner = _der_children(buf, fields[i][1], fields[i][2])
+        if len(inner) != 1 or inner[0][0] != 0x02:
+            raise DerError("malformed RSASSA-PSS saltLength")
+        salt = _der_positive_int(buf[inner[0][1]:inner[0][2]])
+        i += 1
+    if i < len(fields) and fields[i][0] == 0xA3:
+        inner = _der_children(buf, fields[i][1], fields[i][2])
+        if len(inner) != 1 or inner[0][0] != 0x02 or _der_positive_int(buf[inner[0][1]:inner[0][2]]) != 1:
+            raise DerError("RSASSA-PSS trailer field is not 1")
+        i += 1
+    if i != len(fields):
+        raise DerError("trailing RSASSA-PSS-params fields")
+    if hash_name != mgf_hash or salt != _RSA_HASH_LEN[hash_name]:
+        raise AnchorFailure("algorithm_not_allowed",
+                            f"RSASSA-PSS hash {hash_name}, MGF1 {mgf_hash}, salt {salt}")
+    return hash_name
+
+
+def _pss_algorithm_identifier(hash_oid_hex, salt_len):
+    """The one DER form of an RSASSA-PSS AlgorithmIdentifier that webpki
+    accepts in a certificate: explicit hash with NULL parameters, MGF1 over
+    the same hash, salt = hash length, no trailer field."""
+    hash_alg = bytes.fromhex("300d0609" + hash_oid_hex + "0500")
+    mgf = bytes.fromhex("301a06092a864886f70d010108") + hash_alg
+    params = (b"\xa0\x0f" + hash_alg + b"\xa1\x1c" + mgf + bytes([0xA2, 0x03, 0x02, 0x01, salt_len]))
+    body = bytes.fromhex("06092a864886f70d01010a") + b"\x30" + bytes([len(params)]) + params
+    return b"\x30" + bytes([len(body)]) + body
+
+
+_CERT_PSS_ALGORITHMS = {
+    _pss_algorithm_identifier("608648016503040201", 32): "sha256",
+    _pss_algorithm_identifier("608648016503040202", 48): "sha384",
+    _pss_algorithm_identifier("608648016503040203", 64): "sha512",
+}
+
+
+class TsaCertificate(Certificate):
+    """A certificate on a timestamp authority's path. Same strict parser as
+    `Certificate` (the Fulcio path keeps that class, EC-only, unchanged);
+    this one also accepts RSA keys and the TSA signature algorithms, and
+    resolves the signature algorithm lazily so an off-allowlist one is an
+    `algorithm_not_allowed` failure rather than a parse error."""
+
+    def __init__(self, der):
+        super().__init__(der)
+        cert = _der_children(der, *_der_expect(der, 0, len(der), 0x30))
+        tbs = _der_children(der, cert[0][1], cert[0][2])
+        _der_positive_int(der[tbs[1][1]:tbs[1][2]])
+        self.serial = _strip_zeros(der[tbs[1][1]:tbs[1][2]])
+
+    def _load_public_key(self):
+        self.key_kind, self.curve, self.public_point, self.rsa_n, self.rsa_e = "other", None, None, None, None
+        cs, ce = _der_expect(self.spki, 0, len(self.spki), 0x30)
+        kids = _der_children(self.spki, cs, ce)
+        if len(kids) != 2 or kids[0][0] != 0x30 or kids[1][0] != 0x03:
+            raise DerError("malformed SubjectPublicKeyInfo")
+        oid, params = _tsa_alg_id(self.spki, kids[0])
+        if oid == OID_EC_PUBLIC_KEY:
+            try:
+                self.curve, self.public_point = parse_ec_public_key(self.spki)
+                self.key_kind = "ec"
+            except DerError:
+                self.key_kind = "other"  # a curve or point this verifier does not allow
+        elif oid == OID_RSA_ENCRYPTION:
+            if params is None or params[0] != 0x05 or params[1] != params[2]:
+                return  # webpki only matches rsaEncryption with NULL parameters
+            bits = self.spki[kids[1][1]:kids[1][2]]
+            if not bits or bits[0] != 0:
+                raise DerError("RSA key with unused bits")
+            rcs, rce = _der_expect(bits, 1, len(bits), 0x30)
+            if rce != len(bits):
+                raise DerError("trailing bytes after RSAPublicKey")
+            ints = _der_children(bits, rcs, rce)
+            if len(ints) != 2 or ints[0][0] != 0x02 or ints[1][0] != 0x02:
+                raise DerError("malformed RSAPublicKey")
+            self.rsa_n = _der_positive_int(bits[ints[0][1]:ints[0][2]])
+            self.rsa_e = _der_positive_int(bits[ints[1][1]:ints[1][2]])
+            self.key_kind = "rsa"
+
+    @staticmethod
+    def _signature_algorithm(der, node):
+        oid, params = _tsa_alg_id(der, node)
+        if oid in TSA_RSA_SIGNATURES and _null_or_absent(der, params):
+            return ("rsa", TSA_RSA_SIGNATURES[oid])
+        if oid in TSA_ECDSA_SIGNATURES and params is None:
+            return ("ecdsa", TSA_ECDSA_SIGNATURES[oid])
+        if oid == OID_RSASSA_PSS and der[node[3]:node[2]] in _CERT_PSS_ALGORITHMS:
+            return ("pss", _CERT_PSS_ALGORITHMS[der[node[3]:node[2]]])
+        return ("unsupported", oid)
+
+    def subject_key_id(self):
+        ext = self.extensions.get(OID_SUBJECT_KEY_ID)
+        if ext is None:
+            return None
+        value = ext[1]
+        cs, ce = _der_expect(value, 0, len(value), 0x04)
+        if ce != len(value):
+            raise DerError("malformed subjectKeyIdentifier")
+        return value[cs:ce]
+
+    def eku_with_criticality(self):
+        """(critical, [purpose OIDs]) or None. A list, not a set: a purpose
+        listed twice is not "exactly id-kp-timeStamping"."""
+        ext = self.extensions.get(OID_EXT_KEY_USAGE)
+        if ext is None:
+            return None
+        value = ext[1]
+        cs, ce = _der_expect(value, 0, len(value), 0x30)
+        if ce != len(value):
+            raise DerError("malformed extKeyUsage")
+        purposes = []
+        for tag, vcs, vce, _ in _der_children(value, cs, ce):
+            if tag != 0x06:
+                raise DerError("malformed extKeyUsage")
+            purposes.append(_der_oid(value[vcs:vce]))
+        return ext[0], purposes
+
+    def rsa_bits(self):
+        return self.rsa_n.bit_length() if self.key_kind == "rsa" else 0
+
+    def signed_by(self, issuer_cert):
+        """Verify this certificate's signature with `issuer_cert`'s key under
+        the TSA allowlist. Raises AnchorFailure('algorithm_not_allowed') for an
+        algorithm or key the allowlist refuses; returns False for a bad
+        signature."""
+        kind, hash_name = self.signature_algorithm
+        if kind == "unsupported":
+            raise AnchorFailure("algorithm_not_allowed", f"certificate signature {hash_name}")
+        digest = hashlib.new(hash_name, self.tbs).digest()
+        if kind in ("rsa", "pss"):
+            if issuer_cert.key_kind != "rsa" or not RSA_MIN_BITS <= issuer_cert.rsa_bits() <= RSA_MAX_BITS:
+                raise AnchorFailure("algorithm_not_allowed", "certificate signature key")
+            if kind == "rsa":
+                return SIG_BACKEND.rsa_pkcs1v15(issuer_cert.rsa_n, issuer_cert.rsa_e, hash_name, digest,
+                                                self.signature)
+            return SIG_BACKEND.rsa_pss(issuer_cert.rsa_n, issuer_cert.rsa_e, hash_name, digest,
+                                       self.signature, _RSA_HASH_LEN[hash_name])
+        if issuer_cert.key_kind != "ec":
+            raise AnchorFailure("algorithm_not_allowed", "certificate signature key")
+        return SIG_BACKEND.ecdsa(issuer_cert.curve, issuer_cert.public_point, digest, self.signature)
+
+
+class TsaRoot:
+    """A trusted TSA root and the window in which it is trusted. `supplied`
+    marks a root the reviewer passed with --tsa-root rather than one pinned
+    in this file; a token that verifies through it is reported by name."""
+
+    def __init__(self, name, der, start, end, supplied=False):
+        self.name = name
+        self.cert = TsaCertificate(der)
+        self.start = start
+        self.end = end
+        self.supplied = supplied
+        self.fingerprint = hashlib.sha256(der).hexdigest().upper()
+
+    def trusted_at(self, t):
+        return self.start <= t <= self.end
+
+
+# ADR-0075 D10 pins. Each root's SHA-256 is asserted when it is loaded.
+TSA_TRUST_ROOTS = {
+    "sigstore": [(
+        "sigstore-tsa-selfsigned (sigstore/root-signing trusted_root.json @ c9bda74)",
+        (
+            "MIIB9zCCAXygAwIBAgIUV7f0GLDOoEzIh8LXSW80OJiUp14wCgYIKoZIzj0EAwMwOTEVMBMGA1UEChMMc2lnc3RvcmUuZGV2"
+            "MSAwHgYDVQQDExdzaWdzdG9yZS10c2Etc2VsZnNpZ25lZDAeFw0yNTA0MDgwNjU5NDNaFw0zNTA0MDYwNjU5NDNaMDkxFTAT"
+            "BgNVBAoTDHNpZ3N0b3JlLmRldjEgMB4GA1UEAxMXc2lnc3RvcmUtdHNhLXNlbGZzaWduZWQwdjAQBgcqhkjOPQIBBgUrgQQA"
+            "IgNiAAQUQNtfRT/ou3YATa6wB/kKTe70cfJwyRIBovMnt8RcJph/COE82uyS6FmppLLL1VBPGcPfpQPYJNXzWwi8icwhKQ6W"
+            "/Qe2h3oebBb2FHpwNJDqo+TMaC/tdfkv/ElJB72jRTBDMA4GA1UdDwEB/wQEAwIBBjASBgNVHRMBAf8ECDAGAQH/AgEAMB0G"
+            "A1UdDgQWBBSY7AHvf7tR/9SVHm+KiJhTB4nOvzAKBggqhkjOPQQDAwNpADBmAjEAwGEGrfGZR1cen1R8/DTVMI943LssZmJR"
+            "tDp/i7SfGHmGRP6gRbuj9vOK3b67Z0QQAjEAuT2H673LQEaHTcyQSZrkp4mX7WwkmF+sVbkYY5mXN+RMH13KUEHHOqASaemY"
+            "WK/E"
+        ),
+        "2ACA8FEA5D3CE48B01CC77076293C280E6C23FFE44034757EE7833CA9F45D633",
+        "2025-07-04T00:00:00Z", None,
+    )],
+    "globalsign-r45": [(
+        "GlobalSign Root CA - R6",
+        (
+            "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"
+        ),
+        "2CABEAFE37D06CA22ABA7391C0033D25982952C453647349763A3AB5AD6CCF69",
+        "2014-12-10T00:00:00Z", "2034-12-10T00:00:00Z",
+    )],
+}
+
+
+def load_pinned_tsa_roots():
+    """tsa_id -> [TsaRoot] for the built-in witnesses. Raises ValueError if
+    a pinned root's fingerprint does not match (the file was edited)."""
+    out = {}
+    for tsa_id, entries in TSA_TRUST_ROOTS.items():
+        roots = []
+        for name, b64, fingerprint, start, end in entries:
+            der = base64.b64decode(b64, validate=True)
+            if hashlib.sha256(der).hexdigest().upper() != fingerprint:
+                raise ValueError(f"pinned TSA root {name} does not match its fingerprint")
+            roots.append(TsaRoot(name, der, _rfc3339_to_epoch(start),
+                                 _rfc3339_to_epoch(end) if end else float("inf")))
+        out[tsa_id] = roots
+    return out
+
+
+def load_tsa_roots_pem(tsa_id, text):
+    """--tsa-root ID=FILE: PEM certificates trusted for witness `tsa_id`, each
+    only within its own notBefore..notAfter (ADR-0075 D10)."""
+    blocks = re.findall(r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", text, re.S)
+    leftover = re.sub(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", "", text, flags=re.S)
+    if not blocks or leftover.strip():
+        raise ValueError(f"--tsa-root {tsa_id}: not a PEM certificate bundle")
+    roots = []
+    for i, block in enumerate(blocks):
+        der = base64.b64decode("".join(block.split()), validate=True)
+        cert = TsaCertificate(der)
+        roots.append(TsaRoot(f"{tsa_id}-root-{i}", der, cert.not_before, cert.not_after, supplied=True))
+    return roots
+
+
+def _tsa_gen_time(content):
+    """GeneralizedTime as RFC 3161 allows it: YYYYMMDDHHMMSS[.f+]Z, no
+    trailing zero in the fraction. Returns epoch seconds (float)."""
+    text = content.decode("ascii")
+    m = re.fullmatch(r"(\d{14})(?:\.(\d{1,9}))?Z", text)
+    if not m or (m.group(2) is not None and m.group(2).endswith("0")):
+        raise DerError("malformed genTime")
+    d = m.group(1)
+    moment = datetime.datetime(int(d[0:4]), int(d[4:6]), int(d[6:8]), int(d[8:10]), int(d[10:12]),
+                               int(d[12:14]), tzinfo=datetime.timezone.utc)
+    frac = m.group(2) or ""
+    return moment.timestamp() + (int(frac) / 10 ** len(frac) if frac else 0.0)
+
+
+def _strip_zeros(b):
+    return b.lstrip(b"\x00")
+
+
+def verify_tsa_token(response, imprint, roots):
+    """Fully verify one RFC 3161 TimeStampResp against `imprint` and the
+    witness's `roots` ([TsaRoot]). Returns {'gen_time', 'signature_algorithm'}
+    or raises AnchorFailure; malformed DER is AnchorFailure('malformed')."""
+    try:
+        return _verify_tsa_token(response, imprint, roots)
+    except DerError as exc:
+        raise AnchorFailure("malformed", str(exc))
+    except (UnicodeDecodeError, ValueError, IndexError) as exc:
+        raise AnchorFailure("malformed", str(exc))
+
+
+def _verify_tsa_token(resp, imprint, roots):
+    cs, ce = _der_expect(resp, 0, len(resp), 0x30)
+    if ce != len(resp):
+        raise DerError("trailing bytes after TimeStampResp")
+    top = _der_children(resp, cs, ce)
+    if not top or top[0][0] != 0x30:
+        raise DerError("malformed PKIStatusInfo")
+    status_info = _der_children(resp, top[0][1], top[0][2])
+    if not status_info or status_info[0][0] != 0x02:
+        raise DerError("malformed PKIStatus")
+    status = _der_positive_int(resp[status_info[0][1]:status_info[0][2]])
+    if status != 0:
+        raise AnchorFailure("not_granted", f"PKIStatus {status}")
+    if len(top) < 2:
+        raise AnchorFailure("no_token")
+    if len(top) > 2:
+        raise DerError("trailing TimeStampResp fields")
+
+    ci = _der_children(resp, top[1][1], top[1][2])
+    if top[1][0] != 0x30 or len(ci) != 2 or ci[0][0] != 0x06 or ci[1][0] != 0xA0:
+        raise DerError("malformed ContentInfo")
+    if _der_oid(resp[ci[0][1]:ci[0][2]]) != OID_SIGNED_DATA:
+        raise AnchorFailure("not_timestamp_token")
+    wrapper = _der_children(resp, ci[1][1], ci[1][2])
+    if len(wrapper) != 1 or wrapper[0][0] != 0x30:
+        raise DerError("malformed SignedData wrapper")
+    sd = _der_children(resp, wrapper[0][1], wrapper[0][2])
+    if len(sd) < 4 or sd[0][0] != 0x02:
+        raise DerError("malformed SignedData")
+    sd_version = _der_positive_int(resp[sd[0][1]:sd[0][2]])
+    if sd_version != 3:
+        raise AnchorFailure("unsupported_version", f"SignedData {sd_version}")
+    if sd[1][0] != 0x31:
+        raise DerError("malformed digestAlgorithms")
+    for alg in _der_children(resp, sd[1][1], sd[1][2]):
+        _tsa_digest_alg(resp, alg)
+    if sd[2][0] != 0x30:
+        raise DerError("malformed EncapsulatedContentInfo")
+    encap = _der_children(resp, sd[2][1], sd[2][2])
+    if len(encap) != 2 or encap[0][0] != 0x06 or encap[1][0] != 0xA0:
+        raise DerError("malformed EncapsulatedContentInfo")
+    if _der_oid(resp[encap[0][1]:encap[0][2]]) != OID_CT_TST_INFO:
+        raise AnchorFailure("not_timestamp_token")
+    octets = _der_children(resp, encap[1][1], encap[1][2])
+    if len(octets) != 1 or octets[0][0] != 0x04:
+        raise DerError("malformed eContent")
+    tst_der = resp[octets[0][1]:octets[0][2]]
+
+    rest = sd[3:]
+    certificates = []
+    if rest and rest[0][0] == 0xA0:
+        for cert in _der_children(resp, rest[0][1], rest[0][2]):
+            if cert[0] != 0x30:
+                raise DerError("only X.509 certificates are accepted")
+            certificates.append(resp[cert[3]:cert[2]])
+        rest = rest[1:]
+    if rest and rest[0][0] == 0xA1:
+        raise DerError("CRLs inside a timestamp token are not accepted")
+    if len(rest) != 1 or rest[0][0] != 0x31:
+        raise DerError("malformed signerInfos")
+    signer_infos = _der_children(resp, rest[0][1], rest[0][2])
+    if len(signer_infos) != 1:
+        raise AnchorFailure("signer_info_count", str(len(signer_infos)))
+
+    tst = _parse_tst_info(tst_der)
+    if tst["imprint_alg"] != OID_SHA256:
+        raise AnchorFailure("algorithm_not_allowed", f"message imprint algorithm {tst['imprint_alg']}")
+    if tst["imprint"] != imprint:
+        raise AnchorFailure("imprint_mismatch")
+    if tst["nonce"] is None:
+        raise AnchorFailure("nonce_missing")
+
+    si = _parse_signer_info(resp, signer_infos[0])
+    digest_name = _tsa_digest_alg(resp, si["digest_alg_node"])
+    attrs = _parse_signed_attributes(resp, si["signed_attrs"])
+    if attrs["content_type"] != OID_CT_TST_INFO:
+        raise AnchorFailure("content_type_mismatch")
+    if attrs["message_digest"] != hashlib.new(digest_name, tst_der).digest():
+        raise AnchorFailure("message_digest_mismatch")
+    if attrs["algorithm_protection"] is not None and attrs["algorithm_protection"] != (
+            si["digest_alg_oid"], si["signature_alg_oid"]):
+        raise AnchorFailure("algorithm_protection_mismatch")
+
+    ess_hash, ess_cert_hash, ess_serial = attrs["ess"]
+    signer_der = next((c for c in certificates if hashlib.new(ess_hash, c).digest() == ess_cert_hash), None)
+    if signer_der is None:
+        raise AnchorFailure("signer_certificate_not_found")
+    signer = TsaCertificate(signer_der)
+    if ess_serial is not None and ess_serial != signer.serial:
+        raise AnchorFailure("signer_identifier_mismatch")
+    if si["sid"][0] == "issuer_serial":
+        if si["sid"][1] != signer.issuer or si["sid"][2] != signer.serial:
+            raise AnchorFailure("signer_identifier_mismatch")
+    elif signer.subject_key_id() != si["sid"][1]:
+        raise AnchorFailure("signer_identifier_mismatch")
+
+    sig_kind, sig_name = _tsa_signature_alg(resp, si, digest_name, signer)
+    if signer.unknown_critical_extensions():
+        raise AnchorFailure("untrusted_chain",
+                            f"signer certificate: UnsupportedCriticalExtension "
+                            f"{signer.unknown_critical_extensions()[0]}")
+    signed_set = b"\x31" + resp[si["signed_attrs"][3] + 1:si["signed_attrs"][2]]
+    digest = hashlib.new(digest_name, signed_set).digest()
+    if sig_kind == "rsa":
+        good = SIG_BACKEND.rsa_pkcs1v15(signer.rsa_n, signer.rsa_e, digest_name, digest, si["signature"])
+    elif sig_kind == "pss":
+        good = SIG_BACKEND.rsa_pss(signer.rsa_n, signer.rsa_e, digest_name, digest, si["signature"],
+                                   _RSA_HASH_LEN[digest_name])
+    else:
+        good = SIG_BACKEND.ecdsa(signer.curve, signer.public_point, digest, si["signature"])
+    if not good:
+        raise AnchorFailure("signature_invalid")
+
+    eku = signer.eku_with_criticality()
+    if eku is None:
+        raise AnchorFailure("timestamping_eku_missing")
+    critical, purposes = eku
+    if OID_TIME_STAMPING not in purposes:
+        raise AnchorFailure("timestamping_eku_missing")
+    if len(purposes) != 1:
+        raise AnchorFailure("timestamping_eku_not_exclusive")
+    if not critical:
+        raise AnchorFailure("timestamping_eku_not_critical")
+
+    gen_time = tst["gen_time"]
+    trusted = [r for r in roots if r.trusted_at(gen_time)]
+    if not trusted:
+        raise AnchorFailure("no_root_trusted_at_gen_time", _iso(gen_time))
+    pool = [TsaCertificate(c) for c in certificates if c != signer_der]
+    root = build_tsa_path(signer, pool, trusted, int(gen_time))
+    return {"gen_time": gen_time, "signature_algorithm": sig_name, "root": root}
+
+
+def _parse_tst_info(der):
+    cs, ce = _der_expect(der, 0, len(der), 0x30)
+    if ce != len(der):
+        raise DerError("trailing bytes after TSTInfo")
+    f = _der_children(der, cs, ce)
+    if len(f) < 5 or f[0][0] != 0x02 or f[1][0] != 0x06 or f[2][0] != 0x30 or f[3][0] != 0x02 or f[4][0] != 0x18:
+        raise DerError("malformed TSTInfo")
+    version = _der_positive_int(der[f[0][1]:f[0][2]])
+    if version != 1:
+        raise AnchorFailure("unsupported_version", f"TSTInfo {version}")
+    _der_oid(der[f[1][1]:f[1][2]])
+    mi = _der_children(der, f[2][1], f[2][2])
+    if len(mi) != 2 or mi[1][0] != 0x04:
+        raise DerError("malformed MessageImprint")
+    imprint_oid, imprint_params = _tsa_alg_id(der, mi[0])
+    if not _null_or_absent(der, imprint_params):
+        raise DerError("unexpected MessageImprint parameters")
+    _der_positive_int(der[f[3][1]:f[3][2]])
+    gen_time = _tsa_gen_time(der[f[4][1]:f[4][2]])
+    i = 5
+    if i < len(f) and f[i][0] == 0x30:  # accuracy
+        i += 1
+    if i < len(f) and f[i][0] == 0x01:  # ordering
+        i += 1
+    nonce = None
+    if i < len(f) and f[i][0] == 0x02:
+        nonce = _strip_zeros(der[f[i][1]:f[i][2]])
+        _der_positive_int(der[f[i][1]:f[i][2]])
+        i += 1
+    if i < len(f) and f[i][0] == 0xA0:  # tsa GeneralName
+        i += 1
+    if i < len(f) and f[i][0] == 0xA1:
+        for ext in _der_children(der, f[i][1], f[i][2]):
+            parts = _der_children(der, ext[1], ext[2]) if ext[0] == 0x30 else []
+            if len(parts) < 2 or parts[0][0] != 0x06:
+                raise DerError("malformed TSTInfo extension")
+            if parts[1][0] == 0x01 and der[parts[1][1]:parts[1][2]] == b"\xff":
+                raise DerError(f"unknown critical TSTInfo extension {_der_oid(der[parts[0][1]:parts[0][2]])}")
+        i += 1
+    if i != len(f):
+        raise DerError("trailing TSTInfo fields")
+    return {"imprint_alg": imprint_oid, "imprint": der[mi[1][1]:mi[1][2]], "gen_time": gen_time,
+            "nonce": nonce}
+
+
+def _parse_signer_info(buf, node):
+    if node[0] != 0x30:
+        raise DerError("SignerInfo is not a SEQUENCE")
+    f = _der_children(buf, node[1], node[2])
+    if len(f) < 5 or f[0][0] != 0x02:
+        raise DerError("malformed SignerInfo")
+    version = _der_positive_int(buf[f[0][1]:f[0][2]])
+    if version == 1:
+        if f[1][0] != 0x30:
+            raise DerError("malformed IssuerAndSerialNumber")
+        ias = _der_children(buf, f[1][1], f[1][2])
+        if len(ias) != 2 or ias[0][0] != 0x30 or ias[1][0] != 0x02:
+            raise DerError("malformed IssuerAndSerialNumber")
+        _der_positive_int(buf[ias[1][1]:ias[1][2]])
+        sid = ("issuer_serial", buf[ias[0][3]:ias[0][2]], _strip_zeros(buf[ias[1][1]:ias[1][2]]))
+    elif version == 3:
+        if f[1][0] != 0x80:
+            raise DerError("malformed subjectKeyIdentifier")
+        sid = ("ski", buf[f[1][1]:f[1][2]])
+    else:
+        raise AnchorFailure("unsupported_version", f"SignerInfo {version}")
+    if f[2][0] != 0x30:
+        raise DerError("malformed digestAlgorithm")
+    if f[3][0] != 0xA0:
+        raise AnchorFailure("missing_signed_attribute", "signedAttrs")
+    if len(f) < 6 or f[4][0] != 0x30 or f[5][0] != 0x04:
+        raise DerError("malformed SignerInfo")
+    extra = f[6:]
+    if extra and extra[0][0] == 0xA1:
+        extra = extra[1:]
+    if extra:
+        raise DerError("trailing SignerInfo fields")
+    sig_oid, sig_params = _tsa_alg_id(buf, f[4])
+    digest_oid, _ = _tsa_alg_id(buf, f[2])
+    return {"sid": sid, "digest_alg_node": f[2], "digest_alg_oid": digest_oid, "signed_attrs": f[3],
+            "signature_alg_oid": sig_oid, "signature_alg_params": sig_params,
+            "signature": buf[f[5][1]:f[5][2]]}
+
+
+def _parse_signed_attributes(buf, node):
+    seen = set()
+    out = {"content_type": None, "message_digest": None, "ess": None, "algorithm_protection": None}
+    for attr in _der_children(buf, node[1], node[2]):
+        parts = _der_children(buf, attr[1], attr[2]) if attr[0] == 0x30 else []
+        if len(parts) != 2 or parts[0][0] != 0x06 or parts[1][0] != 0x31:
+            raise DerError("malformed signed attribute")
+        oid = _der_oid(buf[parts[0][1]:parts[0][2]])
+        if oid in seen:
+            raise AnchorFailure("duplicate_signed_attribute", oid)
+        seen.add(oid)
+        values = _der_children(buf, parts[1][1], parts[1][2])
+        if len(values) != 1:
+            raise DerError("signed attribute must carry exactly one value")
+        tag, vcs, vce, vstart = values[0]
+        if oid == OID_ATTR_SIGNING_CERT_V1:
+            raise AnchorFailure("ess_cert_id_v1")
+        if oid == OID_ATTR_CONTENT_TYPE:
+            if tag != 0x06:
+                raise DerError("contentType")
+            out["content_type"] = _der_oid(buf[vcs:vce])
+        elif oid == OID_ATTR_MESSAGE_DIGEST:
+            if tag != 0x04:
+                raise DerError("messageDigest")
+            out["message_digest"] = buf[vcs:vce]
+        elif oid == OID_ATTR_SIGNING_TIME:
+            if tag not in (0x17, 0x18):
+                raise DerError("signingTime")
+        elif oid == OID_ATTR_SIGNING_CERT_V2:
+            out["ess"] = _parse_signing_certificate_v2(buf, values[0])
+        elif oid == OID_ATTR_CMS_ALG_PROTECTION:
+            out["algorithm_protection"] = _parse_algorithm_protection(buf, values[0])
+        else:
+            raise AnchorFailure("unexpected_signed_attribute", oid)
+    if out["ess"] is None:
+        raise AnchorFailure("missing_signed_attribute", "signingCertificateV2")
+    if out["content_type"] is None:
+        raise AnchorFailure("missing_signed_attribute", "contentType")
+    if out["message_digest"] is None:
+        raise AnchorFailure("missing_signed_attribute", "messageDigest")
+    return out
+
+
+def _parse_signing_certificate_v2(buf, node):
+    if node[0] != 0x30:
+        raise DerError("SigningCertificateV2")
+    outer = _der_children(buf, node[1], node[2])
+    if not outer or outer[0][0] != 0x30:
+        raise DerError("SigningCertificateV2 certs")
+    certs = _der_children(buf, outer[0][1], outer[0][2])
+    if not certs or certs[0][0] != 0x30:
+        raise DerError("ESSCertIDv2")
+    e = _der_children(buf, certs[0][1], certs[0][2])
+    i = 0
+    hash_name = "sha256"
+    if i < len(e) and e[i][0] == 0x30:
+        oid, _ = _tsa_alg_id(buf, e[i])
+        if oid == OID_SHA256:
+            raise DerError("explicit DEFAULT sha256 in ESSCertIDv2")
+        hash_name = _tsa_digest_alg(buf, e[i])
+        i += 1
+    if i >= len(e) or e[i][0] != 0x04:
+        raise DerError("ESSCertIDv2 certHash")
+    cert_hash = buf[e[i][1]:e[i][2]]
+    i += 1
+    serial = None
+    if i < len(e) and e[i][0] == 0x30:
+        isr = _der_children(buf, e[i][1], e[i][2])
+        if len(isr) != 2 or isr[0][0] != 0x30 or isr[1][0] != 0x02:
+            raise DerError("IssuerSerial")
+        _der_positive_int(buf[isr[1][1]:isr[1][2]])
+        serial = _strip_zeros(buf[isr[1][1]:isr[1][2]])
+        i += 1
+    if i != len(e):
+        raise DerError("trailing ESSCertIDv2 fields")
+    return hash_name, cert_hash, serial
+
+
+def _parse_algorithm_protection(buf, node):
+    if node[0] != 0x30:
+        raise DerError("CMSAlgorithmProtection")
+    f = _der_children(buf, node[1], node[2])
+    if len(f) != 2 or f[1][0] != 0xA1:
+        raise DerError("CMSAlgorithmProtection")
+    digest_oid, _ = _tsa_alg_id(buf, f[0])
+    inner = _der_children(buf, f[1][1], f[1][2])
+    if not inner or inner[0][0] != 0x06 or len(inner) > 2:
+        raise DerError("CMSAlgorithmProtection signatureAlgorithm")
+    return digest_oid, _der_oid(buf[inner[0][1]:inner[0][2]])
+
+
+def _tsa_signature_alg(buf, si, digest_name, signer):
+    """The SignerInfo signature algorithm, the digest it must agree with and
+    the signer's key -> ('rsa'|'pss'|'ecdsa', name). Mirrors signature_alg()
+    in the proxy's verifier."""
+    oid, params = si["signature_alg_oid"], si["signature_alg_params"]
+    if oid == OID_RSA_ENCRYPTION or oid in TSA_RSA_SIGNATURES:
+        if not _null_or_absent(buf, params):
+            raise DerError("signature algorithm parameters")
+        if oid in TSA_RSA_SIGNATURES and TSA_RSA_SIGNATURES[oid] != digest_name:
+            raise AnchorFailure("algorithm_not_allowed", f"{oid} with digest {digest_name}")
+        if signer.key_kind != "rsa":
+            raise AnchorFailure("algorithm_not_allowed", f"{oid} with a non-RSA key")
+        if not RSA_MIN_BITS <= signer.rsa_bits() <= RSA_MAX_BITS:
+            raise AnchorFailure("algorithm_not_allowed", f"RSA-{signer.rsa_bits()}")
+        return "rsa", f"rsa-pkcs1-{digest_name}"
+    if oid == OID_RSASSA_PSS:
+        if signer.key_kind != "rsa":
+            raise AnchorFailure("algorithm_not_allowed", "RSASSA-PSS with a non-RSA key")
+        if not RSA_MIN_BITS <= signer.rsa_bits() <= RSA_MAX_BITS:
+            raise AnchorFailure("algorithm_not_allowed", f"RSA-{signer.rsa_bits()}")
+        pss_hash = _tsa_pss_params(buf, params)
+        if pss_hash != digest_name:
+            raise AnchorFailure("algorithm_not_allowed", f"RSASSA-PSS({pss_hash}) with digest {digest_name}")
+        return "pss", f"rsa-pss-{digest_name}"
+    if oid in TSA_ECDSA_SIGNATURES:
+        if params is not None:
+            raise DerError("ECDSA with parameters")
+        if TSA_ECDSA_SIGNATURES[oid] != digest_name:
+            raise AnchorFailure("algorithm_not_allowed", f"{oid} with digest {digest_name}")
+        if signer.key_kind != "ec":
+            raise AnchorFailure("algorithm_not_allowed", "ECDSA with a non-EC key")
+        curve = "p256" if signer.curve is P256 else "p384"
+        return "ecdsa", f"ecdsa-{curve}-{digest_name}"
+    raise AnchorFailure("algorithm_not_allowed", f"signature {oid}")
+
+
+def build_tsa_path(leaf, pool, anchors, at_time):
+    """Build leaf -> intermediates from the token -> a pinned root, valid at
+    `at_time`. Roots never come from the token: a path ends only at one of
+    `anchors`, so a cross-certificate to an unpinned root leads nowhere.
+    Returns the TsaRoot the path ends at; raises
+    AnchorFailure('untrusted_chain' or 'algorithm_not_allowed')."""
+    errors = []
+
+    def cert_usable(cert):
+        if not cert.not_before <= at_time <= cert.not_after:
+            errors.append("untrusted_chain")
+            return False
+        if cert.unknown_critical_extensions():
+            errors.append("untrusted_chain")
+            return False
+        return True
+
+    def signed(child, issuer):
+        try:
+            return child.signed_by(issuer)
+        except AnchorFailure as exc:
+            errors.append(exc.code)
+            return False
+
+    def walk(child, depth, used):
+        for anchor in anchors:
+            if child.issuer == anchor.cert.subject and signed(child, anchor.cert):
+                return anchor
+        if depth >= _TSA_MAX_PATH_DEPTH:
+            return None
+        for index, cand in enumerate(pool):
+            if index in used or cand.subject != child.issuer:
+                continue
+            if not cert_usable(cand):
+                continue
+            is_ca, path_len = cand.basic_constraints()
+            usage = cand.key_usage_bits()
+            if not is_ca or (usage is not None and not usage & KEY_USAGE_KEY_CERT_SIGN):
+                continue
+            if path_len is not None and depth > path_len:
+                continue
+            purposes = cand.extended_key_usages()
+            if purposes and OID_TIME_STAMPING not in purposes:
+                continue
+            if signed(child, cand):
+                found = walk(cand, depth + 1, used | {index})
+                if found is not None:
+                    return found
+        return None
+
+    if leaf.basic_constraints()[0]:
+        raise AnchorFailure("untrusted_chain", "signing certificate is a CA")
+    if not leaf.not_before <= at_time <= leaf.not_after:
+        raise AnchorFailure("untrusted_chain", "signing certificate not valid at genTime")
+    root = walk(leaf, 0, frozenset())
+    if root is not None:
+        return root
+    if "algorithm_not_allowed" in errors:
+        raise AnchorFailure("algorithm_not_allowed", "certificate signature")
+    raise AnchorFailure("untrusted_chain", "no path to a pinned root")
+
+
+# ── anchor statements ──────────────────────────────────────────────────────
+
+_CREATED_AT_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z")
+_CHAIN_RE = re.compile(r"[A-Za-z0-9_.\-]{1,256}")
+_EVENT_HASH_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def parse_anchor_statement(raw):
+    """Validate stored statement bytes: exact fields, supported version and
+    hash, and the canonical (JCS) byte form, so a statement has one imprint.
+    Returns the parsed object; raises AnchorFailure."""
+    try:
+        obj = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise AnchorFailure("statement_malformed", f"not JSON ({exc})")
+    if not isinstance(obj, dict) or set(obj) != {"created_at", "hash_alg", "heads", "run_id", "v"}:
+        raise AnchorFailure("statement_malformed", "unexpected or missing fields")
+    if obj["v"] != ANCHOR_STATEMENT_VERSION:
+        raise AnchorFailure("statement_malformed", f"unsupported version {obj['v']!r}")
+    if obj["hash_alg"] != ANCHOR_HASH_ALG:
+        raise AnchorFailure("statement_malformed", f"unsupported hash_alg {obj['hash_alg']!r}")
+    if not isinstance(obj["created_at"], str) or not _CREATED_AT_RE.fullmatch(obj["created_at"]):
+        raise AnchorFailure("statement_malformed", "created_at")
+    try:
+        datetime.datetime.strptime(obj["created_at"][:19], "%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        raise AnchorFailure("statement_malformed", "created_at is not a valid date-time")
+    run_id = obj["run_id"]
+    if not isinstance(run_id, str) or not 0 < len(run_id) <= 128 or not all(33 <= ord(c) <= 126 for c in run_id):
+        raise AnchorFailure("statement_malformed", "run_id")
+    heads = obj["heads"]
+    if not isinstance(heads, list) or not heads:
+        raise AnchorFailure("statement_malformed", "heads")
+    chains = []
+    for h in heads:
+        if not isinstance(h, dict) or set(h) != {"chain", "event_hash", "seq"}:
+            raise AnchorFailure("statement_malformed", "head fields")
+        if not isinstance(h["chain"], str) or not _CHAIN_RE.fullmatch(h["chain"]) or h["chain"] in (".", ".."):
+            raise AnchorFailure("statement_malformed", "chain name")
+        if not isinstance(h["event_hash"], str) or not _EVENT_HASH_RE.fullmatch(h["event_hash"]):
+            raise AnchorFailure("statement_malformed", "event_hash")
+        if isinstance(h["seq"], bool) or not isinstance(h["seq"], int) or not 0 <= h["seq"] <= _JSON_SAFE_MAX:
+            raise AnchorFailure("statement_malformed", "seq")
+        chains.append(h["chain"].encode("utf-8"))
+    if chains != sorted(chains) or len(set(chains)) != len(chains):
+        raise AnchorFailure("statement_malformed", "heads not sorted by chain, or a chain repeats")
+    if jcs_dumps(obj).encode("utf-8") != raw:
+        raise AnchorFailure("statement_non_canonical")
+    return obj
+
+
+def anchor_imprint(raw):
+    return hashlib.sha256(ANCHOR_IMPRINT_DOMAIN + raw).digest()
+
+
+# ── anchor objects: bucket, offline directory, export ──────────────────────
+
+_ANCHOR_STATEMENT_NAME = re.compile(r"(\d{20})\.json")
+_ANCHOR_TOKEN_NAME = re.compile(r"(\d{20})\.([a-z0-9][a-z0-9-]{0,31})\.tsr")
+
+
+class AnchorSourceError(OSError):
+    """The anchor objects could not be read (not: an object is absent)."""
+
+
+class AnchorSource:
+    """Read access to anchors/{chain}/ for one chain. An absent object is
+    None; any other read error raises OSError."""
+
+    def list_names(self):
+        raise NotImplementedError
+
+    def get(self, name):
+        raise NotImplementedError
+
+
+class BucketAnchorSource(AnchorSource):
+    def __init__(self, bucket_name, chain, storage_client):
+        self.bucket = storage_client.bucket(bucket_name)
+        self.client = storage_client
+        self.bucket_name = bucket_name
+        self.prefix = f"anchors/{chain}/"
+
+    def list_names(self):
+        try:
+            blobs = self.client.list_blobs(self.bucket_name, prefix=self.prefix)
+            return [b.name[len(self.prefix):] for b in blobs]
+        except Exception as exc:  # ADR-0013 A: propagate loud — an unlistable bucket cannot be evaluated
+            raise AnchorSourceError(f"cannot list gs://{self.bucket_name}/{self.prefix}: {exc}") from exc
+
+    def get(self, name):
+        try:
+            return self.bucket.blob(self.prefix + name).download_as_bytes()
+        except Exception as exc:  # ADR-0013 A: NotFound is "absent" (judged as missing); anything else propagates
+            if type(exc).__name__ == "NotFound":
+                return None
+            raise AnchorSourceError(f"cannot read gs://{self.bucket_name}/{self.prefix}{name}: {exc}") from exc
+
+
+class DirectoryAnchorSource(AnchorSource):
+    def __init__(self, directory):
+        self.dir = Path(directory)
+
+    def list_names(self):
+        return sorted(p.name for p in self.dir.iterdir() if p.is_file()) if self.dir.is_dir() else []
+
+    def get(self, name):
+        path = self.dir / name
+        return path.read_bytes() if path.is_file() else None
+
+
+class ExportingAnchorSource(AnchorSource):
+    """Write every anchor object read to export_dir/anchors/, the layout
+    --records reads back."""
+
+    def __init__(self, inner, export_dir):
+        self.inner = inner
+        self.out = Path(export_dir) / "anchors"
+        self.out.mkdir(parents=True, exist_ok=True)
+
+    def list_names(self):
+        return self.inner.list_names()
+
+    def get(self, name):
+        raw = self.inner.get(name)
+        if raw is not None:
+            (self.out / name).write_bytes(raw)
+        return raw
+
+
+def chain_for_prefix(prefix):
+    """The chain name anchors are stored under for a manifest prefix:
+    `audit/` (the flat chain) -> legacy-flat; `audit/{chain}/` -> {chain}."""
+    if prefix == "audit/":
+        return LEGACY_FLAT_CHAIN
+    m = re.fullmatch(r"audit/([A-Za-z0-9_.\-]{1,256})/", prefix or "")
+    return m.group(1) if m else None
+
+
+def _epoch_of_record(event):
+    ts = normalize_timestamp(event.get("timestamp_utc", ""))
+    m = re.match(r"(\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d)", ts)
+    if not m:
+        raise ValueError("record timestamp")
+    return _rfc3339_to_epoch(m.group(1) + "Z")
+
+
+def _iso(t):
+    return _utc(int(t))
+
+
+def _read_record(record_fetch, seq):
+    """(event, recomputed event hash) for the chain record at `seq`, or an
+    AnchorFailure naming why it could not be read."""
+    try:
+        raw = record_fetch(seq)
+    except Exception as exc:  # ADR-0013 A: fail-closed — any fetch error (GCS NotFound, OSError) fails the check
+        raise AnchorFailure("record_unreadable", f"{type(exc).__name__}: {exc}")
+    try:
+        event = json.loads(raw)
+        return event, recompute_event_hash(event, seq, event.get("previous_hash", ""))
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise AnchorFailure("record_unreadable", str(exc))
+
+
+class _AnchorCheck:
+    def __init__(self):
+        self.failed = False
+        self.cannot = False
+        self.supplied_roots_seen = set()
+
+    def supplied_root(self, tsa_id, root):
+        """Print, once per witness and root, that trust came from --tsa-root."""
+        if (tsa_id, root.fingerprint) not in self.supplied_roots_seen:
+            self.supplied_roots_seen.add((tsa_id, root.fingerprint))
+            print(supplied_root_notice(tsa_id, root))
+
+    def fail(self, line):
+        print(line)
+        self.failed = True
+
+    def cannot_evaluate(self, line):
+        print(line, file=sys.stderr)
+        self.cannot = True
+
+
+def _verify_one_anchor(seq, chain, source, record_fetch, roots_for, listed_tokens, check, label):
+    """Verify the statement and every token stored for `seq`. Returns
+    (earliest gen_time, verified witness ids) or None after reporting."""
+    raw = source.get(f"{seq:020d}.json")
+    if raw is None:
+        check.fail(f"FAIL anchor seq={seq}: {label}statement object is missing")
+        return None
+    if listed_tokens is not None and hashlib.sha256(raw).hexdigest() != listed_tokens["statement_sha256"]:
+        check.fail(f"FAIL anchor seq={seq}: statement does not match the manifest's digest")
+        return None
+    try:
+        statement = parse_anchor_statement(raw)
+    except AnchorFailure as exc:
+        check.fail(f"FAIL anchor seq={seq}: {label}{exc}")
+        return None
+    head = next((h for h in statement["heads"] if h["chain"] == chain and h["seq"] == seq), None)
+    if head is None:
+        check.fail(f"FAIL anchor seq={seq}: {label}statement does not name chain {chain} at this sequence")
+        return None
+    try:
+        event, recomputed = _read_record(record_fetch, seq)
+    except AnchorFailure as exc:
+        check.fail(f"FAIL anchor seq={seq}: {label}cannot read the anchored record ({exc.detail})")
+        return None
+    if head["event_hash"] != recomputed or event.get("event_hash") != recomputed:
+        check.fail(
+            f"FAIL anchor seq={seq}: {label}anchored head event_hash does not match the record "
+            f"(anchored {head['event_hash'][:16]}…, record {recomputed[:16]}…) — "
+            f"the record changed after it was anchored"
+        )
+        return None
+    imprint = anchor_imprint(raw)
+    if listed_tokens is not None:
+        tsa_ids = sorted(listed_tokens["tokens"])
+    else:
+        tsa_ids = sorted({m.group(2) for m in map(_ANCHOR_TOKEN_NAME.fullmatch, source.list_names())
+                          if m and int(m.group(1)) == seq})
+    if not tsa_ids:
+        check.fail(f"FAIL anchor seq={seq}: {label}no witness token")
+        return None
+    gen_times, witnesses = [], []
+    for tsa_id in tsa_ids:
+        token = source.get(f"{seq:020d}.{tsa_id}.tsr")
+        if token is None:
+            check.fail(f"FAIL anchor seq={seq} tsa={tsa_id}: {label}token object is missing")
+            continue
+        listed = listed_tokens["tokens"][tsa_id] if listed_tokens is not None else None
+        if listed is not None and hashlib.sha256(token).hexdigest() != listed["sha256"]:
+            check.fail(f"FAIL anchor seq={seq} tsa={tsa_id}: token does not match the manifest's digest")
+            continue
+        roots = roots_for(tsa_id)
+        if roots is None:
+            check.cannot_evaluate(
+                f"ERROR: anchor seq={seq} tsa={tsa_id}: no trust root for this witness; "
+                f"pass --tsa-root {tsa_id}=FILE")
+            continue
+        try:
+            result = verify_tsa_token(token, imprint, roots)
+        except AnchorFailure as exc:
+            if exc.code == "malformed":
+                check.cannot_evaluate(f"ERROR: anchor seq={seq} tsa={tsa_id}: token cannot be parsed ({exc.detail})")
+            else:
+                check.fail(f"FAIL anchor seq={seq} tsa={tsa_id}: {label}{exc}")
+            continue
+        if listed is not None and listed["gen_time"] != _iso(result["gen_time"]):
+            check.fail(f"FAIL anchor seq={seq} tsa={tsa_id}: manifest gen_time does not match the token")
+            continue
+        if result["root"].supplied:
+            check.supplied_root(tsa_id, result["root"])
+        gen_times.append(result["gen_time"])
+        witnesses.append(f"{tsa_id} {_iso(result['gen_time'])} {result['signature_algorithm']}")
+    if not gen_times or len(witnesses) != len(tsa_ids):
+        return None
+    return min(gen_times), witnesses
+
+
+def supplied_root_notice(tsa_id, root):
+    return (f"NOTICE: anchor tokens from witness {tsa_id} verified through a root supplied with --tsa-root, "
+            f"not one pinned in this verifier: {root.name} SHA-256 {root.fingerprint}. Trusting it was "
+            f"the reviewer's choice; check that fingerprint against the witness's published root.")
+
+
+def records_clock_ahead(covering, lo, record_epoch):
+    """Records whose own timestamp is more than ANCHOR_CLOCK_TOLERANCE_SECONDS
+    after the genTime of the earliest anchor covering them. `covering` is
+    [(anchor_seq, earliest genTime)] for the verified anchors; an anchor at S
+    covers lo..S. `record_epoch(seq)` returns the record's time or raises
+    ValueError. Returns (count ahead, first (seq, record time, genTime) or
+    None, count of records whose time could not be read)."""
+    if not covering:
+        return 0, None, 0
+    covering = sorted(covering)
+    ahead, first, unreadable = 0, None, 0
+    earliest = float("inf")
+    index = len(covering) - 1
+    for seq in range(covering[-1][0], lo - 1, -1):
+        while index >= 0 and covering[index][0] >= seq:
+            earliest = min(earliest, covering[index][1])
+            index -= 1
+        try:
+            when = record_epoch(seq)
+        except ValueError:
+            unreadable += 1  # ADR-0013 A: deliberately counted, not failed — the chain check judges the record
+            continue
+        if when > earliest + ANCHOR_CLOCK_TOLERANCE_SECONDS:
+            ahead += 1
+            first = (seq, when, earliest)
+    return ahead, first, unreadable
+
+
+def _check_anchoring_shape(listed, seals):
+    """Raise ValueError unless every listed anchor and seal has the fields
+    and types the 1.1 schema defines (a pack may be checked without it)."""
+    def is_seq(v):
+        return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= _JSON_SAFE_MAX
+
+    def is_hex(v):
+        return isinstance(v, str) and _EVENT_HASH_RE.fullmatch(v) is not None
+
+    seen = set()
+    for a in listed:
+        if not is_seq(a["seq"]) or a["seq"] in seen:
+            raise ValueError("anchor seq")
+        seen.add(a["seq"])
+        if not isinstance(a["statement"]["key"], str) or not is_hex(a["statement"]["sha256"]):
+            raise ValueError("anchor statement")
+        if not isinstance(a["tokens"], dict) or not a["tokens"]:
+            raise ValueError("anchor tokens")
+        for tsa_id, token in a["tokens"].items():
+            if (not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", tsa_id) or not is_hex(token["sha256"])
+                    or not isinstance(token["gen_time"], str)):
+                raise ValueError("anchor token")
+    for seal in seals:
+        if (not is_seq(seal["seq"]) or not is_hex(seal["event_hash"])
+                or seal["action_type"] not in ("audit_anchoring_disabled", "audit_anchoring_misconfigured")):
+            raise ValueError("seal")
+
+
+def verify_anchors(manifest, record_fetch, source, roots_for, record_times=None):
+    """Verify the manifest's chain-head anchors. Returns PASSED, FAILED or
+    CANNOT_EVALUATE and prints the coverage report. `record_times` (seq ->
+    epoch, from timestamp_recording_fetcher) saves re-fetching records the
+    chain walk already read."""
+    version = manifest.get("schema_version", "1.0")
+    if version == "1.0":
+        print("NOTICE: UNANCHORED — this pack predates chain-head anchoring (manifest 1.0). The chain "
+              "check shows the records are intact and linked; it does not show when they existed.")
+        return PASSED
+    check = _AnchorCheck()
+    anchoring = manifest.get("anchoring")
+    try:
+        chains = anchoring["chains"]
+        if anchoring["state"] not in ("anchored", "partially_anchored", "unanchored") or len(chains) != 1:
+            raise ValueError("anchoring state or chains")
+        entry = chains[0]
+        chain = entry["chain"]
+        if entry["reason"] not in ("anchored", "disabled", "misconfigured", "no_anchors_found"):
+            raise ValueError("anchoring reason")
+        listed = sorted(entry["anchors"], key=lambda a: a["seq"])
+        seals = entry["seals"]
+        _check_anchoring_shape(listed, seals)
+        tail = entry["unanchored_tail"]
+        if tail is not None and (set(tail) != {"from_seq", "to_seq"}
+                                 or not all(isinstance(tail[k], int) for k in tail)):
+            raise ValueError("unanchored_tail")
+        through = entry["anchored_through_seq"]
+        if through is not None and (isinstance(through, bool) or not isinstance(through, int)):
+            raise ValueError("anchored_through_seq")
+        lo, hi = int(manifest["from_sequence"]), int(manifest["to_sequence"])
+    except (KeyError, TypeError, ValueError) as exc:
+        print(f"ERROR: manifest anchoring section is malformed ({exc})", file=sys.stderr)
+        return CANNOT_EVALUATE
+    if chain != chain_for_prefix(manifest.get("prefix", "")):
+        check.fail(f"FAIL anchoring: chain {chain} does not match the manifest prefix {manifest.get('prefix')!r}")
+        return FAILED
+    if source is None and (listed or anchoring["state"] != "unanchored"):
+        print("ERROR: anchors need a records directory (--records DIR) or --bucket", file=sys.stderr)
+        return CANNOT_EVALUATE
+    try:
+        return _verify_listed_and_found(anchoring, entry, listed, seals, (lo, hi), record_fetch, source,
+                                        roots_for, check, record_times or {})
+    except OSError as exc:
+        print(f"ERROR: cannot read the anchor objects ({exc})", file=sys.stderr)
+        return CANNOT_EVALUATE
+
+
+def _verify_listed_and_found(anchoring, entry, listed, seals, window, record_fetch, source, roots_for, check,
+                             record_times):
+    chain, reason = entry["chain"], entry["reason"]
+    lo, hi = window
+    covered = []
+    covering = []
+    listed_seqs = set()
+    for a in listed:
+        seq = a["seq"]
+        listed_seqs.add(seq)
+        if not lo <= seq <= hi:
+            check.fail(f"FAIL anchor seq={seq}: listed anchor is outside the pack window {lo}..{hi}")
+            continue
+        if a["statement"]["key"] != f"anchors/{chain}/{seq:020d}.json":
+            check.fail(f"FAIL anchor seq={seq}: statement key does not match the anchor layout")
+            continue
+        listed_tokens = {"statement_sha256": a["statement"]["sha256"], "tokens": a["tokens"]}
+        result = _verify_one_anchor(seq, chain, source, record_fetch, roots_for, listed_tokens, check, "")
+        if result is not None:
+            covered.append(seq)
+            covering.append((seq, result[0]))
+            witness_count = (len(result[1]), len(a["tokens"]))
+            print(f"PASS anchor seq={seq} witnesses={len(result[1])}/{len(a['tokens'])}: "
+                  + "; ".join(result[1]))
+
+    outside = 0
+    if source is not None:
+        discovered = set()
+        for name in source.list_names():
+            m = _ANCHOR_STATEMENT_NAME.fullmatch(name) or _ANCHOR_TOKEN_NAME.fullmatch(name)
+            if m:
+                discovered.add(int(m.group(1)))
+        for seq in sorted(discovered - listed_seqs):
+            if not lo <= seq <= hi:
+                outside += 1
+                continue
+            result = _verify_one_anchor(seq, chain, source, record_fetch, roots_for, None, check,
+                                        "discovered, not listed: ")
+            if result is not None:
+                print(f"NOTICE anchor seq={seq}: not listed in the manifest; found and verified "
+                      f"({'; '.join(result[1])})")
+        if outside:
+            print(f"NOTICE: {outside} anchor(s) outside this pack's window {lo}..{hi} were not judged")
+
+    for seal in seals:
+        try:
+            event, recomputed = _read_record(record_fetch, seal["seq"])
+        except AnchorFailure as exc:
+            check.fail(f"FAIL anchoring seal seq={seal['seq']}: cannot read the record ({exc.detail})")
+            continue
+        action = (event.get("admin_action") or {}).get("action_type")
+        if (recomputed != seal["event_hash"] or event.get("event_hash") != recomputed
+                or event.get("event_kind") != "admin_action" or action != seal["action_type"]):
+            check.fail(f"FAIL anchoring seal seq={seal['seq']}: the record is not the listed seal")
+            continue
+        print(f"NOTICE: chain {chain} carries the seal {action} at seq={seal['seq']}")
+
+    anchored_through = max(covered) if covered else None
+    state = ("unanchored" if anchored_through is None
+             else "anchored" if anchored_through >= hi else "partially_anchored")
+    seal_actions = {s["action_type"] for s in seals}
+    expected_reason = ("anchored" if listed
+                       else "disabled" if "audit_anchoring_disabled" in seal_actions
+                       else "misconfigured" if "audit_anchoring_misconfigured" in seal_actions
+                       else "no_anchors_found")
+    if not check.failed and not check.cannot:
+        tail = entry.get("unanchored_tail")
+        declared_tail = (tail["from_seq"], tail["to_seq"]) if tail else None
+        actual_tail = None if anchored_through is not None and anchored_through >= hi else (
+            (anchored_through + 1 if anchored_through is not None else lo), hi)
+        if (anchoring["state"] != state or entry.get("anchored_through_seq") != anchored_through
+                or declared_tail != actual_tail or reason != expected_reason):
+            check.fail("FAIL anchoring: the manifest's anchoring summary does not match the anchors "
+                       f"(declared {anchoring['state']}/{reason}, verified {state}/{expected_reason})")
+    if check.failed:
+        return FAILED
+    if check.cannot:
+        return CANNOT_EVALUATE
+    def record_epoch(seq):
+        if seq in record_times:
+            return record_times[seq]
+        try:
+            return _epoch_of_record(json.loads(record_fetch(seq)))
+        except Exception as exc:  # ADR-0013 A: an unreadable record is counted as unchecked; the chain check fails it
+            raise ValueError(str(exc))
+
+    ahead, first, unreadable = records_clock_ahead(covering, lo, record_epoch)
+    if ahead:
+        seq, when, gen_time = first
+        print(f"NOTICE: record clock ahead of anchor — {ahead} record(s) in chain {chain} carry a timestamp more "
+              f"than {ANCHOR_CLOCK_TOLERANCE_SECONDS // 60} min after the genTime of the earliest anchor covering "
+              f"them (first seq={seq}: record {_iso(when)}, anchor genTime {_iso(gen_time)}); the anchor's "
+              f"genTime is the authoritative 'existed by' time")
+    if unreadable:
+        print(f"NOTICE: the clock of {unreadable} anchored record(s) could not be read and was not compared")
+    if state == "unanchored":
+        print(f"NOTICE: UNANCHORED — chain {chain} ({reason}): no chain-head anchor covers this pack's "
+              f"records, so nothing here shows when they existed.")
+    else:
+        print(f"ANCHORS OK: chain={chain} anchored_through={anchored_through} "
+              f"witnesses={witness_count[0]}/{witness_count[1]}")
+        if state == "partially_anchored":
+            print(f"NOTICE: unanchored tail seq={anchored_through + 1}..{hi}: these records are not yet "
+                  f"covered by a chain-head anchor")
+    print("NOTE: an anchor shows a record existed no later than the token's genTime and is unchanged "
+          "since; it does not show the chain is complete (ADR-0075 D13).")
+    return PASSED
+
+
+def manifest_schema_version_error(manifest):
+    """None when this verifier understands the manifest's schema_version
+    (a manifest without one predates the field and reads as 1.0), else the
+    message to print before exiting 2."""
+    version = manifest.get("schema_version", "1.0")
+    if version in SUPPORTED_MANIFEST_SCHEMA_VERSIONS:
+        return None
+    return (f"manifest schema_version {version!r} is not one this verifier supports "
+            f"({', '.join(SUPPORTED_MANIFEST_SCHEMA_VERSIONS)}). Re-run with an updated verifier.")
+
+
+def load_tsa_roots(specs):
+    """The pinned public-witness roots plus every --tsa-root ID=FILE."""
+    roots = load_pinned_tsa_roots()
+    for spec in specs:
+        tsa_id, sep, file_name = spec.partition("=")
+        if not sep or not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", tsa_id) or not file_name:
+            raise ValueError(f"{spec!r} is not ID=FILE with a valid witness id")
+        extra = load_tsa_roots_pem(tsa_id, Path(file_name).read_text(encoding="ascii"))
+        roots.setdefault(tsa_id, []).extend(extra)
+    return roots
+
+
+def combine_with_anchor_status(chain_status, anchor_status):
+    """Fold the anchor verdict into the chain verdict: a failure of either is
+    a failure; otherwise a check that could not be evaluated wins."""
+    if FAILED in (chain_status, anchor_status):
+        return FAILED
+    if CANNOT_EVALUATE in (chain_status, anchor_status):
+        return CANNOT_EVALUATE
+    return chain_status
 
 
 def report_pack_signature(manifest, manifest_bytes, manifest_path, args):
@@ -5230,6 +6674,459 @@ def signature_self_test():
     return ok
 
 
+# ── anchor self-test data (MEI-2758) ──────────────────────────────────────
+# RSA-2048 public key (SPKI) for the known-answer vectors below; OpenSSL-generated.
+_KAT_RSA_SPKI = (
+    "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA99gXa1HWWgLdl8EYk3o7Aoo9ZnNnxxuDDmT/2Dm1U8IOT8VpukeT",
+    "u88R9BmMxjtfpb4xXDpv/jDRljwxG2CR5OX605HXWcDVv5nHoB7PV8zXxiTd3VVIQddmBpvMyeyXftN5+eZcA6hnoHpAErDO",
+    "anzkJjsA0Plq7RH+4WtbqLc471I1vIvaBZIGuv4zF7fozblllWCG/XlbdfEikYz2d34pd4tNLsVX7miEBwH6zB8kcKGURjM8",
+    "F2GmHTygw+Ldop0cU7QU8QmMECPrhXPo5PuPiW/CRl8gDwPjURCZcOCK2kEShqoYiJELaoJvjGcqRl6TfXuQgqeYl+mwlSur",
+    "JwIDAQAB",
+)
+# RSASSA-PKCS1-v1_5 / SHA-256 over b'meilynx-anchor-rsa-kat-v1'.
+_KAT_RSA_PKCS1_SHA256 = (
+    "tdE7vo2te4c9k0nIzd5zIIPkJLv+Hgv32kUkZQOOR9t5NUXiFHSBt801jNFcmhWgZJ5HkIdAt2gAlYWv/KkKrCdDrmZc5SCh",
+    "vNrXZZo1l2fBqXJnM7qyE3SR9wWCnLOBr0s/5cyRPBjBCf2pLsGk+zPcGWBCilVA3Es+zBeKRwYNRF6mGAoxzIGuoYcFgkvf",
+    "NjyXY2EMgkVbuziQOU9DTO3gVeqqHQDTuOyk2BakVzpraf+iMpYrxJv1ab4l52wkqjKCnHD1vUhz5WZ+FbRSWoTiEefUXfWf",
+    "Nso9Wu1PGgamLlmIX2iRiNNEcio2nvB9KUzD2ncwaKIkQFTnwJeflg==",
+)
+# RSASSA-PSS / SHA-256, MGF1-SHA-256, salt 32, same message.
+_KAT_RSA_PSS_SHA256 = (
+    "oM7y0GDZGDeQtDK/211iyqS4RZTEK9Mrc70KlDT4hQce9DTIliwJe8lJXS7aWoJ0pOyFixUekECC4NOsHp5TzWDoLUEsU+I2",
+    "3cLek28zVawGuXrpmhE3WjqILNjStAY86RPxEAtwfZyoO8NSwj3xTShJPZMd15ERs5bBMzLZKVNAOAIx1CBo/6H7+eZoxeVr",
+    "NCZIsqUFRNoqPyB97LAqYPZakRJvNDdrCGM860KxJc1yy+Gm/1b3xcprEOpCmbGL7kTa//3/pmrRp4JJXAZqRkz7GBVEm75M",
+    "M7+eDQBRexup1id+9ZFzdnHnfFxM7APwDTLcV9h5o/3AG2YHgMcOmA==",
+)
+# RSASSA-PSS / SHA-384, MGF1-SHA-384, salt 48, same message.
+_KAT_RSA_PSS_SHA384 = (
+    "Y1te+e/z/xbI2UYDIEBKJgwtnZXVa0Z7CAkxPfgW2IGXYrK0iqUKp0V0agqihUHUaNzneRDPwI1gEduT79hn1+vMletWrDgk",
+    "MNgVe19xlzRlgS1w7CRfxBv05hkEGD/eDQDgOrMoH7Z+CaHWXTaRvnl+ICuaf9ReeD5YjD0+remiK0+nopNSFrZUIuUlbYDg",
+    "ukw7KUMV8bf3AumGSYPB2DfrDFyALMA0krdlZ3b8U84uzvVX9PZF7KnB2V+Mg4BvkqUG+CwxrMnij4JXcAsx2laJ7euy3ZS5",
+    "zIMseduL2jAlR62jmmmHuX7n+hHrzh0TwrztIBx+ksT7RKDXCfcniQ==",
+)
+# Real TimeStampResp from timestamp.sigstore.dev, 2026-10-03T00:51:11Z, over
+# SHA-256(b'meilynx-anchor-interop-probe-2026-10-02') (proxy fixture anchor/real/sigstore.tsr).
+_REAL_SIGSTORE_TSR = (
+    "MIIE6jADAgEAMIIE4QYJKoZIhvcNAQcCoIIE0jCCBM4CAQMxDTALBglghkgBZQMEAgEwgcIGCyqGSIb3DQEJEAEEoIGyBIGv",
+    "MIGsAgEBBgkrBgEEAYO/MAIwMTANBglghkgBZQMEAgEFAAQg52KkYxzSouG/J+rJlOyheMGyiAPpIw3qxsqkzR/3JqMCFHqY",
+    "fug4y7BNpMbV2Ko3sV8ymhH7GA8yMDI2MTAwMzAwNTExMVowAwIBAQIJAPgMSdy/ASM4oDKkMDAuMRUwEwYDVQQKEwxzaWdz",
+    "dG9yZS5kZXYxFTATBgNVBAMTDHNpZ3N0b3JlLXRzYaCCAhQwggIQMIIBlqADAgECAhQ6E1QvDJBh7rzBQy/Lio6LKiOLDDAK",
+    "BggqhkjOPQQDAzA5MRUwEwYDVQQKEwxzaWdzdG9yZS5kZXYxIDAeBgNVBAMTF3NpZ3N0b3JlLXRzYS1zZWxmc2lnbmVkMB4X",
+    "DTI1MDQwODA2NTk0M1oXDTM1MDQwNjA2NTk0M1owLjEVMBMGA1UEChMMc2lnc3RvcmUuZGV2MRUwEwYDVQQDEwxzaWdzdG9y",
+    "ZS10c2EwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAATitrZnyEo2KDZP2QWMIBOgYbfSOTL5ZC/cHMv6Yq+HVIo1H9TC7Cx80KDi",
+    "yvKhgB3wTqKyi9UDczhqg12b1AOLnRnydMTK+qB8M+1MjBci1+Jb8AV/VXu7CRuQCiPTHFyjajBoMA4GA1UdDwEB/wQEAwIH",
+    "gDAdBgNVHQ4EFgQUif15Q4fP0GVGwwJGxyxzW3206wMwHwYDVR0jBBgwFoAUmOwB73+7Uf/UlR5vioiYUweJzr8wFgYDVR0l",
+    "AQH/BAwwCgYIKwYBBQUHAwgwCgYIKoZIzj0EAwMDaAAwZQIwO2mxX/opo7SrIX9QyxfZpJRcpAV2gZOm1AZzR+2rVyy6Uc8Y",
+    "bp2ybIw13ckH4bcRAjEA5qO8FyOkmYpvg2/7ZNqiPxRzn5vqKHoVcIIqtpKq6l7TvOqzAxxclN7VwTG8e++XMYIB2zCCAdcC",
+    "AQEwUTA5MRUwEwYDVQQKEwxzaWdzdG9yZS5kZXYxIDAeBgNVBAMTF3NpZ3N0b3JlLXRzYS1zZWxmc2lnbmVkAhQ6E1QvDJBh",
+    "7rzBQy/Lio6LKiOLDDALBglghkgBZQMEAgGggfwwGgYJKoZIhvcNAQkDMQ0GCyqGSIb3DQEJEAEEMBwGCSqGSIb3DQEJBTEP",
+    "Fw0yNjEwMDMwMDUxMTFaMC8GCSqGSIb3DQEJBDEiBCB+yIjEAzL2RUyLmCFlr9yRaRfpnqZvTCbRoFYCNZHg4jCBjgYLKoZI",
+    "hvcNAQkQAi8xfzB9MHsweQQghfknvAerYsrDtENWwQ78gbLGiD/aernm2HDZ0TrNBbcwVTA9pDswOTEVMBMGA1UEChMMc2ln",
+    "c3RvcmUuZGV2MSAwHgYDVQQDExdzaWdzdG9yZS10c2Etc2VsZnNpZ25lZAIUOhNULwyQYe68wUMvy4qOiyojiwwwCgYIKoZI",
+    "zj0EAwIEZzBlAjEA6xaSEkw0pBwQRk1J3qlGGBmCKL46kXrZuP1AGW3+ik+Qusv/88ELkefSjSnJYN+WAjBlDDvCxoQ2M6FF",
+    "CG7dIHl6g0ouKE/mAvLApliUtg4O1iUvV0xhKLfME5ydi3jbvzE=",
+)
+# Real TimeStampResp from GlobalSign R45, 2026-10-03T00:56:22Z, same imprint
+# (proxy fixture anchor/real/globalsign-r45.tsr).
+_REAL_GLOBALSIGN_TSR = (
+    "MIId6TADAgEAMIId4AYJKoZIhvcNAQcCoIId0TCCHc0CAQMxDTALBglghkgBZQMEAgIwge8GCyqGSIb3DQEJEAEEoIHfBIHc",
+    "MIHZAgEBBgsrBgEEAaAyAgMCAjAxMA0GCWCGSAFlAwQCAQUABCDnYqRjHNKi4b8n6smU7KF4wbKIA+kjDerGyqTNH/cmowIU",
+    "IY+pqwR12O/76j2cki6boSo/3jQYDzIwMjYxMDAzMDA1NjIyWjADAgEBAgkA+AxJ3L8BIzigXaRbMFkxCzAJBgNVBAYTAkJF",
+    "MRkwFwYDVQQKExBHbG9iYWxTaWduIG52LXNhMS8wLQYDVQQDEyZHbG9iYWxzaWduIFI0NSBUU0EgZm9yIENvZGVTaWduIDIw",
+    "MjUxMKCCGWAwggaKMIIEcqADAgECAhEAhHI/wZXMFvHbK6L2YN8r5DANBgkqhkiG9w0BAQwFADBeMQswCQYDVQQGEwJCRTEZ",
+    "MBcGA1UEChMQR2xvYmFsU2lnbiBudi1zYTE0MDIGA1UEAxMrR2xvYmFsU2lnbiBPZmZsaW5lIFI0NSBUaW1lc3RhbXBpbmcg",
+    "Q0EgMjAyNTAeFw0yNTEwMTUwNzI1MDRaFw0zNzAxMTAwMDAwMDBaMFkxCzAJBgNVBAYTAkJFMRkwFwYDVQQKExBHbG9iYWxT",
+    "aWduIG52LXNhMS8wLQYDVQQDEyZHbG9iYWxzaWduIFI0NSBUU0EgZm9yIENvZGVTaWduIDIwMjUxMDCCAaIwDQYJKoZIhvcN",
+    "AQEBBQADggGPADCCAYoCggGBANFKjaGNhkBIKKMJBJzZExA88qiMT/F/hSKNrYmewntKeXaAOjEqND0dxTqtUPymDLWwEp1X",
+    "G0ssWFjeDNj88DaLAizpnMKfGyG2NKGw3VHLNGvNzgWr7TFDHqoANQyf3qaocT/SiTncM9uakGSRQPK0Yzv2dB/D1ZXKZiAD",
+    "5ORsDT9A6Y800khnoKNfS3fAl+EvRxqJe2EEEwRYrFPm/ZTtlFsKr8NUNcD2hfWIVUFVoGnHnswsvTSfIe7HQidhLtGvngze",
+    "02Gbv7SZrGnJMVrnW5jU8e1Mky6n+XdEaihDljB4IfaEOhQ3Ao4LtCQVuSWE92rbsReS56Dyos6dEOZU7Wv4HXIwBuXpC5XQ",
+    "v448HVIoEA+mYgWSWYnRKiJttSrGxPN6ON0j7LBAtRxeKWiDApawnjqHrCOVTkBWpPsUQFjNYJO3qF/tItBs8azTYFryhpo1",
+    "+jRIv5oCk33iW4QH/C4TWWCm2tyQvNtCUKnno6CQAlimpi66L5N+54IhTQIDAQABo4IBxjCCAcIwDgYDVR0PAQH/BAQDAgeA",
+    "MBYGA1UdJQEB/wQMMAoGCCsGAQUFBwMIMAwGA1UdEwEB/wQCMAAwHQYDVR0OBBYEFDL60+EHaCeQawjSPx08jGU2KAYZMB8G",
+    "A1UdIwQYMBaAFHcCOwExDx50d8NIyMMHY1WIpTuiMIGlBggrBgEFBQcBAQSBmDCBlTBCBggrBgEFBQcwAYY2aHR0cDovL29j",
+    "c3AuZ2xvYmFsc2lnbi5jb20vZ3NvZmZsaW5lcjQ1dGltZXN0YW1wY2EyMDI1ME8GCCsGAQUFBzAChkNodHRwOi8vc2VjdXJl",
+    "Lmdsb2JhbHNpZ24uY29tL2NhY2VydC9nc29mZmxpbmVyNDV0aW1lc3RhbXBjYTIwMjUuY3J0MEoGA1UdHwRDMEEwP6A9oDuG",
+    "OWh0dHA6Ly9jcmwuZ2xvYmFsc2lnbi5jb20vZ3NvZmZsaW5lcjQ1dGltZXN0YW1wY2EyMDI1LmNybDBWBgNVHSAETzBNMAgG",
+    "BmeBDAEEAjBBBgkrBgEEAaAyAR4wNDAyBggrBgEFBQcCARYmaHR0cHM6Ly93d3cuZ2xvYmFsc2lnbi5jb20vcmVwb3NpdG9y",
+    "eS8wDQYJKoZIhvcNAQEMBQADggIBAI6ucKaPR4aRim6eLPr9YWb3WzoqOeGQwpiVtx+2CkwG2WHKxWeIQ58G+Fy+gVDDgA4c",
+    "b01FW9mmQGdqDkO3UczcmDbWBFUIHAXI/URPwgPGh+VjHk4PhII0sezq8KDqsWQ1PzW/1nLy7TFfLdZug3mIr9JtOYsaoKsA",
+    "YmKEsut8iG913BWt0HKIe14vGCO6BPolCiAJKgEXYmqYfRkEKXnXlu1tO5ZkutBSzm++Xaj3wx2O73LIlFYvM9VxSRGT13zE",
+    "EGLrfwUE4C6jd9zJOEZyd7vBQ5r5OCGHAgdtnenFNimCjlwLERmwfwRfCJNRPAd/Sp6yyyD/Zd1wYfuzQBHhPI4nZCcBrJg4",
+    "Az9c4HE3NRFCDiaEx08v8XxUIwqPeSglpVzHZqSHQHzaV79oFTyrY5r747A7CIcXl75/2b7KHJhvAZKiBYhXeGBGX5XIqtyH",
+    "yC/fkUev9xXPyfT8I8ZFcaJglns/XA46Bh2QwPaIMpVhBvLkjH/EIHT+VIoueoSgV7N+acIlsaAAJWzAyzGEkRSO3ERxBz1p",
+    "9qWd74g62zS//IJGKQmyeZVtLTHnQOTY4f5UKJT2z9fLOB8LtbOu1Dl2Ih1zYqyLckxMmbhrQuIQhlaK0Pn7o+iQ6RDz7flO",
+    "wc7BSGzzsj/LImOUhmkBXg5/X8k3xtZUHcR2bhbOMIIGoDCCBIigAwIBAgIRAIPahje3nwyEDJR7hApSeB8wDQYJKoZIhvcN",
+    "AQEMBQAwUzELMAkGA1UEBhMCQkUxGTAXBgNVBAoTEEdsb2JhbFNpZ24gbnYtc2ExKTAnBgNVBAMTIEdsb2JhbFNpZ24gVGlt",
+    "ZXN0YW1waW5nIFJvb3QgUjQ1MB4XDTI1MDcxNjAzMDUwNFoXDTQxMDcxNjAwMDAwMFowXjELMAkGA1UEBhMCQkUxGTAXBgNV",
+    "BAoTEEdsb2JhbFNpZ24gbnYtc2ExNDAyBgNVBAMTK0dsb2JhbFNpZ24gT2ZmbGluZSBSNDUgVGltZXN0YW1waW5nIENBIDIw",
+    "MjUwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCkdxb47X2L4t0ChkVjNL7lf5Zi+dagWpcB+KvWHKeFRN0fhFbU",
+    "Nv7I6atDbvmOWxDpvOhnec3QIydxlfgTRCGmnpC/Hbv5+Wl/N4xBpwPtVyJZSIXdMuK7vBPZsEJIQ1SfeF8Ywbg8m9gW87mj",
+    "gMDWI28eEbihLNy2h2gl9vhzwSNVqELD80uLMHetr41Z7aBkFJpkqtozEW3rvrKrHtFxCeNsXhHQ4sai+xm3be9Tr0DkF2g/",
+    "F0D3O72sz6pMGw8NVQl7FjARVTQZjsEnmZRZaeLIA8dbRa/gDOTm3sjRdQiMDf7Y4aSvR1UFdUEPIR4YFWthcR2F9UvC6Hoc",
+    "EYkV0isRjkqgaWmhP7gEFB7hcIfmy/XlSj4zvZUpaM8DkTHed8UkLg/kVbVJHqiUJJoiu2dnNz7OCalLKIP4ZwTa51BFAdsO",
+    "Lvh6deBrOTT6S2kdnVnyhO9JpIhESi9dItsfcoLy4UiRe5yXtc8ftkYiuYX14XjO6ijkUhSey9XrSQuoUPM+T5RsuaBkNQI+",
+    "UUUEF6Fpo2+LETKbH043Ypd6/4x8ro5kKGoZus4LbC+8AUfIqVNltUd2o2K7S7lrZPUL11JNGfLX+HEvBzEv0FY/NAvCGyLJ",
+    "epTMzu4PSUP349gxrFRiChVLGpvjG88KJWos1psj5a2MTNh9DQ/7q0FMWwIDAQABo4IBYjCCAV4wDgYDVR0PAQH/BAQDAgGG",
+    "MBMGA1UdJQQMMAoGCCsGAQUFBwMIMBIGA1UdEwEB/wQIMAYBAf8CAQAwHQYDVR0OBBYEFHcCOwExDx50d8NIyMMHY1WIpTui",
+    "MB8GA1UdIwQYMBaAFEayHHfhexXwpTmhcN7RxC7qbbLeMIGOBggrBgEFBQcBAQSBgTB/MDcGCCsGAQUFBzABhitodHRwOi8v",
+    "b2NzcC5nbG9iYWxzaWduLmNvbS90aW1lc3RhbXByb290cjQ1MEQGCCsGAQUFBzAChjhodHRwOi8vc2VjdXJlLmdsb2JhbHNp",
+    "Z24uY29tL2NhY2VydC90aW1lc3RhbXByb290cjQ1LmNydDA/BgNVHR8EODA2MDSgMqAwhi5odHRwOi8vY3JsLmdsb2JhbHNp",
+    "Z24uY29tL3RpbWVzdGFtcHJvb3RyNDUuY3JsMBEGA1UdIAQKMAgwBgYEVR0gADANBgkqhkiG9w0BAQwFAAOCAgEAMqPuftFu",
+    "5GYxllheqUw9EmhHpfWf/+q5cYtV86kWhH1hrTkv3jDTLAGN6XIYZ/6cAH4JkVDuBQ53ZrZul+lbxfDkCsz5iM8R/wC0LgTp",
+    "ivXTlTVg2OVNIRGhYkpzWGRI3mbh2mxi14XKTMVBXBfnSFgoffJnpVy7odrQQDmh/MumLaMraNtEMJdsU0uLmY7XEpF0HYDM",
+    "AXR/kLTRvgfd3mwI4HyeNO8DBpMwYQx5OQtYzhn1j7dQ606mjVC7FdsOldWQtetobbmIvVW2+PEQDLjnfidQg0H3CE5GJwkl",
+    "JMttrp84rZ//VAZYR17BYscDMT43mgfRCg1EAuknkmMh94ie876xB0GJ2c+4son3kdOPtfIy8mEVmO1sckaURbHhSApy40os",
+    "MtdYAt/BAM3YN7LeRN93jLDidB2TU9y0ssrcXgvaecu/3gEySlj5F+Xneg4Q3jJO+3AJg/5UO5muS1zs1pyhNXFmcoaS/xrV",
+    "qRyR07BBkL6LwDLVXLMwBf9Nvj6vdzrkHtykC2rc6hSKNdQmC9nFyLpNfvyyYvZNjLa1af7wbiSude/LYQtHZdicoQ5LgxWa",
+    "tIKyMzmfFKuCETXRUNdBsR9r3eWGKR8Wgi4g0rNYMuq+7xm5ybES5/GkeM2edFVdf9m/kpCrym78xCg7PoMLvifn47ltLC9P",
+    "myAwggajMIIEi6ADAgECAhB4SqqBc2ackAlU5CHJR+vAMA0GCSqGSIb3DQEBDAUAMEwxIDAeBgNVBAsTF0dsb2JhbFNpZ24g",
+    "Um9vdCBDQSAtIFI2MRMwEQYDVQQKEwpHbG9iYWxTaWduMRMwEQYDVQQDEwpHbG9iYWxTaWduMB4XDTIwMTIwOTAwMDAwMFoX",
+    "DTM0MTIxMDAwMDAwMFowUzELMAkGA1UEBhMCQkUxGTAXBgNVBAoTEEdsb2JhbFNpZ24gbnYtc2ExKTAnBgNVBAMTIEdsb2Jh",
+    "bFNpZ24gVGltZXN0YW1waW5nIFJvb3QgUjQ1MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAunQz7CfcEjghG8XT",
+    "YSjWWrxP34vMkYRDJFe8ZCG8OxwfPU+MrQe388XXAukRFIKaqrSUcjtxDRrvaGuFeY6vZupYmA26wXx50v/Ns28xRdAFdAQA",
+    "cmonfrg3PzqI7ZeD9as1TQ+fWTv1L99ZxXylMnZglsjt7vgEfhlRcqi/REF6vHseOwCbvLrglr+Q/o2bw3KLABL4IDpgOPfB",
+    "zIWK+4d5LqErIObLoIWRI7bEKAdUKN7sEDFPivLNFB8e3VUc6igxTPkhaqjN85Zn+gFBm80PC2h/u97xQ+oX5bDccCKzaTZZ",
+    "dGvG5YkqfOULgV2rP4+40XZy83yiqeKXQb/MjEX+Ycn2bAcLAAToFSNPgiot9u/D+hE2SKHR/Xo5OjRdoywOm3dQIDRA3bED",
+    "Ma1f6WKHc5YDYfeUsNlcbE/nFMXh8XsNI5zNcIwdat5KLYsqu9tCFAUHqvsU3DHT9h9sy75oZkRwTW0X+XHrBXOOkZJ162hc",
+    "HvZEYRgpYt0XZojsKLpJb9s+d/65MR91HBiipke92O5IhTv9s+IPPyqYxpr6gm+xpaWGHVo6+qRsdA93UmFqf4cp3jmbi+6z",
+    "RWAwJJcVEiqFMJMmrJamLehwbQupMq0smygKdkLyVWFRmJTe7fbFF288FRCwDq2w3sUW9GXRzC9aVgjPmcTwVZHCLHkCAwEA",
+    "AaOCAXgwggF0MA4GA1UdDwEB/wQEAwIBhjATBgNVHSUEDDAKBggrBgEFBQcDCDAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW",
+    "BBRGshx34XsV8KU5oXDe0cQu6m2y3jAfBgNVHSMEGDAWgBSubAWjkxPioufi1xzWx/B/yGdToDB7BggrBgEFBQcBAQRvMG0w",
+    "LgYIKwYBBQUHMAGGImh0dHA6Ly9vY3NwMi5nbG9iYWxzaWduLmNvbS9yb290cjYwOwYIKwYBBQUHMAKGL2h0dHA6Ly9zZWN1",
+    "cmUuZ2xvYmFsc2lnbi5jb20vY2FjZXJ0L3Jvb3QtcjYuY3J0MDYGA1UdHwQvMC0wK6ApoCeGJWh0dHA6Ly9jcmwuZ2xvYmFs",
+    "c2lnbi5jb20vcm9vdC1yNi5jcmwwRwYDVR0gBEAwPjA8BgRVHSAAMDQwMgYIKwYBBQUHAgEWJmh0dHBzOi8vd3d3Lmdsb2Jh",
+    "bHNpZ24uY29tL3JlcG9zaXRvcnkvMA0GCSqGSIb3DQEBDAUAA4ICAQCLSLo2Vzxyxdp1+e8y9Ya93BIo44guTzZfJpnsDwEh",
+    "EJaSOMZwa23zrtQOvSXvhn/iiY2VpX4pRANNqpio8bfc6iljIdztzYgKyxBpYXkpQgwjvOnF71IeLzM31U9memapR1Qzsd0W",
+    "8thkcaMxlOVv9k1L4oRs0MklZ0/IS9DOSwXWPft9QfqKscAh4H4IsNlkK/nq8scK9M8uDDRg7my7kvA/8XtSEmh3WYH1HC6k",
+    "Oow5Aw3t5cyvZkh5Y9VJuP9L0iVPSE6TO5N3sJpIbLagHbN0nl+9IgQ7fDcNhbXDmrvdnFoDjbQNn0x2NNWFrUV7tZ+7Lom7",
+    "rMi/kmNIxj/KF6oNvAARX4vo40OEikM0zf07wKJ72x+4Z8iMFd4/pn/HKO+hb2+yQc8CIusB+EvI0nZvJd9e2mhoPXtEBMJB",
+    "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",
+    "mdYLpX9PLXPqDSDVDKxSsAtv7JCxstB8pAwpOWg=",
+)
+
+
+def anchor_self_test():
+    """MEI-2758 — chain-head anchors. RSA known-answer vectors (PKCS#1 v1.5,
+    PSS over SHA-256 and SHA-384), the pinned roots' fingerprints, the two
+    real witness tokens captured in the 2026-10-02 interop probe (each passes
+    against its own pinned root and fails against the other's, or when
+    altered), anchor statement parsing, and verify_anchors on synthetic packs
+    (unanchored, manifest 1.0, a tampered head, a missing statement, a summary
+    that disagrees with the anchors, an unknown manifest version)."""
+    import contextlib
+    import io
+    import tempfile
+
+    ok = True
+
+    def check(label, passed, what, output=""):
+        nonlocal ok
+        print(f"SELF-TEST assertion {label} {'PASS' if passed else 'FAIL'}: {what}")
+        if not passed and output:
+            print('\n'.join(f"    | {line}" for line in output.splitlines()))
+        ok = ok and passed
+
+    def code_of(fn):
+        try:
+            fn()
+        except AnchorFailure as exc:
+            return exc.code
+        return "passed"
+
+    # 25a-25c: RSA known-answer vectors (RSA-2048, e = 65537, generated with
+    # OpenSSL over the message below), plus a flipped bit and a short input.
+    spki = base64.b64decode("".join(_KAT_RSA_SPKI))
+    cs, ce = _der_expect(spki, 0, len(spki), 0x30)
+    kids = _der_children(spki, cs, ce)
+    bits = spki[kids[1][1]:kids[1][2]]
+    rcs, rce = _der_expect(bits, 1, len(bits), 0x30)
+    ints = _der_children(bits, rcs, rce)
+    n = _der_positive_int(bits[ints[0][1]:ints[0][2]])
+    e = _der_positive_int(bits[ints[1][1]:ints[1][2]])
+    message = b"meilynx-anchor-rsa-kat-v1"
+    for label, kind, hash_name, sig_b64 in (
+        ("25a", "v15", "sha256", "".join(_KAT_RSA_PKCS1_SHA256)),
+        ("25b", "pss", "sha256", "".join(_KAT_RSA_PSS_SHA256)),
+        ("25c", "pss", "sha384", "".join(_KAT_RSA_PSS_SHA384)),
+    ):
+        sig = base64.b64decode(sig_b64)
+        digest = hashlib.new(hash_name, message).digest()
+        if kind == "v15":
+            run = lambda s: SIG_BACKEND.rsa_pkcs1v15(n, e, hash_name, digest, s)  # noqa: E731
+        else:
+            run = lambda s: SIG_BACKEND.rsa_pss(n, e, hash_name, digest, s, _RSA_HASH_LEN[hash_name])  # noqa: E731
+        flipped = bytearray(sig)
+        flipped[len(sig) // 2] ^= 0x01
+        passed = run(sig) and not run(bytes(flipped)) and not run(sig[1:])
+        check(label, passed, f"RSA {'PKCS#1 v1.5' if kind == 'v15' else 'PSS'} {hash_name} known-answer "
+              f"vector verifies; a flipped bit and a truncated signature do not")
+
+    # 25d: the pinned roots load and match their fingerprints.
+    try:
+        roots = load_pinned_tsa_roots()
+        pinned = sorted(roots) == ["globalsign-r45", "sigstore"]
+    except ValueError:
+        roots, pinned = {}, False
+    check("25d", pinned, "the pinned TSA roots (Sigstore, GlobalSign R6) match their SHA-256 fingerprints")
+    if not pinned:
+        return False
+
+    # 25e-25f: the real probe tokens verify against their own pinned root.
+    probe_imprint = hashlib.sha256(b"meilynx-anchor-interop-probe-2026-10-02").digest()
+    real = {
+        "sigstore": (base64.b64decode("".join(_REAL_SIGSTORE_TSR)), "2026-10-03T00:51:11Z", "ecdsa-p384-sha256"),
+        "globalsign-r45": (base64.b64decode("".join(_REAL_GLOBALSIGN_TSR)), "2026-10-03T00:56:22Z",
+                           "rsa-pkcs1-sha384"),
+    }
+    for label, tsa_id in (("25e", "sigstore"), ("25f", "globalsign-r45")):
+        token, gen_time, algorithm = real[tsa_id]
+        try:
+            result = verify_tsa_token(token, probe_imprint, roots[tsa_id])
+            passed = _iso(result["gen_time"]) == gen_time and result["signature_algorithm"] == algorithm
+        except AnchorFailure as exc:
+            passed, result = False, exc
+        check(label, passed, f"the real {tsa_id} token verifies (genTime {gen_time}, {algorithm})", str(result))
+
+    # 25g-25l: in-code mutations of the real tokens.
+    def signer_signature_end(resp):
+        top = _der_children(resp, *_der_expect(resp, 0, len(resp), 0x30))
+        ci = _der_children(resp, top[1][1], top[1][2])
+        sd = _der_children(resp, *_der_children(resp, ci[1][1], ci[1][2])[0][1:3])
+        si = _der_children(resp, sd[-1][1], sd[-1][2])
+        return _der_children(resp, si[0][1], si[0][2])[5][2]
+
+    def tst_serial_end(resp):
+        top = _der_children(resp, *_der_expect(resp, 0, len(resp), 0x30))
+        ci = _der_children(resp, top[1][1], top[1][2])
+        sd = _der_children(resp, *_der_children(resp, ci[1][1], ci[1][2])[0][1:3])
+        encap = _der_children(resp, sd[2][1], sd[2][2])
+        octets = _der_children(resp, encap[1][1], encap[1][2])[0]
+        tst = _der_children(resp, *_der_expect(resp, octets[1], octets[2], 0x30))
+        return tst[3][2]
+
+    def flip(token, end):
+        out = bytearray(token)
+        out[end - 1] ^= 0x01
+        return bytes(out)
+
+    for tsa_id, other in (("sigstore", "globalsign-r45"), ("globalsign-r45", "sigstore")):
+        token = real[tsa_id][0]
+        roots_own = roots[tsa_id]
+        cases = (
+            ("against the other witness's pinned root", lambda: verify_tsa_token(token, probe_imprint, roots[other]),
+             "untrusted_chain"),
+            ("over a different imprint", lambda: verify_tsa_token(token, bytes(32), roots_own), "imprint_mismatch"),
+            ("with one signature bit flipped",
+             lambda: verify_tsa_token(flip(token, signer_signature_end(token)), probe_imprint, roots_own),
+             "signature_invalid"),
+            ("with the TSTInfo serial number altered",
+             lambda: verify_tsa_token(flip(token, tst_serial_end(token)), probe_imprint, roots_own),
+             "message_digest_mismatch"),
+            ("truncated", lambda: verify_tsa_token(token[:-1], probe_imprint, roots_own), "malformed"),
+            ("when the root's trust window has not opened at genTime",
+             lambda: verify_tsa_token(token, probe_imprint, [
+                 TsaRoot(r.name, r.cert.der, _rfc3339_to_epoch("2030-01-01T00:00:00Z"), float("inf"))
+                 for r in roots_own]),
+             "no_root_trusted_at_gen_time"),
+        )
+        for index, (what, fn, expected) in enumerate(cases):
+            got = code_of(fn)
+            label = f"25{'ghijkl'[index]}" + ("" if tsa_id == "sigstore" else "2")
+            check(label, got == expected, f"the real {tsa_id} token fails {what} ({expected})", f"got {got}")
+
+    # 25m: the Fulcio path's Certificate stays EC-only: an RSA certificate
+    # from the GlobalSign token is refused there.
+    gs = real["globalsign-r45"][0]
+    rsa_cert = _tsa_certificates(gs)[0]
+    try:
+        Certificate(rsa_cert)
+        refused = False
+    except DerError:
+        refused = True
+    check("25m", refused and TsaCertificate(rsa_cert).key_kind == "rsa",
+          "the Fulcio certificate parser still refuses an RSA key; the TSA parser reads it as RSA")
+
+    # 25n: anchor statements — canonical bytes parse; a re-encoding, an
+    # unknown field and an unsorted head list are refused.
+    head0 = {"chain": "chain_a", "event_hash": "0" * 64, "seq": 7}
+    head1 = {"chain": "chain_b", "event_hash": "1" * 64, "seq": 9}
+    statement = {"created_at": "2026-10-02T12:00:00.123Z", "hash_alg": "sha-256", "heads": [head0, head1],
+                 "run_id": "run-1", "v": "meilynx.anchor.v1"}
+    canonical = jcs_dumps(statement).encode("utf-8")
+    outcomes = (
+        code_of(lambda: parse_anchor_statement(canonical)),
+        code_of(lambda: parse_anchor_statement(json.dumps(statement).encode("utf-8"))),
+        code_of(lambda: parse_anchor_statement(jcs_dumps(dict(statement, extra=1)).encode("utf-8"))),
+        code_of(lambda: parse_anchor_statement(jcs_dumps(dict(statement, heads=[head1, head0])).encode("utf-8"))),
+    )
+    check("25n", outcomes == ("passed", "statement_non_canonical", "statement_malformed", "statement_malformed"),
+          "anchor statements: canonical bytes parse; non-canonical, extra-field and unsorted statements fail",
+          repr(outcomes))
+
+    # 25o-25t: verify_anchors on a synthetic three-record chain.
+    genesis = genesis_hash()
+    events = []
+    for seq in range(3):
+        prev = events[-1]["event_hash"] if events else genesis
+        event = {
+            "schema_version": "v1", "sequence_number": seq, "timestamp_utc": f"2026-01-01T00:00:0{seq}+00:00",
+            "event_id": f"evt-{seq}", "request_id": f"req-{seq}", "model_requested": "gpt-4.1-mini",
+            "action": "allow", "input_tokens": 11, "output_tokens": 7, "total_tokens": 18,
+            "cache_creation_input_tokens": None, "cache_read_input_tokens": None, "cached_input_tokens": None,
+            "reasoning_tokens": None, "estimated_cost_usd": 0.000123, "previous_hash": prev,
+        }
+        event["event_hash"] = recompute_event_hash(event, seq, prev)
+        events.append(event)
+    head_statement = jcs_dumps({
+        "created_at": "2026-01-01T00:00:05.000Z", "hash_alg": "sha-256",
+        "heads": [{"chain": "self-test", "event_hash": events[2]["event_hash"], "seq": 2}],
+        "run_id": "run-self-test", "v": "meilynx.anchor.v1"}).encode("utf-8")
+    placeholder_token = b"not a token"
+
+    def manifest_with(anchoring, version="1.1"):
+        return {"schema_version": version, "hash_version": "v1", "prefix": "audit/self-test/",
+                "from_sequence": 0, "to_sequence": 2, "anchoring": anchoring,
+                "events": [{"sequence": s, "recomputed_event_hash": events[s]["event_hash"]} for s in range(3)]}
+
+    unanchored = {"state": "unanchored", "chains": [{
+        "chain": "self-test", "reason": "no_anchors_found", "anchored_through_seq": None,
+        "unanchored_tail": {"from_seq": 0, "to_seq": 2}, "anchors": [], "seals": []}]}
+    anchored = {"state": "anchored", "chains": [{
+        "chain": "self-test", "reason": "anchored", "anchored_through_seq": 2, "unanchored_tail": None,
+        "anchors": [{"seq": 2,
+                     "statement": {"key": f"anchors/self-test/{2:020d}.json",
+                                   "sha256": hashlib.sha256(head_statement).hexdigest()},
+                     "tokens": {"sigstore": {"sha256": hashlib.sha256(placeholder_token).hexdigest(),
+                                             "gen_time": "2026-01-01T00:00:05Z"}}}],
+        "seals": []}]}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        records = Path(tmp)
+        anchors_dir = records / "anchors"
+        anchors_dir.mkdir()
+        for ev in events:
+            (records / record_file_name(ev["sequence_number"])).write_bytes(json.dumps(ev).encode("utf-8"))
+
+        def run(manifest, source=DirectoryAnchorSource(anchors_dir)):
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+                status = verify_anchors(manifest, local_fetcher(records), source, roots.get)
+            return status, out.getvalue()
+
+        status, output = run(manifest_with(unanchored))
+        check("25o", status == PASSED and "NOTICE: UNANCHORED" in output,
+              "a 1.1 pack with state unanchored passes with an UNANCHORED notice", output)
+
+        status, output = run(dict(manifest_with(None, version="1.0")))
+        check("25p", status == PASSED and "NOTICE: UNANCHORED" in output and "manifest 1.0" in output,
+              "a 1.0 pack passes with an UNANCHORED notice", output)
+
+        status, output = run(manifest_with(anchored))
+        check("25q", status == FAILED and "FAIL anchor seq=2: statement object is missing" in output,
+              "a listed anchor whose statement object is missing fails", output)
+
+        (anchors_dir / f"{2:020d}.json").write_bytes(head_statement)
+        (anchors_dir / f"{2:020d}.sigstore.tsr").write_bytes(placeholder_token)
+        tampered = dict(events[2], input_tokens=12)
+        tampered["event_hash"] = recompute_event_hash(tampered, 2, tampered["previous_hash"])
+        (records / record_file_name(2)).write_bytes(json.dumps(tampered).encode("utf-8"))
+        status, output = run(manifest_with(anchored))
+        check("25r", status == FAILED and "the record changed after it was anchored" in output,
+              "a record rewritten after its head was anchored fails, even with its own hash recomputed", output)
+
+        (records / record_file_name(2)).write_bytes(json.dumps(events[2]).encode("utf-8"))
+        status, output = run(manifest_with(anchored))
+        check("25s", status == CANNOT_EVALUATE and "token cannot be parsed" in output,
+              "an unparseable token cannot be evaluated (exit 2), never passes", output)
+
+        claims_anchored = {"state": "anchored", "chains": [dict(unanchored["chains"][0], anchored_through_seq=2,
+                                                                 unanchored_tail=None)]}
+        status, output = run(manifest_with(claims_anchored), source=DirectoryAnchorSource(records / "none"))
+        check("25t", status == FAILED and "anchoring summary does not match" in output,
+              "a manifest claiming coverage that no anchor provides fails", output)
+
+    # 25w: the clock check covers every anchored record, each against the
+    # earliest anchor at or after it. Anchors at 2 (genTime 100) and 5
+    # (genTime 50, an earlier token on a later head): records 0-5 all compare
+    # with 50; records 3 and 5 are ahead, 4 is unreadable, 6 is uncovered.
+    times = {0: 40, 1: 50, 2: 349, 3: 351, 5: 900, 6: 10_000}
+
+    def epoch(seq):
+        if seq not in times:
+            raise ValueError("no timestamp")
+        return times[seq]
+
+    got = records_clock_ahead([(5, 50), (2, 100)], 0, epoch)
+    check("25w", got == (2, (3, 351, 50), 1) and records_clock_ahead([], 0, epoch) == (0, None, 0),
+          "the record clock check covers every anchored record against the earliest covering genTime", repr(got))
+
+    # 25x: a token that verifies through a --tsa-root root reports that root;
+    # through a pinned root it does not.
+    sigstore_token = real["sigstore"][0]
+    pinned_root = roots["sigstore"][0]
+    supplied = TsaRoot("sigstore-root-0", pinned_root.cert.der, pinned_root.start, pinned_root.end, supplied=True)
+    via_pinned = verify_tsa_token(sigstore_token, probe_imprint, roots["sigstore"])["root"]
+    via_supplied = verify_tsa_token(sigstore_token, probe_imprint, [supplied])["root"]
+    notice = supplied_root_notice("sigstore", via_supplied)
+    check("25x", not via_pinned.supplied and via_supplied.supplied
+          and "witness sigstore" in notice and pinned_root.fingerprint in notice,
+          "a token verified through a --tsa-root root is reported with that root's SHA-256 and witness id",
+          notice)
+
+    errors = (manifest_schema_version_error({"schema_version": "1.1"}),
+              manifest_schema_version_error({}),
+              manifest_schema_version_error({"schema_version": "1.2"}))
+    check("25u", errors[0] is None and errors[1] is None and errors[2] is not None,
+          "manifest schema_version 1.0 / 1.1 / absent is understood; anything else is refused (exit 2)",
+          repr(errors))
+    check("25v", "chain-anchors-v1" in VERIFIER_CAPABILITIES,
+          "VERIFIER_CAPABILITIES advertises chain-anchors-v1")
+    return ok
+
+
+def _tsa_certificates(resp):
+    """The certificates carried in a TimeStampResp, as DER (self-test helper)."""
+    top = _der_children(resp, *_der_expect(resp, 0, len(resp), 0x30))
+    ci = _der_children(resp, top[1][1], top[1][2])
+    sd = _der_children(resp, *_der_children(resp, ci[1][1], ci[1][2])[0][1:3])
+    certs = next(f for f in sd[3:] if f[0] == 0xA0)
+    return [resp[c[3]:c[2]] for c in _der_children(resp, certs[1], certs[2])]
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Meilynx Integrity Pack reproducer — independently verifies GCS WORM audit chain.'
@@ -5284,6 +7181,18 @@ def main():
         ),
     )
     parser.add_argument(
+        '--tsa-root',
+        action='append',
+        default=[],
+        metavar='ID=FILE',
+        help=(
+            'PEM root certificate(s) to trust for chain-head anchor tokens from witness ID '
+            '(a customer timestamp authority). Each certificate is trusted only within its own '
+            'validity period. Repeatable. The public witnesses (sigstore, globalsign-r45) have '
+            'pinned roots and need no flag.'
+        ),
+    )
+    parser.add_argument(
         '--allow-unsigned',
         action='store_true',
         help=(
@@ -5301,6 +7210,7 @@ def main():
         ok = content_self_test() and ok
         ok = tool_calls_self_test() and ok
         ok = signature_self_test() and ok
+        ok = anchor_self_test() and ok
         sys.exit(0 if ok else 1)
 
     if not (args.bucket or args.records) or not args.manifest:
@@ -5322,6 +7232,16 @@ def main():
         print(f"ERROR: manifest is not valid JSON: {exc}", file=sys.stderr)
         sys.exit(EXIT_FAIL)
 
+    version_error = manifest_schema_version_error(manifest)
+    if version_error:
+        print(f"ERROR: {version_error}", file=sys.stderr)
+        sys.exit(EXIT_CANNOT_EVALUATE)
+    try:
+        tsa_roots = load_tsa_roots(args.tsa_root)
+    except (OSError, ValueError, DerError) as exc:
+        print(f"ERROR: unusable --tsa-root ({exc})", file=sys.stderr)
+        sys.exit(EXIT_CANNOT_EVALUATE)
+
     signed = pack_is_signed(manifest)
     signature_status = (
         report_pack_signature(manifest, manifest_bytes, manifest_path, args) if signed else UNSIGNED
@@ -5334,6 +7254,8 @@ def main():
             print(f"ERROR: {exc}", file=sys.stderr)
             sys.exit(1)
         print(f"Offline verification: records from {args.records}")
+        anchors_dir = Path(args.records) / 'anchors'
+        anchor_source = DirectoryAnchorSource(anchors_dir) if Path(args.records).is_dir() else None
     else:
         try:
             from google.cloud import storage as gcs
@@ -5345,9 +7267,17 @@ def main():
             )
             sys.exit(1)
 
-        fetch = gcs_fetcher(args.bucket, manifest.get('prefix', 'audit/'), gcs.Client())
+        client = gcs.Client()
+        fetch = gcs_fetcher(args.bucket, manifest.get('prefix', 'audit/'), client)
+        anchor_chain = chain_for_prefix(manifest.get('prefix', 'audit/'))
+        anchor_source = BucketAnchorSource(args.bucket, anchor_chain, client) if anchor_chain else None
         if args.export_records:
             fetch = exporting_fetcher(fetch, args.export_records)
+            if anchor_source is not None:
+                anchor_source = ExportingAnchorSource(anchor_source, args.export_records)
+
+    record_times = {}
+    fetch = timestamp_recording_fetcher(fetch, record_times)
 
     hash_version = manifest.get('hash_version', '')
     if hash_version not in SUPPORTED_HASH_VERSIONS:
@@ -5357,15 +7287,21 @@ def main():
             file=sys.stderr,
         )
         chain_status = CANNOT_EVALUATE
+        anchor_status = CANNOT_EVALUATE
     else:
         passed = verify_manifest_with(fetch, manifest, require_manifest_hash=signed)
         chain_status = PASSED if passed else FAILED
+        print()
+        anchor_status = verify_anchors(manifest, fetch, anchor_source, tsa_roots.get, record_times)
     count = len(manifest.get('events', []))
-    code = final_exit_code(chain_status, signature_status, bool(args.allow_unsigned))
+    code = final_exit_code(combine_with_anchor_status(chain_status, anchor_status), signature_status,
+                           bool(args.allow_unsigned))
 
     if code == EXIT_FAIL:
         if chain_status == FAILED:
             print("\nFAIL: one or more events failed verification.", file=sys.stderr)
+        if anchor_status == FAILED:
+            print("\nFAIL: chain-head anchor verification failed (see above).", file=sys.stderr)
         if signature_status == FAILED:
             print("\nFAIL: the manifest signature did not verify (see above).", file=sys.stderr)
     elif code == EXIT_CANNOT_EVALUATE:

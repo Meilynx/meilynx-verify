@@ -1,0 +1,17 @@
+{
+  "runs": [
+    {
+      "args": [
+        "--tsa-root",
+        "test-rsa=roots/rsa-root.der",
+        "--tsa-root",
+        "test-ec=roots/ec-root.der"
+      ],
+      "contains": [
+        "FAIL anchor seq=4: anchored head event_hash does not match the record",
+        "the record changed after it was anchored"
+      ],
+      "exit": 1
+    }
+  ]
+}

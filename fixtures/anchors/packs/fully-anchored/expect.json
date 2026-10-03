@@ -1,0 +1,25 @@
+{
+  "runs": [
+    {
+      "args": [
+        "--tsa-root",
+        "test-rsa=roots/rsa-root.der",
+        "--tsa-root",
+        "test-ec=roots/ec-root.der"
+      ],
+      "contains": [
+        "ANCHORS OK: chain=chain_tnt_fixture_run_a anchored_through=4 witnesses=2/2",
+        "NOTICE: anchor tokens from witness test-ec verified through a root supplied with --tsa-root",
+        "NOTICE: anchor tokens from witness test-rsa verified through a root supplied with --tsa-root"
+      ],
+      "exit": 0
+    },
+    {
+      "args": [],
+      "contains": [
+        "no trust root for this witness"
+      ],
+      "exit": 2
+    }
+  ]
+}

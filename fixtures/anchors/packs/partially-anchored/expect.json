@@ -1,0 +1,17 @@
+{
+  "runs": [
+    {
+      "args": [
+        "--tsa-root",
+        "test-rsa=roots/rsa-root.der",
+        "--tsa-root",
+        "test-ec=roots/ec-root.der"
+      ],
+      "contains": [
+        "anchored_through=2",
+        "NOTICE: unanchored tail seq=3..4"
+      ],
+      "exit": 0
+    }
+  ]
+}

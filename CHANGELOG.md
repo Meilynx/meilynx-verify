@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.6.0 (2026-10-03)
+
+- `verify-pack.py` from meilynx-proxy `c831e20`. The verifier itself last
+  changed in `78cb3a0`; `c831e20` is the commit from which the proxy also
+  writes the manifest 1.1 packs this release reads.
+- Chain-head anchors (SPEC §6.1). A proxy that writes to a write-once store
+  periodically timestamps its chain heads with RFC 3161 tokens from two
+  independent witnesses and stores the statement and tokens next to the
+  chain. The verifier checks every anchor a pack lists or carries: the
+  statement is canonical JSON naming this chain and sequence, the anchored
+  `event_hash` equals the record's recomputed hash, and each token verifies
+  against a pinned root (Sigstore TSA, GlobalSign Root CA - R6) or a root
+  passed with `--tsa-root ID=FILE`. A record changed or replaced under an
+  anchor fails with `the record changed after it was anchored`.
+- Pack manifest `schema_version` 1.1, which adds the `anchoring` section.
+  The verifier checks the manifest's coverage summary against the anchors it
+  verified. Manifest 1.0 still verifies, with an `UNANCHORED` notice.
+- Verdicts: an anchored pack prints `ANCHORS OK` with the anchored range and
+  the witness count; a pack with no anchors passes with a prominent
+  `UNANCHORED` notice; a listed anchor that is missing, differs from the
+  manifest's digests or does not verify fails (exit 1); a witness with no
+  trust root, an unparseable token or an unknown manifest version is cannot
+  evaluate (exit 2).
+- `--tsa-root ID=FILE`: PEM roots for a customer witness. A token verified
+  through one is reported with that root's SHA-256 fingerprint.
+- A record whose own clock is more than five minutes ahead of the anchor
+  covering it is reported as a NOTICE. The token's genTime is the
+  authoritative "existed by" time.
+- `VERIFIER_CAPABILITIES` declares `chain-anchors-v1`. Meilynx gates
+  production rollouts on it: a proxy build that writes anchors is not rolled
+  until a public release declares the capability.
+- Fixtures: `fixtures/anchors/` holds nine offline packs (fully, partially
+  and un-anchored, tampered head, missing anchor, untrusted root, record
+  clock ahead, manifest 1.0, unknown manifest version), each with the exit
+  code and lines it must produce, plus 37 RFC 3161 token cases with the
+  verdict the proxy's own verifier gave. `fixtures/run-anchor-cases.py` runs
+  both sets and compares every token verdict with `openssl ts -verify`.
+- `--self-test` adds the anchor assertions (25a to 25x).
+
 ## 0.5.0 (2026-10-03)
 
 - `verify-pack.py` from meilynx-proxy `c1581f0`.

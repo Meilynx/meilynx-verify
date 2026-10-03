@@ -72,6 +72,34 @@ jobs:
             "d['identity']['asserted']['agent_name'] = 'impostor-agent'"
           expect_fail fixtures/coverage/records fixtures/coverage/manifest.json 1 \
             "d['coverage_key_inventory']['keys_json'] = d['coverage_key_inventory']['keys_json'].replace('\"governed\":false', '\"governed\":true')"
+      - name: Chain-head anchors; token verdicts match the proxy verifier and OpenSSL, and each offline pack exits as expected
+        run: python fixtures/run-anchor-cases.py
+      - name: The anchored sample verifies through the fixture roots (ANCHORS OK)
+        run: |
+          set -o pipefail
+          python verify-pack.py --records fixtures/anchors/packs/fully-anchored/records \
+            --manifest fixtures/anchors/packs/fully-anchored/manifest.json --allow-unsigned \
+            --tsa-root test-rsa=fixtures/anchors/roots/rsa-root.pem \
+            --tsa-root test-ec=fixtures/anchors/roots/ec-root.pem | tee /tmp/anchored.out
+          grep -q "ANCHORS OK: chain=chain_tnt_fixture_run_a anchored_through=4 witnesses=2/2" /tmp/anchored.out
+      - name: A record changed after it was anchored must fail (exit 1)
+        run: |
+          set +e
+          python verify-pack.py --records fixtures/anchors/packs/tampered-head/records \
+            --manifest fixtures/anchors/packs/tampered-head/manifest.json --allow-unsigned \
+            --tsa-root test-rsa=fixtures/anchors/roots/rsa-root.pem \
+            --tsa-root test-ec=fixtures/anchors/roots/ec-root.pem > /tmp/tampered.out
+          rc=$?
+          set -e
+          grep -q "the record changed after it was anchored" /tmp/tampered.out
+          if [ "$rc" -ne 1 ]; then
+            echo "tampered anchored head exited $rc, expected 1: verifier is broken" >&2; exit 1
+          fi
+      - name: The PEM fixture roots are the DER roots the cases reference
+        run: |
+          for r in rsa ec; do
+            openssl x509 -inform der -in fixtures/anchors/roots/$r-root.der | diff - fixtures/anchors/roots/$r-root.pem
+          done
       - name: Fixtures were generated from this verifier
         run: |
           python fixtures/generate.py --out /tmp/regen
