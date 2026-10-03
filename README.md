@@ -20,9 +20,10 @@ library when run offline. The format it checks is documented in
 # 1. Confirm the verifier itself works (pinned fixture hashes + an offline tamper test)
 python3 verify-pack.py --self-test
 
-# 2. Verify the sample chain shipped with this repository
-#    (the sample is not signed, which --allow-unsigned acknowledges)
+# 2. Verify the sample chains shipped with this repository
+#    (the samples are not signed, which --allow-unsigned acknowledges)
 python3 verify-pack.py --records fixtures/records --manifest fixtures/manifest.json --allow-unsigned
+python3 verify-pack.py --records fixtures/coverage/records --manifest fixtures/coverage/manifest.json --allow-unsigned
 ```
 
 Exit codes, the same online and offline:
@@ -36,9 +37,11 @@ Exit codes, the same online and offline:
 
 When more than one applies, `1` outranks `2`, and `2` outranks `3`.
 
-The sample chain carries no signature, so step 2 prints "AUTHENTICITY NOT
+The sample chains carry no signature, so step 2 prints "AUTHENTICITY NOT
 ESTABLISHED" and relies on `--allow-unsigned` for its `0`. Without the flag it
-exits `3`.
+exits `3`. The first sample is a request chain (model calls and MCP tool
+calls, including records that seal the caller's identity); the second is a
+coverage chain.
 
 Try it on a tampered copy:
 
@@ -138,8 +141,11 @@ It does **not** prove:
   deployment property (routing enforcement), not a chain property.
 - that fields outside the hash preimage are unchanged. Which fields are
   hashed is listed per record version in [SPEC.md](SPEC.md). For LLM-lane
-  records the prompt and response text is stored in the record but is not in
-  the preimage; for MCP-lane records a digest of the payload is.
+  records sealed under a capture policy (v1.10 and later), digests of the
+  prompt, response, findings and tool calls are in the preimage and the
+  verifier checks the stored content against them; without a capture policy
+  that content is stored but not bound. For MCP-lane records a digest of the
+  payload is in the preimage.
 - who wrote the record. A signed pack (`manifest.json.sigstore.json`) binds
   the manifest to the signing identity, and the manifest binds each record's
   hash; the records themselves are not signed individually.
@@ -147,7 +153,7 @@ It does **not** prove:
 ## Versions
 
 The verifier understands chain records with `schema_version` v1 through
-v1.10. A record of an unknown version or kind fails verification rather than
+v1.13. A record of an unknown version or kind fails verification rather than
 being skipped. Changes to the verifier are listed in
 [CHANGELOG.md](CHANGELOG.md). The canonical source of this file is the
 `meilynx-integrity-pack` crate in the proxy; releases here are byte-identical

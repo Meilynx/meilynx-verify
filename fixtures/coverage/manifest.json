@@ -1,0 +1,51 @@
+{
+  "schema_version": "1.0",
+  "pack_id": "00000000-0000-4000-8000-00000000f1f1",
+  "window": "A",
+  "signing_deferred": true,
+  "generated_at": "2026-10-01T15:00:00Z",
+  "generator_version": "fixture",
+  "substrate_name": "fixture",
+  "bucket": "fixture",
+  "prefix": "coverage/fixture/",
+  "from_sequence": 0,
+  "to_sequence": 1,
+  "hash_algorithm": "sha256",
+  "hash_version": "v1",
+  "genesis_hash": "c2989403cf897daccd825cc41377b804343c5a4851eac1daf32b58eb1fa4edf8",
+  "verified": true,
+  "records_checked": 2,
+  "first_sequence": 0,
+  "last_sequence": 1,
+  "break_at_sequence": null,
+  "violation_kind": null,
+  "error": null,
+  "events": [
+    {
+      "sequence": 0,
+      "timestamp_utc": "2026-10-01T01:00:00.000000000Z",
+      "action": "allow",
+      "model_requested": "",
+      "project_id": null,
+      "request_id": "00000000-0000-4000-8000-00000000c000",
+      "event_id": "00000000-0000-4000-8000-00000000c000",
+      "stored_event_hash": "c73f06c4a2aca6861b12cb8f92cd0468dd73430da829904256a423cfb9e8a735",
+      "recomputed_event_hash": "c73f06c4a2aca6861b12cb8f92cd0468dd73430da829904256a423cfb9e8a735",
+      "hash_match": true,
+      "previous_hash_match": true
+    },
+    {
+      "sequence": 1,
+      "timestamp_utc": "2026-10-01T01:00:01.000000000Z",
+      "action": "allow",
+      "model_requested": "",
+      "project_id": null,
+      "request_id": "00000000-0000-4000-8000-00000000c001",
+      "event_id": "00000000-0000-4000-8000-00000000c001",
+      "stored_event_hash": "458d5b6645dd0319be4085b14899ce0c5c59d7ea72bebf19dff836e8e124de4f",
+      "recomputed_event_hash": "458d5b6645dd0319be4085b14899ce0c5c59d7ea72bebf19dff836e8e124de4f",
+      "hash_match": true,
+      "previous_hash_match": true
+    }
+  ]
+}

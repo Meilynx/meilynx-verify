@@ -1,0 +1,33 @@
+{
+ "schema_version": "v1.8",
+ "event_kind": "coverage_computed",
+ "sequence_number": 0,
+ "timestamp_utc": "2026-10-01T01:00:00.000000000Z",
+ "event_id": "00000000-0000-4000-8000-00000000c000",
+ "request_id": "00000000-0000-4000-8000-00000000c000",
+ "model_requested": "",
+ "action": "allow",
+ "input_tokens": 0,
+ "output_tokens": 0,
+ "estimated_cost_usd": null,
+ "findings": [],
+ "messages": [],
+ "response_text": null,
+ "coverage": {
+  "provider": "openai",
+  "day": "2026-09-30",
+  "tier": "A",
+  "reconciliation_unit": "requests",
+  "proxy_attributed": 40,
+  "provider_reported": 52,
+  "delta_classification": "bypass_signal",
+  "bypass_rate_ppm": 230769,
+  "tolerance_band_json": "{\"relative\":0.02,\"unit\":\"requests\"}",
+  "claim_language_key": "coverage.tier_a.org_administered_accounts",
+  "registry_version": "2026.10.01-1",
+  "numerator_source": "instance_sqlite",
+  "denominator_fetched_at": "2026-10-01T01:00:00Z"
+ },
+ "previous_hash": "c2989403cf897daccd825cc41377b804343c5a4851eac1daf32b58eb1fa4edf8",
+ "event_hash": "c73f06c4a2aca6861b12cb8f92cd0468dd73430da829904256a423cfb9e8a735"
+}

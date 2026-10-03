@@ -249,6 +249,9 @@ EVENT_KIND_MCP_ERROR = 'mcp.error'
 EVENT_KIND_MCP_CATALOG_DRIFT = 'mcp.catalog_drift'
 # MEI-1955 (ADR-0052) — the coverage-reconciliation kind (v1.8 bucket).
 EVENT_KIND_COVERAGE_COMPUTED = 'coverage.computed'
+# MEI-2641 (ADR-0052 dated edit 2026-10-01) — the provider-key inventory kind
+# (v1.13 bucket).
+EVENT_KIND_COVERAGE_KEY_INVENTORY = 'coverage.key_inventory'
 
 MCP_EVENT_KINDS = {
     EVENT_KIND_MCP_TOOL_CALL,
@@ -273,6 +276,8 @@ SERDE_EVENT_KIND_TO_WIRE = {
     'mcp_catalog_drift': EVENT_KIND_MCP_CATALOG_DRIFT,
     # MEI-1955 — serde snake_case form of the v1.8 kind.
     'coverage_computed': EVENT_KIND_COVERAGE_COMPUTED,
+    # MEI-2641 — serde snake_case form of the v1.13 kind.
+    'coverage_key_inventory': EVENT_KIND_COVERAGE_KEY_INVENTORY,
 }
 
 
@@ -645,6 +650,41 @@ def compute_event_hash_v1_8_coverage(
     return h.hexdigest()
 
 
+def compute_event_hash_v1_13_coverage_key_inventory(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    inventory,
+):
+    """MEI-2641 (ADR-0052 dated edit 2026-10-01) — v1.13 coverage.key_inventory
+    hash. `inventory` is a dict matching `CoverageKeyInventoryFields`. Mirror of
+    `compute_event_hash_v1_13_coverage_key_inventory` in sqlite.rs: the SAME
+    v1.2 prefix, then the event_kind wire-name, then the 11 payload fields in
+    struct-definition order. Strings feed as raw utf-8 (`keys_json` verbatim,
+    as stored, never re-serialized); the four counts feed as little-endian
+    signed 64-bit with no presence tag."""
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_COVERAGE_KEY_INVENTORY.encode('utf-8'))
+    h.update(inventory['provider'].encode('utf-8'))
+    h.update(inventory['day'].encode('utf-8'))
+    h.update(inventory['attribution_unit'].encode('utf-8'))
+    h.update(inventory['claim_language_key'].encode('utf-8'))
+    h.update(inventory['registry_version'].encode('utf-8'))
+    h.update(struct.pack('<q', int(inventory['proxy_key_count'])))
+    h.update(struct.pack('<q', int(inventory['unresolved_proxy_key_count'])))
+    h.update(struct.pack('<q', int(inventory['governed_key_count'])))
+    h.update(struct.pack('<q', int(inventory['ungoverned_key_count'])))
+    h.update(inventory['listing_fetched_at'].encode('utf-8'))
+    h.update(inventory['keys_json'].encode('utf-8'))
+    return h.hexdigest()
+
+
 def compute_event_hash_v1_9_llm_request(
     sequence_number, timestamp_utc, event_id, request_id,
     model_requested, action, input_tokens, output_tokens,
@@ -890,7 +930,7 @@ def _has_tool_call_digests(content):
 
 
 def check_llm_content(event):
-    """MEI-2424 — for a v1.10 or v1.11 record, check that the content it
+    """MEI-2424 — for a v1.10, v1.11 or v1.12 record, check that the content it
     carries is the content it was sealed over: the stored-prompt,
     stored-response, findings and (MEI-2456) stored-tool-calls digests (all
     inside the hash) must match the record's own `messages`, `response_text`,
@@ -898,11 +938,18 @@ def check_llm_content(event):
     retained, so the record must carry no content on that axis; a v1.10
     record has no tool-call digest, so tool calls on one are unattested.
     Returns a list of problems; empty means the content checks out. Records
-    on older schema versions carry no digests and return no problems."""
+    on older schema versions carry no digests and return no problems.
+
+    MEI-2745 — v1.12 carries the v1.11 content block forward, presence-tagged:
+    a v1.12 record with a content block gets the same check, and one sealed
+    with no capture policy has none and stores its content unhashed, as before
+    v1.10."""
     schema_version = event.get('schema_version') or 'v1'
-    if schema_version not in ('v1.10', 'v1.11'):
+    if schema_version not in ('v1.10', 'v1.11', 'v1.12'):
         return []
     content = event.get('content')
+    if schema_version == 'v1.12' and content is None:
+        return []
     if not isinstance(content, dict):
         return [f'{schema_version} record has no content payload']
     problems = []
@@ -933,6 +980,161 @@ def check_llm_content(event):
     return problems
 
 
+def encode_sealed_identity(identity):
+    """MEI-2646 — the sealed identity feed shared by the v1.12 hashers of both
+    lanes. Mirror of `feed_sealed_identity` in sqlite.rs: `SealedIdentity`
+    definition order; optional strings carry the 1-byte presence tag;
+    `delegated_human` is a presence tag followed by `subject` then `issuer`.
+    `tier` and `credential_kind` are fed in their wire spelling (`t1`,
+    `project_key`, …), which is how the record stores them."""
+    out = encode_optional_str(identity.get('agent_id'))
+    out += identity['tier'].encode('utf-8')
+    out += identity['credential_kind'].encode('utf-8')
+    out += encode_optional_str(identity.get('credential_kid'))
+    human = identity.get('delegated_human')
+    if human is None:
+        out += b'\x00'
+    else:
+        out += b'\x01' + human['subject'].encode('utf-8') + human['issuer'].encode('utf-8')
+    out += identity['asserted_digest'].encode('utf-8')
+    return out
+
+
+def asserted_claims_digest(asserted):
+    """MEI-2646 — lowercase hex SHA-256 over the RFC 8785 canonical JSON of the
+    stored `identity.asserted` object. Mirror of `asserted_claims_digest` in
+    meilynx-core (serde_jcs over the same object the record stores)."""
+    return sha256_jcs(asserted)
+
+
+def check_sealed_identity(event):
+    """MEI-2646 — for a v1.12 record, check that the stored asserted labels
+    are the labels the record was sealed over: recompute `asserted_digest`
+    from `identity.asserted`. The labels are stored-not-hashed, so a rewritten
+    label leaves the chain hash intact; this check is what catches it. Returns
+    a list of problems; empty means the identity checks out. Records on any
+    other schema version carry no identity and return no problems."""
+    version = event.get('schema_version') or 'v1'
+    if version != 'v1.12':
+        return []
+    identity = event.get('identity')
+    if not isinstance(identity, dict):
+        return [f"{version} record has no identity block"]
+    problems = []
+    asserted = identity.get('asserted')
+    if not isinstance(asserted, dict):
+        problems.append("identity has no stored asserted-claims object")
+    else:
+        expected = asserted_claims_digest(asserted)
+        if identity.get('asserted_digest') != expected:
+            problems.append(
+                f"identity.asserted_digest {identity.get('asserted_digest')!r} does not match "
+                f"the stored asserted labels (recomputed {expected!r}) — a label was rewritten "
+                f"after sealing"
+            )
+    return problems
+
+
+def compute_event_hash_v1_12_llm_request(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    join_context, content, identity,
+):
+    """MEI-2646 — v1.12 llm_request hash: the v1.11 layout with the content
+    block presence-tagged (`content` may be None: every LLM record is v1.12
+    once the resolver produced an identity, whether or not a capture policy is
+    in force), followed by the sealed identity block. Mirror of
+    `compute_event_hash_v1_12_llm_request` in sqlite.rs. The v1.11 feeds are
+    duplicated, not shared, so a v1.12 change can never move a v1.11 hash."""
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_LLM_REQUEST.encode('utf-8'))
+    join = join_context or {}
+    h.update(encode_optional_str(join.get('correlation_id')))
+    h.update(encode_optional_str(join.get('session_id')))
+    h.update(encode_optional_str(join.get('agent_name')))
+    if content is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(content['capture_policy'].encode('utf-8'))
+        h.update(encode_optional_str(content.get('prompt_sha256_jcs')))
+        h.update(encode_optional_str(content.get('response_sha256')))
+        h.update(encode_optional_str(content.get('stored_prompt_sha256_jcs')))
+        h.update(encode_optional_str(content.get('stored_response_sha256')))
+        h.update(encode_optional_str(content.get('findings_sha256_jcs')))
+        h.update(encode_optional_str(content.get('tool_calls_sha256_jcs')))
+        h.update(encode_optional_str(content.get('stored_tool_calls_sha256_jcs')))
+    # MEI-2646 — the v1.12 addition.
+    h.update(encode_sealed_identity(identity))
+    return h.hexdigest()
+
+
+def compute_event_hash_v1_12_mcp(
+    event_kind,
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    mcp_event, join_context, identity,
+):
+    """MEI-2646 — v1.12 mcp.* hash: the v1.9 layout with the join keys
+    presence-tagged whether or not the caller asserted any (`join_context`
+    may be None), then the sealed identity block. Mirror of
+    `compute_event_hash_v1_12_mcp` in sqlite.rs. One number for both lanes:
+    v1.10 and v1.11 are LLM content buckets, so the MCP lane skips to v1.12.
+    The v1.4-v1.9 feeds are DUPLICATED here, not shared."""
+    if event_kind not in MCP_EVENT_KINDS:
+        raise ValueError(
+            f"MEI-2646: compute_event_hash_v1_12_mcp called with non-MCP kind {event_kind!r}"
+        )
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(event_kind.encode('utf-8'))
+    h.update(mcp_event['virtual_server'].encode('utf-8'))
+    h.update(mcp_event['upstream_slug'].encode('utf-8'))
+    h.update(mcp_event['method'].encode('utf-8'))
+    h.update(encode_optional_str(mcp_event.get('tool_name')))
+    h.update(encode_optional_str(mcp_event.get('jsonrpc_id')))
+    h.update(mcp_event['protocol_version'].encode('utf-8'))
+    h.update(encode_optional_str(mcp_event.get('decision')))
+    h.update(encode_optional_str(mcp_event.get('reason')))
+    h.update(encode_optional_str(mcp_event.get('payload_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('mcp_bundle_sha256')))
+    h.update(encode_optional_str(mcp_event.get('correlated_event_id')))
+    h.update(encode_optional_i64(mcp_event.get('error_code')))
+    h.update(mcp_event['traceparent'].encode('utf-8'))
+    h.update(encode_principal_chain(mcp_event['principal_chain']))
+    h.update(encode_optional_str(mcp_event.get('redacted_payload_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('redaction_pre_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('redaction_post_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('hold_id')))
+    join = join_context or {}
+    h.update(encode_optional_str(join.get('correlation_id')))
+    h.update(encode_optional_str(join.get('session_id')))
+    h.update(encode_optional_str(join.get('agent_name')))
+    # MEI-2646 — the v1.12 addition.
+    h.update(encode_sealed_identity(identity))
+    return h.hexdigest()
+
+
+def _on_behalf_of_is_verified(mcp_event):
+    """Mirror of `PrincipalChain::on_behalf_of_is_verified`: a verified leg is
+    present AND marked `verified`; an unmarked leg is asserted (fail-safe)."""
+    chain = mcp_event.get('principal_chain') or {}
+    return chain.get('on_behalf_of') is not None and chain.get('on_behalf_of_attestation') == 'verified'
+
+
 def compute_event_hash_dispatch(
     schema_version,
     sequence_number, timestamp_utc, event_id, request_id,
@@ -941,6 +1143,7 @@ def compute_event_hash_dispatch(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     event_kind=EVENT_KIND_LLM_REQUEST, auth_session=None, admin_action=None,
     mcp_event=None, coverage=None, join_context=None, content=None,
+    identity=None, coverage_key_inventory=None,
 ):
     """MEI-639 — Python mirror of compute_event_hash_dispatch in sqlite.rs.
 
@@ -949,6 +1152,17 @@ def compute_event_hash_dispatch(
       - "v1.2" → compute_event_hash_v1_2_* based on event_kind.
       - Unknown → raise ValueError (forward-compat guard, matches Rust).
     """
+    # MEI-2641 — ADR-0013 A: fail closed. The key-inventory payload is hashed
+    # only by the v1.13 coverage.key_inventory hasher; anywhere else it would
+    # sit on the record unhashed.
+    if coverage_key_inventory is not None and (
+        schema_version != 'v1.13' or event_kind != EVENT_KIND_COVERAGE_KEY_INVENTORY
+    ):
+        raise ValueError(
+            f"MEI-2641: coverage_key_inventory payload present on a {schema_version!r} "
+            f"{event_kind!r} event — it is hashed only in the v1.13 "
+            f"coverage.key_inventory bucket."
+        )
     # MEI-2151 — fail-closed invariant, mirror of the Rust dispatcher: a
     # caller-asserted join key may only ride the one bucket whose preimage
     # contains it. An event carrying join_context on an older schema_version
@@ -956,22 +1170,38 @@ def compute_event_hash_dispatch(
     # the fact without breaking the chain.
     # MEI-2424 — the same rule for the content attestation: its digests are
     # hashed only in the v1.10 and v1.11 buckets.
-    if content is not None and schema_version not in ('v1.10', 'v1.11'):
+    if content is not None and schema_version not in ('v1.10', 'v1.11', 'v1.12'):
         raise ValueError(
             f"MEI-2424: content attestation present on a {schema_version!r} event — "
-            f"content digests are hashed only in the v1.10 and v1.11 buckets."
+            f"content digests are hashed only in the v1.10, v1.11 and v1.12 buckets."
         )
     # MEI-2456 — and the tool-call digests only in v1.11: the v1.10 hash does
     # not read them, so a v1.10 record carrying one would present it unhashed.
-    if _has_tool_call_digests(content) and schema_version != 'v1.11':
+    if _has_tool_call_digests(content) and schema_version not in ('v1.11', 'v1.12'):
         raise ValueError(
             f"MEI-2456: tool-call digests present on a {schema_version!r} event — "
-            f"they are hashed only in the v1.11 bucket."
+            f"they are hashed only in the v1.11 and v1.12 buckets."
         )
-    if join_context is not None and schema_version not in ('v1.9', 'v1.10', 'v1.11'):
+    # MEI-2646 — ADR-0013 A: fail closed. The sealed identity enters only the
+    # v1.12 preimage (both lanes); on any other version it would sit on the
+    # record unhashed, rewritable without breaking the chain.
+    if identity is not None and schema_version != 'v1.12':
+        raise ValueError(
+            f"MEI-2646: identity block present on a {schema_version!r} event — "
+            f"it is hashed only in the v1.12 bucket."
+        )
+    # MEI-2646 — the hashed delegated_human and the stored-not-hashed MEI-2633
+    # attestation marker must agree.
+    if identity is not None and mcp_event is not None:
+        if (identity.get('delegated_human') is not None) != _on_behalf_of_is_verified(mcp_event):
+            raise ValueError(
+                "MEI-2646: identity.delegated_human disagrees with the principal chain's "
+                "on_behalf_of_attestation — the two must agree"
+            )
+    if join_context is not None and schema_version not in ('v1.9', 'v1.10', 'v1.11', 'v1.12'):
         raise ValueError(
             f"MEI-2151: join_context present on a {schema_version!r} event — "
-            f"caller-asserted join keys are hashed only in the v1.9, v1.10 and v1.11 buckets."
+            f"caller-asserted join keys are hashed only in the v1.9, v1.10, v1.11 and v1.12 buckets."
         )
     if schema_version in ('v1', 'v1.1'):
         return compute_event_hash(
@@ -1121,6 +1351,25 @@ def compute_event_hash_dispatch(
             cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
             coverage,
         )
+    if schema_version == 'v1.13':
+        # MEI-2641 — v1.13 introduces exactly one new event class:
+        # coverage.key_inventory. Same kind-only gate posture as v1.8.
+        if event_kind != EVENT_KIND_COVERAGE_KEY_INVENTORY:
+            raise ValueError(
+                f"MEI-2641: schema_version v1.13 is defined only for "
+                f"coverage.key_inventory events; got event_kind {event_kind!r}"
+            )
+        if coverage_key_inventory is None:
+            raise ValueError(
+                "MEI-2641: CoverageKeyInventory event missing coverage_key_inventory payload"
+            )
+        return compute_event_hash_v1_13_coverage_key_inventory(
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            coverage_key_inventory,
+        )
     if schema_version == 'v1.9':
         # MEI-2151 — v1.9 is the first bucket that is NOT keyed to a new event
         # class: it is the existing llm_request / mcp.* preimages plus the
@@ -1200,6 +1449,39 @@ def compute_event_hash_dispatch(
             total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
             cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
             join_context, content,
+        )
+    if schema_version == 'v1.12':
+        # MEI-2646 — the identity bucket on BOTH lanes: the llm_request
+        # preimage (v1.11 layout, content presence-tagged) or the mcp.*
+        # preimage (v1.9 layout, join presence-tagged), then the sealed
+        # identity block. Stamped exactly when the record carries an identity.
+        if identity is None:
+            raise ValueError(
+                "MEI-2646: schema_version v1.12 requires an identity block; a "
+                "record sealed without one must stay in its pre-v1.12 bucket."
+            )
+        if event_kind == EVENT_KIND_LLM_REQUEST:
+            return compute_event_hash_v1_12_llm_request(
+                sequence_number, timestamp_utc, event_id, request_id,
+                model_requested, action, input_tokens, output_tokens,
+                total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+                cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+                join_context, content, identity,
+            )
+        if event_kind in MCP_EVENT_KINDS:
+            if mcp_event is None:
+                raise ValueError(f"MEI-2646: {event_kind!r} event missing mcp_event payload")
+            return compute_event_hash_v1_12_mcp(
+                event_kind,
+                sequence_number, timestamp_utc, event_id, request_id,
+                model_requested, action, input_tokens, output_tokens,
+                total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+                cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+                mcp_event, join_context, identity,
+            )
+        raise ValueError(
+            f"MEI-2646: schema_version v1.12 is defined only for llm_request "
+            f"and mcp.* events; got event_kind {event_kind!r}"
         )
     raise ValueError(
         f"MEI-639: unknown schema_version {schema_version!r} — "
@@ -1680,6 +1962,52 @@ def run_self_test():
         print(f'  got:      {got_v18_loop}', file=sys.stderr)
         ok = False
 
+    # MEI-2641 Assertion 16c — v1.13 coverage.key_inventory fixture (direct
+    # fn), paired with the Rust mei2641_v1_13_key_inventory_fixture_hash_pinned
+    # literal in meilynx-audit/tests/mei2641_key_inventory_chain_round_trip.rs.
+    got_v113 = compute_event_hash_v1_13_coverage_key_inventory(
+        sequence_number=7, timestamp_utc=ts_1760, event_id='evt-fixture',
+        request_id='req-fixture', model_requested='', action='allow',
+        input_tokens=0, output_tokens=0, total_tokens=None,
+        cache_creation_input_tokens=None, cache_read_input_tokens=None,
+        cached_input_tokens=None, reasoning_tokens=None,
+        estimated_cost_usd=None, previous_hash='prev-fixture',
+        inventory=_V1_13_KEY_INVENTORY_FIXTURE_PAYLOAD,
+    )
+    if got_v113 == V1_13_COVERAGE_KEY_INVENTORY_FIXTURE_HASH:
+        print('SELF-TEST assertion 16c PASS: v1.13 coverage.key_inventory fixture hash matches')
+    else:
+        print('SELF-TEST assertion 16c FAIL: v1.13 coverage.key_inventory fixture drift', file=sys.stderr)
+        print(f'  expected: {V1_13_COVERAGE_KEY_INVENTORY_FIXTURE_HASH}', file=sys.stderr)
+        print(f'  got:      {got_v113}', file=sys.stderr)
+        ok = False
+
+    # MEI-2641 Assertion 16d — the same v1.13 event through recompute_event_hash
+    # (the production path) from a synthetic exported-JSON body, then a payload
+    # outside its bucket must be refused rather than hashed without it.
+    synthetic_inventory_event = dict(
+        schema_version='v1.13',
+        event_kind='coverage_key_inventory',
+        timestamp_utc=ts_1760.replace('+00:00', 'Z'),
+        event_id='evt-fixture', request_id='req-fixture', model_requested='',
+        action='allow', input_tokens=0, output_tokens=0,
+        coverage_key_inventory=dict(_V1_13_KEY_INVENTORY_FIXTURE_PAYLOAD),
+    )
+    got_v113_loop = recompute_event_hash(synthetic_inventory_event, 7, 'prev-fixture')
+    misplaced = dict(synthetic_inventory_event, schema_version='v1.8', event_kind='coverage_computed')
+    try:
+        recompute_event_hash(misplaced, 7, 'prev-fixture')
+        misplaced_rejected = False
+    except ValueError:
+        misplaced_rejected = True
+    if got_v113_loop == V1_13_COVERAGE_KEY_INVENTORY_FIXTURE_HASH and misplaced_rejected:
+        print('SELF-TEST assertion 16d PASS: verify_manifest recompute path handles v1.13 coverage.key_inventory')
+    else:
+        print('SELF-TEST assertion 16d FAIL: recompute_event_hash mis-handles v1.13 coverage.key_inventory', file=sys.stderr)
+        print(f'  expected: {V1_13_COVERAGE_KEY_INVENTORY_FIXTURE_HASH} (misplaced payload rejected)', file=sys.stderr)
+        print(f'  got:      {got_v113_loop} (misplaced rejected: {misplaced_rejected})', file=sys.stderr)
+        ok = False
+
     # MEI-2151 Assertion 17a — v1.9 llm_request fixture (direct fn), paired
     # with the Rust mei2151_v1_9_llm_request_fixture_hash_pinned literal.
     got_v19_llm = compute_event_hash_v1_9_llm_request(
@@ -1755,6 +2083,199 @@ def run_self_test():
         print('SELF-TEST assertion 17d FAIL: recompute_event_hash mis-hashes v1.9 mcp.tool_call', file=sys.stderr)
         print(f'  expected: {V1_9_MCP_TOOL_CALL_FIXTURE_HASH}', file=sys.stderr)
         print(f'  got:      {got_v19_mcp_loop}', file=sys.stderr)
+        ok = False
+
+    # MEI-2646 Assertion 24a — the asserted-claims digest: RFC 8785 over the
+    # stored labels. Paired with the Rust mei2646_asserted_digest_pinned literal;
+    # this is the cross-language pin the stored-not-hashed labels rest on.
+    got_digest = asserted_claims_digest(_V1_12_ASSERTED_FIXTURE_PAYLOAD)
+    if got_digest == V1_12_ASSERTED_DIGEST:
+        print('SELF-TEST assertion 24a PASS: v1.12 asserted-claims digest matches')
+    else:
+        print('SELF-TEST assertion 24a FAIL: v1.12 asserted-claims digest drift', file=sys.stderr)
+        print(f'  expected: {V1_12_ASSERTED_DIGEST}', file=sys.stderr)
+        print(f'  got:      {got_digest}', file=sys.stderr)
+        ok = False
+
+    # MEI-2646 Assertion 24b — v1.12 llm_request fixtures (direct fn): the T1
+    # agent with join keys and a content block, and the bare T3 project-key
+    # record (absent join, absent content: both presence tags pinned). Paired
+    # with mei2646_v1_12_llm_request_fixture_hash_pinned.
+    for label, join, content, identity, expected in (
+        ('24b', _V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD, _V1_12_CONTENT_FIXTURE_PAYLOAD,
+         _V1_12_IDENTITY_T1_FIXTURE_PAYLOAD, V1_12_LLM_REQUEST_FIXTURE_HASH),
+        ('24c', None, None, _V1_12_IDENTITY_T3_FIXTURE_PAYLOAD, V1_12_LLM_REQUEST_BARE_FIXTURE_HASH),
+    ):
+        got = compute_event_hash_v1_12_llm_request(
+            timestamp_utc="2026-05-17T00:00:00+00:00",
+            join_context=join, content=content, identity=identity, **_FIXTURE,
+        )
+        if got == expected:
+            print(f'SELF-TEST assertion {label} PASS: v1.12 llm_request fixture hash matches')
+        else:
+            print(f'SELF-TEST assertion {label} FAIL: v1.12 llm_request fixture drift', file=sys.stderr)
+            print(f'  expected: {expected}', file=sys.stderr)
+            print(f'  got:      {got}', file=sys.stderr)
+            ok = False
+
+    # MEI-2646 Assertion 24d — v1.12 mcp.tool_call fixture (direct fn): a T2
+    # identity whose verified delegated human agrees with the chain's
+    # `verified` attestation marker. Paired with
+    # mei2646_v1_12_mcp_tool_call_fixture_hash_pinned.
+    got_v112_mcp = compute_event_hash_v1_12_mcp(
+        EVENT_KIND_MCP_TOOL_CALL,
+        mcp_event=_V1_12_MCP_TOOL_CALL_FIXTURE_PAYLOAD,
+        join_context=_V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD,
+        identity=_V1_12_IDENTITY_T2_FIXTURE_PAYLOAD,
+        **mcp_fixture_args,
+    )
+    if got_v112_mcp == V1_12_MCP_TOOL_CALL_FIXTURE_HASH:
+        print('SELF-TEST assertion 24d PASS: v1.12 mcp.tool_call fixture hash matches')
+    else:
+        print('SELF-TEST assertion 24d FAIL: v1.12 mcp.tool_call fixture drift', file=sys.stderr)
+        print(f'  expected: {V1_12_MCP_TOOL_CALL_FIXTURE_HASH}', file=sys.stderr)
+        print(f'  got:      {got_v112_mcp}', file=sys.stderr)
+        ok = False
+
+    # MEI-2646 Assertion 24e — both v1.12 fixtures through the production
+    # recompute path from synthetic exported-JSON bodies (MEI-1096 class).
+    synthetic_llm_v112_event = dict(
+        schema_version='v1.12',
+        event_kind='llm_request',
+        timestamp_utc='2026-05-17T00:00:00Z',
+        event_id=_FIXTURE['event_id'], request_id=_FIXTURE['request_id'],
+        model_requested=_FIXTURE['model_requested'], action=_FIXTURE['action'],
+        input_tokens=_FIXTURE['input_tokens'], output_tokens=_FIXTURE['output_tokens'],
+        total_tokens=_FIXTURE['total_tokens'],
+        estimated_cost_usd=_FIXTURE['estimated_cost_usd'],
+        join_context=dict(_V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD),
+        content=dict(_V1_12_CONTENT_FIXTURE_PAYLOAD),
+        identity=dict(_V1_12_IDENTITY_T1_FIXTURE_PAYLOAD),
+    )
+    synthetic_mcp_v112_event = dict(
+        schema_version='v1.12',
+        event_kind='mcp_tool_call',
+        timestamp_utc=ts_1760.replace('+00:00', 'Z'),
+        event_id='evt-mcp-fixture', request_id='req-mcp-fixture',
+        model_requested='', action='allow', input_tokens=0, output_tokens=0,
+        mcp_event=dict(_V1_12_MCP_TOOL_CALL_FIXTURE_PAYLOAD),
+        join_context=dict(_V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD),
+        identity=dict(_V1_12_IDENTITY_T2_FIXTURE_PAYLOAD),
+    )
+    for label, ev, seq, prev, expected in (
+        ('24e-llm', synthetic_llm_v112_event, _FIXTURE['sequence_number'], _FIXTURE['previous_hash'],
+         V1_12_LLM_REQUEST_FIXTURE_HASH),
+        ('24e-mcp', synthetic_mcp_v112_event, 11, 'prev-fixture', V1_12_MCP_TOOL_CALL_FIXTURE_HASH),
+    ):
+        got = recompute_event_hash(ev, seq, prev)
+        if got == expected:
+            print(f'SELF-TEST assertion {label} PASS: verify_manifest recompute path handles v1.12')
+        else:
+            print(f'SELF-TEST assertion {label} FAIL: recompute_event_hash mis-hashes v1.12', file=sys.stderr)
+            print(f'  expected: {expected}', file=sys.stderr)
+            print(f'  got:      {got}', file=sys.stderr)
+            ok = False
+        if check_sealed_identity(ev):
+            print(f'SELF-TEST assertion {label} FAIL: check_sealed_identity rejected an intact record', file=sys.stderr)
+            ok = False
+
+    # MEI-2646 Assertion 24f — the fail-closed invariants: an identity on any
+    # bucket other than v1.12 is a hard error; v1.12 without an identity is a
+    # hard error; a delegated_human over an asserted on-behalf-of leg is a hard
+    # error. Mirror of the Rust dispatcher guards.
+    for stale_version in ('v1', 'v1.1', 'v1.9', 'v1.10', 'v1.11'):
+        try:
+            compute_event_hash_dispatch(
+                stale_version, timestamp_utc="2026-05-17T00:00:00+00:00",
+                event_kind=EVENT_KIND_LLM_REQUEST,
+                identity=_V1_12_IDENTITY_T1_FIXTURE_PAYLOAD, **_FIXTURE,
+            )
+        except ValueError as e:
+            if 'MEI-2646' not in str(e):
+                print(f'SELF-TEST assertion 24f FAIL: wrong rejection for identity on {stale_version}: {e}', file=sys.stderr)
+                ok = False
+        else:
+            print(f'SELF-TEST assertion 24f FAIL: dispatcher accepted an identity on {stale_version}', file=sys.stderr)
+            ok = False
+    try:
+        compute_event_hash_dispatch(
+            'v1.12', timestamp_utc="2026-05-17T00:00:00+00:00",
+            event_kind=EVENT_KIND_LLM_REQUEST, **_FIXTURE,
+        )
+        print('SELF-TEST assertion 24f FAIL: dispatcher accepted v1.12 without an identity', file=sys.stderr)
+        ok = False
+    except ValueError:
+        pass
+    disagreeing = dict(_V1_12_MCP_TOOL_CALL_FIXTURE_PAYLOAD,
+                       principal_chain=dict(_V1_12_MCP_TOOL_CALL_FIXTURE_PAYLOAD['principal_chain'],
+                                            on_behalf_of_attestation='asserted'))
+    try:
+        compute_event_hash_dispatch(
+            'v1.12', event_kind=EVENT_KIND_MCP_TOOL_CALL, mcp_event=disagreeing,
+            identity=_V1_12_IDENTITY_T2_FIXTURE_PAYLOAD, **mcp_fixture_args,
+        )
+        print('SELF-TEST assertion 24f FAIL: dispatcher accepted a delegated_human over an asserted leg', file=sys.stderr)
+        ok = False
+    except ValueError:
+        print('SELF-TEST assertion 24f PASS: identity outside v1.12, v1.12 without identity, and a disagreeing delegation are rejected')
+
+    # MEI-2646 Assertion 24g — a rewritten stored label behind an intact digest
+    # is caught by check_sealed_identity (the chain hash alone cannot see it).
+    relabelled = dict(synthetic_llm_v112_event,
+                      identity=dict(_V1_12_IDENTITY_T1_FIXTURE_PAYLOAD,
+                                    asserted=dict(_V1_12_ASSERTED_FIXTURE_PAYLOAD, agent_name='impostor-agent')))
+    same_hash = recompute_event_hash(relabelled, _FIXTURE['sequence_number'], _FIXTURE['previous_hash']) == V1_12_LLM_REQUEST_FIXTURE_HASH
+    if same_hash and check_sealed_identity(relabelled):
+        print('SELF-TEST assertion 24g PASS: a rewritten asserted label is caught by the digest recomputation')
+    else:
+        print('SELF-TEST assertion 24g FAIL: a rewritten asserted label went unnoticed', file=sys.stderr)
+        ok = False
+
+    # MEI-2745 Assertion 24h — the stored-content check runs on v1.12 as on
+    # v1.10/v1.11: offline, a sealed v1.12 record carrying content verifies;
+    # the same record with its prompt edited after sealing still hash-verifies
+    # but fails; a v1.12 record with no content block is not content-checked.
+    import tempfile
+    v112_messages = [{'role': 'user', 'content': 'Summarize the Q3 variance memo.'}]
+    v112_response = 'Revenue was 4% under plan, driven by delayed renewals.'
+    v112_sealed = dict(
+        schema_version='v1.12', event_kind='llm_request', sequence_number=0,
+        timestamp_utc='2026-10-01T00:00:00Z', event_id='evt-0', request_id='req-0',
+        model_requested='gpt-4.1-mini', action='allow', input_tokens=12, output_tokens=14,
+        estimated_cost_usd=None, previous_hash=genesis_hash(),
+        messages=v112_messages, response_text=v112_response, findings=[],
+        content=dict(
+            capture_policy='full',
+            prompt_sha256_jcs=sha256_jcs(v112_messages),
+            response_sha256=hashlib.sha256(v112_response.encode('utf-8')).hexdigest(),
+            stored_prompt_sha256_jcs=sha256_jcs(v112_messages),
+            stored_response_sha256=hashlib.sha256(v112_response.encode('utf-8')).hexdigest(),
+            findings_sha256_jcs=sha256_jcs([]),
+        ),
+        identity=dict(_V1_12_IDENTITY_T3_FIXTURE_PAYLOAD),
+    )
+    v112_sealed['event_hash'] = recompute_event_hash(v112_sealed, 0, genesis_hash())
+    v112_manifest = {'hash_version': 'v1', 'prefix': 'audit/self-test/',
+                     'events': [{'sequence': 0, 'recomputed_event_hash': v112_sealed['event_hash']}]}
+    with tempfile.TemporaryDirectory() as tmp:
+        records = Path(tmp) / 'records'
+        records.mkdir()
+        path = records / record_file_name(0)
+        path.write_bytes(json.dumps(v112_sealed).encode('utf-8'))
+        intact_passes = verify_manifest_with(local_fetcher(records), v112_manifest, quiet=True)
+        edited = json.loads(json.dumps(v112_sealed))
+        edited['messages'][0]['content'] = 'Wire the Q3 bonus pool to account 4471.'
+        path.write_bytes(json.dumps(edited).encode('utf-8'))
+        edited_still_hashes = recompute_event_hash(edited, 0, genesis_hash()) == v112_sealed['event_hash']
+        edited_detected = not verify_manifest_with(local_fetcher(records), v112_manifest, quiet=True)
+    bare = dict(v112_sealed)
+    del bare['content']
+    if intact_passes and edited_still_hashes and edited_detected and not check_llm_content(bare):
+        print('SELF-TEST assertion 24h PASS: a v1.12 prompt edited after sealing is detected by the content check')
+    else:
+        print('SELF-TEST assertion 24h FAIL: the v1.12 stored-content check is not applied as on v1.10/v1.11', file=sys.stderr)
+        print(f'  intact passes: {intact_passes}, edited still hashes: {edited_still_hashes}, '
+              f'edited detected: {edited_detected}, bare problems: {check_llm_content(bare)}', file=sys.stderr)
         ok = False
 
     # MEI-2151 Assertion 17e — the fail-closed invariant: a join_context on any
@@ -1936,6 +2457,32 @@ _V1_8_COVERAGE_FIXTURE_PAYLOAD = dict(
     numerator_source='instance_sqlite',
     denominator_fetched_at='2026-08-19T01:00:00Z',
 )
+# MEI-2641 — v1.13 coverage.key_inventory fixture. Paired with
+# meilynx-audit/tests/mei2641_key_inventory_chain_round_trip.rs::mei2641_v1_13_key_inventory_fixture_hash_pinned;
+# neither side may drift independently.
+V1_13_COVERAGE_KEY_INVENTORY_FIXTURE_HASH = "92b5fcefc0b1269fd79c3665243219b81ee712372e10d6d0d322a77266bae2b6"
+_V1_13_KEY_INVENTORY_FIXTURE_PAYLOAD = dict(
+    provider='openai',
+    day='2026-09-30',
+    attribution_unit='requests',
+    claim_language_key='coverage.tier_a.org_administered_accounts',
+    registry_version='2026.10.01-1',
+    proxy_key_count=1,
+    unresolved_proxy_key_count=0,
+    governed_key_count=1,
+    ungoverned_key_count=1,
+    listing_fetched_at='2026-10-01T01:00:00Z',
+    keys_json=(
+        '[{"key_id":"key_gov","key_suffix":"abcd","key_name":"proxy-routing",'
+        '"external_scope_id":"proj_1","owner_type":"service_account","owner_id":"svc_1",'
+        '"key_created_at":"2026-09-01T00:00:00Z","key_last_used_at":null,"listed":true,'
+        '"governed":true,"requests":40,"input_tokens":4000,"output_tokens":900},'
+        '{"key_id":"key_shadow","key_suffix":"wxyz","key_name":"laptop",'
+        '"external_scope_id":"proj_1","owner_type":"user","owner_id":"user_9",'
+        '"key_created_at":"2026-09-20T00:00:00Z","key_last_used_at":null,"listed":true,'
+        '"governed":false,"requests":12,"input_tokens":1200,"output_tokens":300}]'
+    ),
+)
 # MEI-2151 — v1.9 fixtures: the caller-asserted cross-lane join keys appended
 # to the v1.2-LlmRequest and v1.7-mcp preimages. Paired with
 # meilynx-audit/tests/mei2151_join_context_chain_round_trip.rs; neither side
@@ -2003,6 +2550,67 @@ _V1_11_HASH_ONLY_CONTENT_FIXTURE_PAYLOAD = dict(
 )
 V1_11_LLM_REQUEST_FIXTURE_HASH = "afd2d6fa30b6de48b227afdec6291e889919af46dc382d96476bd8ebaa2fc2d8"
 V1_11_LLM_REQUEST_JOIN_HASH_ONLY_FIXTURE_HASH = "20da367bc79f4e9f1bfdb4203885b8ce5378c6ad9da33e1536935265f4a3bbfa"
+
+# MEI-2646 — v1.12 fixtures (both lanes). Paired with
+# meilynx-audit/tests/mei2646_identity_chain_round_trip.rs; neither side may
+# drift independently. The asserted labels are a fully populated object so the
+# RFC 8785 canonicalisation of every field is what the digest pins.
+_V1_12_ASSERTED_FIXTURE_PAYLOAD = dict(
+    agent_name='billing-bot',
+    client_info=dict(name='claude-code', version='2.1.0'),
+    user_agent_family=dict(family='openai-python', major=1),
+    on_behalf_of='user-alice',
+)
+V1_12_ASSERTED_DIGEST = "a252c2c4569f366ffe2b3bb10a2d5f1802112351238ae747da108a5b303bd4cf"
+_V1_12_IDENTITY_T1_FIXTURE_PAYLOAD = dict(
+    agent_id='agt_01J9ZK3Q7R8S9T0V1W2X3Y4Z5A',
+    tier='t1',
+    credential_kind='agent_key',
+    credential_kid='a7f3k2m9p4q8r1s6',
+    asserted_digest=V1_12_ASSERTED_DIGEST,
+    asserted=_V1_12_ASSERTED_FIXTURE_PAYLOAD,
+)
+_V1_12_IDENTITY_T2_FIXTURE_PAYLOAD = dict(
+    _V1_12_IDENTITY_T1_FIXTURE_PAYLOAD,
+    tier='t2',
+    delegated_human=dict(subject='user-alice', issuer='https://idp.example'),
+)
+_V1_12_IDENTITY_T3_FIXTURE_PAYLOAD = dict(
+    tier='t3',
+    credential_kind='project_key',
+    credential_kid='pk:0123456789abcdef',
+    asserted_digest=V1_12_ASSERTED_DIGEST,
+    asserted=_V1_12_ASSERTED_FIXTURE_PAYLOAD,
+)
+_V1_12_CONTENT_FIXTURE_PAYLOAD = dict(
+    capture_policy='hash_only',
+    prompt_sha256_jcs='1' * 64,
+    response_sha256='2' * 64,
+    findings_sha256_jcs='3' * 64,
+    tool_calls_sha256_jcs='4' * 64,
+)
+_V1_12_MCP_TOOL_CALL_FIXTURE_PAYLOAD = dict(
+    virtual_server='crm',
+    upstream_slug='crm',
+    method='tools/call',
+    tool_name='crm__lookup_account',
+    jsonrpc_id='42',
+    protocol_version='2026-07-28',
+    payload_sha256_jcs='9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08',
+    mcp_bundle_sha256='a' * 64,
+    traceparent='00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01',
+    principal_chain=dict(
+        authenticated=dict(kind='agent', agent_ref='agt_01J9ZK3Q7R8S9T0V1W2X3Y4Z5A'),
+        on_behalf_of=dict(kind='human_user', subject='user-alice', issuer='https://idp.example'),
+        on_behalf_of_attestation='verified',
+    ),
+    redacted_payload_sha256_jcs='b' * 64,
+    redaction_pre_sha256_jcs='c' * 64,
+    redaction_post_sha256_jcs='d' * 64,
+)
+V1_12_LLM_REQUEST_FIXTURE_HASH = "62826a249c726dd87608fa0c05db6387b045b9583e76fa5631fcf902456bc235"
+V1_12_LLM_REQUEST_BARE_FIXTURE_HASH = "99ab7d921ff414be33abe689efb6671b13b32a274c868c72b4868461c2f29e96"
+V1_12_MCP_TOOL_CALL_FIXTURE_HASH = "c2f71dbf0ff7e00ac709c6b5a4f44222edf2d1ef29324252f6961f8cc6311780"
 
 # MEI-2456 — tool-call digest fixture. Paired with
 # meilynx-proxy/src/audit_capture.rs::tool_call_digests_are_pinned_for_the_verifier:
@@ -2095,6 +2703,8 @@ def recompute_event_hash(event, seq, previous_hash):
         coverage=event.get('coverage'),
         join_context=event.get('join_context'),
         content=event.get('content'),
+        identity=event.get('identity'),
+        coverage_key_inventory=event.get('coverage_key_inventory'),
     )
 
 
@@ -2285,6 +2895,12 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
         # this checks the content itself still matches them.
         content_ok = True
         for problem in check_llm_content(event):
+            report(f"FAIL seq={seq}: {problem}")
+            all_passed = False
+            content_ok = False
+        # MEI-2646 — a v1.12 record's hash covers the digest of its asserted
+        # labels; this checks the stored labels still match it.
+        for problem in check_sealed_identity(event):
             report(f"FAIL seq={seq}: {problem}")
             all_passed = False
             content_ok = False
