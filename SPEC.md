@@ -6,8 +6,8 @@ enough that a verifier can be written from it without reading Meilynx code.
 pins the values below against fixture hashes.
 
 Status: describes chain records with `schema_version` v1 through v1.13 and
-pack manifest `schema_version` 1.0, as produced by meilynx-proxy at commit
-`c1581f0` (2026-10-03).
+pack manifest `schema_version` 1.0 and 1.1, as produced by meilynx-proxy at
+commit `c831e20` (2026-10-03).
 
 ## 1. Records
 
@@ -335,12 +335,12 @@ useful for a from-scratch implementation:
 
 ## 6. Pack manifest
 
-`manifest.json` (schema_version `"1.0"`) describes one verification window
-of one chain:
+`manifest.json` (schema_version `"1.0"` or `"1.1"`) describes one
+verification window of one chain:
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "1.0" | "1.1",
   "pack_id": "<uuid>",
   "window": "A" | "B",
   "signing_deferred": true | false,
@@ -362,6 +362,7 @@ of one chain:
   "violation_kind": null,
   "error": null,
   "signature": { … present on window B only … },
+  "anchoring": { … present on 1.1 only, §6.1 … },
   "events": [
     {
       "sequence": 0,
@@ -388,6 +389,109 @@ ever appears in a manifest.
 A verifier treats the manifest's `recomputed_event_hash` as a claim to check,
 not as truth: it recomputes from the record bytes and reports disagreement
 with the manifest as a failure.
+
+### 6.1 Chain-head anchors (manifest 1.1)
+
+A chain shows order and integrity. It does not show time: `timestamp_utc`
+comes from the proxy's clock, and a writer with access to the chain could
+back-date a rewritten chain. A proxy that writes its chain to a write-once
+store therefore anchors the chain head periodically with RFC 3161 timestamp
+tokens from independent timestamp authorities (witnesses). The witness sees
+only a 32-byte digest and a nonce, never a record.
+
+**Statement.** An anchor statement is JCS (RFC 8785) JSON with exactly these
+fields, `heads` sorted by chain name with no chain repeated:
+
+```json
+{"created_at":"2026-05-01T00:10:00.000Z","hash_alg":"sha-256","heads":[{"chain":"<chain name>","event_hash":"<hex>","seq":4}],"run_id":"<instance boot id>","v":"meilynx.anchor.v1"}
+```
+
+Each head is the last record the proxy had durably written to the store for
+that chain, by sequence and `event_hash`. The imprint the witness signs is
+`SHA-256("meilynx-anchor-v1\n" || statement bytes)` over the exact stored
+bytes. A statement whose bytes are not the canonical form is invalid, so each
+statement has exactly one imprint.
+
+**Objects.** Next to the chain, under the same write-once retention:
+
+| Object | Content |
+|---|---|
+| `anchors/{chain}/{seq:020d}.json` | The statement |
+| `anchors/{chain}/{seq:020d}.{tsa_id}.tsr` | One `TimeStampResp` (RFC 3161) per witness, stored only after the proxy verified it |
+
+`{seq}` is the head sequence the statement records for that chain. In an
+exported pack they sit under `records/anchors/`. The verifier reads anchors
+from the records directory offline, or from the bucket online.
+
+**Token.** A token verifies when all of the following hold:
+
+- `PKIStatus` is `granted`; the TSTInfo imprint equals the statement imprint
+  under SHA-256, and a nonce is present.
+- The signer certificate carries the `id-kp-timeStamping` extended key usage,
+  marked critical, and the signed attributes are limited to contentType,
+  messageDigest, signingTime, signingCertificateV2 and
+  CMSAlgorithmProtection. ESSCertID v1 (SHA-1) is rejected.
+- Digests are SHA-256, SHA-384 or SHA-512; signatures are RSA of at least
+  2048 bits (PKCS#1 v1.5 or PSS with salt length equal to the hash length) or
+  ECDSA on P-256 or P-384. SHA-1 and MD5 are rejected everywhere.
+- The certificate path, built from intermediates carried in the token, ends
+  at a trusted root that was valid at the token's `genTime`, and never
+  follows a cross-certificate. Roots never come from the token.
+
+**Roots.** Two public witnesses have roots pinned in `verify-pack.py`, each
+with its SHA-256 fingerprint and trust window: `sigstore` (the Sigstore TSA
+root from `sigstore/root-signing` `trusted_root.json`) and `globalsign-r45`
+(GlobalSign Root CA - R6). A customer witness's roots are supplied with
+`--tsa-root ID=FILE` (PEM, one or more certificates, each trusted within its
+own validity period); the verifier then names that root and its fingerprint
+in a NOTICE. No revocation check is made.
+
+**Manifest section.** A 1.1 manifest carries `anchoring`:
+
+```json
+"anchoring": {
+  "state": "anchored" | "partially_anchored" | "unanchored",
+  "chains": [{
+    "chain": "<chain name>",
+    "reason": "anchored" | "disabled" | "misconfigured" | "no_anchors_found",
+    "anchored_through_seq": 4 | null,
+    "unanchored_tail": {"from_seq": 5, "to_seq": 9} | null,
+    "anchors": [{
+      "seq": 4,
+      "statement": {"key": "anchors/<chain>/00000000000000000004.json", "sha256": "<hex>"},
+      "tokens": {"<tsa_id>": {"gen_time": "<RFC 3339>", "sha256": "<hex>"}}
+    }],
+    "seals": [{"seq": 0, "event_hash": "<hex>", "action_type": "audit_anchoring_disabled" | "audit_anchoring_misconfigured"}]
+  }]
+}
+```
+
+Only anchors inside `[from_sequence, to_sequence]` are listed. An anchor at
+sequence S covers every record from `from_sequence` through S, because each
+record's hash commits to the one before it. Records after the last anchor are
+the unanchored tail. A `seal` is an `admin_action` record the proxy wrote at
+startup when anchoring was switched off or refused its configuration; it
+explains an unanchored chain.
+
+**What a verifier checks** (`verify-pack.py` does all of these):
+
+| Finding | Verdict |
+|---|---|
+| Manifest 1.0, or 1.1 with `state: unanchored` and no anchors | Pass, with a prominent `UNANCHORED` notice |
+| A listed anchor whose statement or token object is missing, or whose bytes differ from the manifest's SHA-256 | Fail (exit 1), naming the chain, the sequence and the reason |
+| A statement that is not canonical, or does not name this chain at this sequence | Fail (exit 1) |
+| The anchored `event_hash` differs from the record's recomputed hash, or from the hash the record stores | Fail (exit 1): the record changed after it was anchored |
+| A token that does not verify, including a path that reaches no trusted root | Fail (exit 1), with the same reason code the proxy's verifier uses |
+| An anchor found in the records directory or bucket that the manifest does not list | Verified like a listed one; a pass is reported as a NOTICE, a failure fails the pack |
+| The manifest's `state`, `reason`, `anchored_through_seq` or `unanchored_tail` disagree with the anchors that verified | Fail (exit 1) |
+| A listed seal that is not the `admin_action` record it claims to be | Fail (exit 1) |
+| A record whose `timestamp_utc` is more than five minutes after the `genTime` of the earliest anchor covering it | Pass, with a `record clock ahead of anchor` notice; the token's `genTime` is the authoritative time |
+| No trust root for a witness, an unparseable token, or a manifest `schema_version` this verifier does not know | Cannot evaluate (exit 2) |
+
+A pass prints `ANCHORS OK: chain=<name> anchored_through=<seq>
+witnesses=<verified>/<listed>`. An anchor shows that the covered records
+existed no later than the token's `genTime` and are unchanged since. It does
+not show that the chain is complete (§8).
 
 ## 7. Signed packs (window B)
 
@@ -516,3 +620,9 @@ since; the chain hashes attest the records.
   text no detector recognized.
 - **Authorship of the chain.** Only a signed pack (§7) binds an identity to
   a window.
+- **When a record was written.** `timestamp_utc` is hashed, but it comes from
+  the proxy's clock and nothing in the chain shows that clock was right. A
+  chain-head anchor (§6.1) shows that a record existed no later than the
+  witness's `genTime`, and the verifier flags a record clock that runs ahead
+  of its anchor. A pack without anchors shows nothing about time, and says
+  so with an `UNANCHORED` notice.

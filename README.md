@@ -24,6 +24,13 @@ python3 verify-pack.py --self-test
 #    (the samples are not signed, which --allow-unsigned acknowledges)
 python3 verify-pack.py --records fixtures/records --manifest fixtures/manifest.json --allow-unsigned
 python3 verify-pack.py --records fixtures/coverage/records --manifest fixtures/coverage/manifest.json --allow-unsigned
+
+# 3. Verify an anchored sample: a chain whose heads carry RFC 3161 timestamps
+#    from two test witnesses, whose roots are passed with --tsa-root
+python3 verify-pack.py --records fixtures/anchors/packs/fully-anchored/records \
+  --manifest fixtures/anchors/packs/fully-anchored/manifest.json --allow-unsigned \
+  --tsa-root test-rsa=fixtures/anchors/roots/rsa-root.pem \
+  --tsa-root test-ec=fixtures/anchors/roots/ec-root.pem
 ```
 
 Exit codes, the same online and offline:
@@ -31,8 +38,8 @@ Exit codes, the same online and offline:
 | Code | Meaning |
 |---|---|
 | `0` | Every record verified, and on a signed pack the signature too. An unsigned pack reaches `0` only with `--allow-unsigned`, and the output still says authenticity is not established. |
-| `1` | Verification failed. The output names the first record that failed and why (hash mismatch, chain break, missing record, unknown record kind), or why the signature failed. |
-| `2` | This verifier cannot evaluate the pack: an unsupported hash version, signature method or bundle format (use a newer release), or an unusable `--trusted-root`. |
+| `1` | Verification failed. The output names the first record that failed and why (hash mismatch, chain break, missing record, unknown record kind), why the signature failed, or which chain-head anchor failed and why. |
+| `2` | This verifier cannot evaluate the pack: an unsupported hash version, manifest version, signature method or bundle format (use a newer release), an unusable `--trusted-root`, or an anchor from a witness with no trust root (pass `--tsa-root`). |
 | `3` | The records verified, but the pack is unsigned, so nothing shows who produced the manifest. |
 
 When more than one applies, `1` outranks `2`, and `2` outranks `3`.
@@ -41,7 +48,9 @@ The sample chains carry no signature, so step 2 prints "AUTHENTICITY NOT
 ESTABLISHED" and relies on `--allow-unsigned` for its `0`. Without the flag it
 exits `3`. The first sample is a request chain (model calls and MCP tool
 calls, including records that seal the caller's identity); the second is a
-coverage chain.
+coverage chain. The third, under `fixtures/anchors/`, is a chain whose heads
+are anchored (see "Chain-head anchors" below); its output ends with
+`ANCHORS OK`.
 
 Try it on a tampered copy:
 
@@ -67,6 +76,7 @@ A **pack** is what a Meilynx proxy's `integrity-pack` command produces:
 | `manifest.json` | The window verified (`from_sequence`..`to_sequence`), the hash algorithm and version, the genesis hash, and one entry per record with the hash the generator recomputed |
 | `records/<seq>.bin` | The chain records themselves, one JSON document per file, named by 20-digit zero-padded sequence number (the layout of the write-once bucket they came from) |
 | `manifest.json.sigstore.json` | Present on a signed pack: a Sigstore bundle holding a keyless cosign signature over `manifest.json`, the signing certificate, and the Rekor transparency-log proof |
+| `records/anchors/<seq>.json` and `records/anchors/<seq>.<witness>.tsr` | Present on an anchored chain: the chain-head statement the proxy timestamped, and one RFC 3161 token per witness |
 
 Records are exported alongside the manifest with
 `verify-pack.py --bucket … --export-records DIR` by someone who has read
@@ -125,6 +135,52 @@ cosign verify-blob --bundle manifest.json.sigstore.json \
 and tampered test packs, and with `--cosign cosign` compares every verdict
 with cosign's.
 
+## Chain-head anchors
+
+A hash chain shows order and integrity, not time. A proxy that writes its
+chain to a write-once store therefore timestamps the chain head periodically
+with RFC 3161 tokens from two independent timestamp authorities (Sigstore's
+TSA and GlobalSign), and stores the signed statement and the tokens next to
+the chain. The authority sees only a 32-byte digest and a nonce. The format is
+in [SPEC.md](SPEC.md) §6.1.
+
+On a pack whose manifest is version 1.1, the verifier checks every anchor the
+manifest lists and every anchor it finds next to the records:
+
+- the statement is canonical JSON and names this chain at this sequence;
+- the anchored `event_hash` equals the hash recomputed from the record, so a
+  record changed or replaced after it was anchored fails with
+  `the record changed after it was anchored`;
+- each token is a granted RFC 3161 response over the statement's digest,
+  signed by a certificate with the time-stamping purpose that chains to a
+  trusted root valid at the token's time; SHA-1 is refused everywhere;
+- the manifest's coverage summary agrees with the anchors that verified.
+
+A pass prints `ANCHORS OK` with the anchored sequence range and the number of
+witnesses that verified. Records after the last anchor are reported as an
+unanchored tail. A pack with no anchors still passes its chain check, and
+prints a prominent `UNANCHORED` notice so nobody reads a chain check as
+proof of time.
+
+The roots of the two public witnesses are pinned in `verify-pack.py` with
+their SHA-256 fingerprints and trust windows. A deployment that uses its own
+timestamp authority passes that authority's root with
+`--tsa-root <witness id>=<PEM file>`; the output then names the root and its
+fingerprint, so a reviewer can check it against the authority's published
+root. A witness with no root is exit `2`, not a pass.
+
+An anchor shows that the covered records existed no later than the token's
+time and are unchanged since. It does not show that the chain is complete,
+and it does not vouch for the proxy's own clock: a record whose timestamp runs
+more than five minutes ahead of its anchor is flagged, and the token's time
+is the one to rely on.
+
+`fixtures/run-anchor-cases.py` runs 37 token cases (valid and defective
+tokens, including real Sigstore and GlobalSign tokens with altered
+signatures, digests and certificates) and nine offline packs, checks that
+every verdict matches the one the proxy's own verifier gave, and compares
+each token verdict with `openssl ts -verify`.
+
 ## What a passing verdict means, and what it does not
 
 A pass proves that, for every record in the window:
@@ -149,12 +205,16 @@ It does **not** prove:
 - who wrote the record. A signed pack (`manifest.json.sigstore.json`) binds
   the manifest to the signing identity, and the manifest binds each record's
   hash; the records themselves are not signed individually.
+- when a record was written, unless the chain is anchored. Without anchors
+  the record's timestamp is the proxy's own clock. With anchors, the token's
+  time bounds when the covered records existed.
 
 ## Versions
 
 The verifier understands chain records with `schema_version` v1 through
-v1.13. A record of an unknown version or kind fails verification rather than
-being skipped. Changes to the verifier are listed in
+v1.13, and pack manifests 1.0 and 1.1 (1.1 adds chain-head anchors). A
+record of an unknown version or kind fails verification rather than being
+skipped; a manifest of an unknown version is cannot evaluate (exit `2`). Changes to the verifier are listed in
 [CHANGELOG.md](CHANGELOG.md). The canonical source of this file is the
 `meilynx-integrity-pack` crate in the proxy; releases here are byte-identical
 copies tagged with the proxy commit they came from.

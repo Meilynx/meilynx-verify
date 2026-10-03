@@ -1,0 +1,18 @@
+{
+  "runs": [
+    {
+      "args": [
+        "--tsa-root",
+        "test-rsa=roots/rsa-root.der",
+        "--tsa-root",
+        "test-ec=roots/ec-root.der"
+      ],
+      "contains": [
+        "NOTICE: record clock ahead of anchor — 5 record(s) in chain chain_tnt_fixture_run_a",
+        "(first seq=0: record 2026-05-01T01:00:00Z, anchor genTime 2026-05-01T00:10:00Z)",
+        "ANCHORS OK"
+      ],
+      "exit": 0
+    }
+  ]
+}

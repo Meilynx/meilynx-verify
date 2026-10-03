@@ -1,0 +1,11 @@
+{
+  "runs": [
+    {
+      "args": [],
+      "contains": [
+        "FAIL anchor seq=4 tsa=sigstore: untrusted_chain"
+      ],
+      "exit": 1
+    }
+  ]
+}

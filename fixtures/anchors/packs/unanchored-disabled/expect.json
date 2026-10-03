@@ -1,0 +1,12 @@
+{
+  "runs": [
+    {
+      "args": [],
+      "contains": [
+        "carries the seal audit_anchoring_disabled at seq=0",
+        "NOTICE: UNANCHORED — chain chain_tnt_fixture_run_a (disabled)"
+      ],
+      "exit": 0
+    }
+  ]
+}

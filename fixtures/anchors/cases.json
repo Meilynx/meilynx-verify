@@ -1,0 +1,503 @@
+{
+  "about": "MEI-2758 anchor token cases; written by examples/gen_anchor_fixtures.rs. `rust` is the proxy verifier's verdict (ok or AnchorVerifyError::code) for this token, imprint, nonce and genTime against the listed roots.",
+  "cases": [
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "rsa-pkcs1-sha256",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "ok",
+      "token": "tokens/rsa-pkcs1-sha256.tsr",
+      "what": "valid RSA PKCS#1 v1.5 / SHA-256 token"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "rsa-pkcs1-sha384",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "ok",
+      "token": "tokens/rsa-pkcs1-sha384.tsr",
+      "what": "valid RSA PKCS#1 v1.5 / SHA-384 token"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "rsa-pss-sha256",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "ok",
+      "token": "tokens/rsa-pss-sha256.tsr",
+      "what": "valid RSA-PSS / SHA-256 token"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "ecdsa-p384-sha384",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/ec-root.der"
+      ],
+      "rust": "ok",
+      "token": "tokens/ecdsa-p384-sha384.tsr",
+      "what": "valid ECDSA P-384 / SHA-384 token"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "cross-cert-alongside",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "ok",
+      "token": "tokens/cross-cert-alongside.tsr",
+      "what": "a cross-certificate next to the good path"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "not-granted",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "not_granted",
+      "token": "tokens/not-granted.tsr",
+      "what": "PKIStatus rejection (2), no token"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "granted-with-mods",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "not_granted",
+      "token": "tokens/granted-with-mods.tsr",
+      "what": "PKIStatus grantedWithMods (1) with a token"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b",
+      "name": "imprint-mismatch",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "imprint_mismatch",
+      "token": "tokens/imprint-mismatch.tsr",
+      "what": "token over a different imprint"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "nonce-missing",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "nonce_missing",
+      "token": "tokens/nonce-missing.tsr",
+      "what": "token without a nonce"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "bad-signature",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "signature_invalid",
+      "token": "tokens/bad-signature.tsr",
+      "what": "SignerInfo signature altered"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "message-digest-mismatch",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "message_digest_mismatch",
+      "token": "tokens/message-digest-mismatch.tsr",
+      "what": "messageDigest does not match the TSTInfo"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "unexpected-signed-attribute",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "unexpected_signed_attribute",
+      "token": "tokens/unexpected-signed-attribute.tsr",
+      "what": "an extra signed attribute"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "ess-cert-id-v1-only",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "ess_cert_id_v1",
+      "token": "tokens/ess-cert-id-v1-only.tsr",
+      "what": "ESSCertID v1 (SHA-1) only"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "ess-cert-id-v1-and-v2",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "ess_cert_id_v1",
+      "token": "tokens/ess-cert-id-v1-and-v2.tsr",
+      "what": "ESSCertID v1 next to v2"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "ess-cert-id-missing",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "missing_signed_attribute",
+      "token": "tokens/ess-cert-id-missing.tsr",
+      "what": "no signingCertificate attribute"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "sha1-signer-digest",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "algorithm_not_allowed",
+      "token": "tokens/sha1-signer-digest.tsr",
+      "what": "SHA-1 SignerInfo digest"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "rsa-1024-signer",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "algorithm_not_allowed",
+      "token": "tokens/rsa-1024-signer.tsr",
+      "what": "RSA-1024 signing key"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "sha1-signed-leaf",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "algorithm_not_allowed",
+      "token": "tokens/sha1-signed-leaf.tsr",
+      "what": "signer certificate signed with SHA-1"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "unpinned-root",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/unpinned-root.der"
+      ],
+      "rust": "untrusted_chain",
+      "token": "tokens/unpinned-root.tsr",
+      "what": "valid chain to a root this witness does not pin"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "cross-cert-to-unpinned-root",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "untrusted_chain",
+      "token": "tokens/cross-cert-to-unpinned-root.tsr",
+      "what": "only a cross-certificate to an unpinned root"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "expired-signer",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "untrusted_chain",
+      "token": "tokens/expired-signer.tsr",
+      "what": "signer certificate expired at genTime"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "eku-not-critical",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "timestamping_eku_not_critical",
+      "token": "tokens/eku-not-critical.tsr",
+      "what": "timeStamping EKU not marked critical"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "eku-not-exclusive",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "timestamping_eku_not_exclusive",
+      "token": "tokens/eku-not-exclusive.tsr",
+      "what": "timeStamping EKU next to codeSigning"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "unknown-critical-extension",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "untrusted_chain",
+      "token": "tokens/unknown-critical-extension.tsr",
+      "what": "signer certificate with an unknown critical extension"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "root-window-not-open",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2026-05-01T01:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "no_root_trusted_at_gen_time",
+      "token": "tokens/root-window-not-open.tsr",
+      "what": "root trusted only from after genTime"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "ecdsa-hash-mismatch",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/ec-root.der"
+      ],
+      "rust": "algorithm_not_allowed",
+      "token": "tokens/ecdsa-hash-mismatch.tsr",
+      "what": "ecdsa-with-SHA384 over a SHA-256 SignerInfo digest"
+    },
+    {
+      "gen_time": "2026-05-01T00:10:00Z",
+      "imprint": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "name": "truncated",
+      "nonce": "6d65692d32373538",
+      "pinned": null,
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [
+        "roots/rsa-root.der"
+      ],
+      "rust": "malformed",
+      "token": "tokens/truncated.tsr",
+      "what": "token missing its last byte"
+    },
+    {
+      "gen_time": "2026-10-03T00:51:11Z",
+      "imprint": "e762a4631cd2a2e1bf27eac994eca178c1b28803e9230deac6caa4cd1ff726a3",
+      "name": "real-sigstore",
+      "nonce": "f80c49dcbf012338",
+      "pinned": "sigstore",
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [],
+      "rust": "ok",
+      "token": "tokens/real-sigstore.tsr",
+      "what": "real witness token from the 2026-10-02 probe"
+    },
+    {
+      "gen_time": "2026-10-03T00:51:11Z",
+      "imprint": "e762a4631cd2a2e1bf27eac994eca178c1b28803e9230deac6caa4cd1ff726a3",
+      "name": "real-sigstore-signature-flipped",
+      "nonce": "f80c49dcbf012338",
+      "pinned": "sigstore",
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [],
+      "rust": "signature_invalid",
+      "token": "tokens/real-sigstore-signature-flipped.tsr",
+      "what": "real token, last signature byte flipped"
+    },
+    {
+      "gen_time": "2026-10-03T00:51:11Z",
+      "imprint": "0000000000000000000000000000000000000000000000000000000000000000",
+      "name": "real-sigstore-imprint-mismatch",
+      "nonce": "f80c49dcbf012338",
+      "pinned": "sigstore",
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [],
+      "rust": "imprint_mismatch",
+      "token": "tokens/real-sigstore-imprint-mismatch.tsr",
+      "what": "real token over a different imprint"
+    },
+    {
+      "gen_time": "2026-10-03T00:51:11Z",
+      "imprint": "e762a4631cd2a2e1bf27eac994eca178c1b28803e9230deac6caa4cd1ff726a3",
+      "name": "real-sigstore-other-root",
+      "nonce": "f80c49dcbf012338",
+      "pinned": "globalsign-r45",
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [],
+      "rust": "untrusted_chain",
+      "token": "tokens/real-sigstore-other-root.tsr",
+      "what": "real token against the other witness's pinned root"
+    },
+    {
+      "gen_time": "2026-10-03T00:51:11Z",
+      "imprint": "e762a4631cd2a2e1bf27eac994eca178c1b28803e9230deac6caa4cd1ff726a3",
+      "name": "real-sigstore-certificate-altered",
+      "nonce": "f80c49dcbf012338",
+      "pinned": "sigstore",
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [],
+      "rust": "signer_certificate_not_found",
+      "token": "tokens/real-sigstore-certificate-altered.tsr",
+      "what": "real token, last byte of its first embedded certificate flipped"
+    },
+    {
+      "gen_time": "2026-10-03T00:56:22Z",
+      "imprint": "e762a4631cd2a2e1bf27eac994eca178c1b28803e9230deac6caa4cd1ff726a3",
+      "name": "real-globalsign-r45",
+      "nonce": "f80c49dcbf012338",
+      "pinned": "globalsign-r45",
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [],
+      "rust": "ok",
+      "token": "tokens/real-globalsign-r45.tsr",
+      "what": "real witness token from the 2026-10-02 probe"
+    },
+    {
+      "gen_time": "2026-10-03T00:56:22Z",
+      "imprint": "e762a4631cd2a2e1bf27eac994eca178c1b28803e9230deac6caa4cd1ff726a3",
+      "name": "real-globalsign-r45-signature-flipped",
+      "nonce": "f80c49dcbf012338",
+      "pinned": "globalsign-r45",
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [],
+      "rust": "signature_invalid",
+      "token": "tokens/real-globalsign-r45-signature-flipped.tsr",
+      "what": "real token, last signature byte flipped"
+    },
+    {
+      "gen_time": "2026-10-03T00:56:22Z",
+      "imprint": "0000000000000000000000000000000000000000000000000000000000000000",
+      "name": "real-globalsign-r45-imprint-mismatch",
+      "nonce": "f80c49dcbf012338",
+      "pinned": "globalsign-r45",
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [],
+      "rust": "imprint_mismatch",
+      "token": "tokens/real-globalsign-r45-imprint-mismatch.tsr",
+      "what": "real token over a different imprint"
+    },
+    {
+      "gen_time": "2026-10-03T00:56:22Z",
+      "imprint": "e762a4631cd2a2e1bf27eac994eca178c1b28803e9230deac6caa4cd1ff726a3",
+      "name": "real-globalsign-r45-other-root",
+      "nonce": "f80c49dcbf012338",
+      "pinned": "sigstore",
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [],
+      "rust": "untrusted_chain",
+      "token": "tokens/real-globalsign-r45-other-root.tsr",
+      "what": "real token against the other witness's pinned root"
+    },
+    {
+      "gen_time": "2026-10-03T00:56:22Z",
+      "imprint": "e762a4631cd2a2e1bf27eac994eca178c1b28803e9230deac6caa4cd1ff726a3",
+      "name": "real-globalsign-r45-certificate-altered",
+      "nonce": "f80c49dcbf012338",
+      "pinned": "globalsign-r45",
+      "root_window_from": "2000-01-01T00:00:00Z",
+      "roots": [],
+      "rust": "signer_certificate_not_found",
+      "token": "tokens/real-globalsign-r45-certificate-altered.tsr",
+      "what": "real token, last byte of its first embedded certificate flipped"
+    }
+  ]
+}
