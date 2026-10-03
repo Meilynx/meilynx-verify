@@ -1,0 +1,69 @@
+{
+ "schema_version": "v1.12",
+ "event_kind": "mcp_tool_call",
+ "sequence_number": 4,
+ "timestamp_utc": "2026-10-01T14:00:03.000000000Z",
+ "event_id": "00000000-0000-4000-8000-000000000004",
+ "request_id": "44444444-4444-4444-8444-444444444444",
+ "model_requested": "",
+ "action": "allow",
+ "input_tokens": 0,
+ "output_tokens": 0,
+ "estimated_cost_usd": null,
+ "findings": [],
+ "messages": [],
+ "response_text": null,
+ "mcp_event": {
+  "virtual_server": "research",
+  "upstream_slug": "market-data",
+  "method": "tools/call",
+  "tool_name": "market-data__get_positions",
+  "jsonrpc_id": "7",
+  "protocol_version": "2026-07-28",
+  "payload_sha256_jcs": "c4a6ffe4176495be741e98fab2218bd3fb1add7926dc7f5299ff4d0ad0b0ae33",
+  "mcp_bundle_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+  "principal_chain": {
+   "authenticated": {
+    "kind": "agent",
+    "agent_ref": "agt_01J9ZK3Q7R8S9T0V1W2X3Y4Z5A"
+   },
+   "on_behalf_of": {
+    "kind": "human_user",
+    "subject": "user-fixture",
+    "issuer": "https://idp.example"
+   },
+   "on_behalf_of_attestation": "verified"
+  }
+ },
+ "join_context": {
+  "correlation_id": "corr-fixture-1",
+  "session_id": "sess-fixture-1",
+  "agent_name": "research-assistant"
+ },
+ "identity": {
+  "agent_id": "agt_01J9ZK3Q7R8S9T0V1W2X3Y4Z5A",
+  "tier": "t2",
+  "credential_kind": "agent_key",
+  "credential_kid": "a7f3k2m9p4q8r1s6",
+  "delegated_human": {
+   "subject": "user-fixture",
+   "issuer": "https://idp.example"
+  },
+  "asserted_digest": "a03d30b187ca1322b6cdf9e0ffa646ad190e2047484bc53a66336c35b3cc13db",
+  "asserted": {
+   "agent_name": "research-assistant",
+   "client_info": {
+    "name": "research-assistant",
+    "version": "1.4.0"
+   },
+   "user_agent_family": {
+    "family": "openai-python",
+    "major": 1
+   },
+   "on_behalf_of": "user-fixture"
+  }
+ },
+ "previous_hash": "e035abd46c8fd613526c5c4b4319581fc426386c151cd9641c9e902f38766aaf",
+ "event_hash": "3c2e8ce01777d3d3c9ffde54fb29717a40a90b6d8f6149ab8eddb79a1af19220"
+}

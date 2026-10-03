@@ -1,0 +1,31 @@
+{
+ "schema_version": "v1.13",
+ "event_kind": "coverage_key_inventory",
+ "sequence_number": 1,
+ "timestamp_utc": "2026-10-01T01:00:01.000000000Z",
+ "event_id": "00000000-0000-4000-8000-00000000c001",
+ "request_id": "00000000-0000-4000-8000-00000000c001",
+ "model_requested": "",
+ "action": "allow",
+ "input_tokens": 0,
+ "output_tokens": 0,
+ "estimated_cost_usd": null,
+ "findings": [],
+ "messages": [],
+ "response_text": null,
+ "coverage_key_inventory": {
+  "provider": "openai",
+  "day": "2026-09-30",
+  "attribution_unit": "requests",
+  "claim_language_key": "coverage.tier_a.org_administered_accounts",
+  "registry_version": "2026.10.01-1",
+  "proxy_key_count": 1,
+  "unresolved_proxy_key_count": 0,
+  "governed_key_count": 1,
+  "ungoverned_key_count": 1,
+  "listing_fetched_at": "2026-10-01T01:00:00Z",
+  "keys_json": "[{\"key_id\":\"key_gov\",\"key_suffix\":\"abcd\",\"key_name\":\"proxy-routing\",\"external_scope_id\":\"proj_1\",\"owner_type\":\"service_account\",\"owner_id\":\"svc_1\",\"key_created_at\":\"2026-09-01T00:00:00Z\",\"key_last_used_at\":null,\"listed\":true,\"governed\":true,\"requests\":40,\"input_tokens\":4000,\"output_tokens\":900},{\"key_id\":\"key_shadow\",\"key_suffix\":\"wxyz\",\"key_name\":\"laptop\",\"external_scope_id\":\"proj_1\",\"owner_type\":\"user\",\"owner_id\":\"user_9\",\"key_created_at\":\"2026-09-20T00:00:00Z\",\"key_last_used_at\":null,\"listed\":true,\"governed\":false,\"requests\":12,\"input_tokens\":1200,\"output_tokens\":300}]"
+ },
+ "previous_hash": "c73f06c4a2aca6861b12cb8f92cd0468dd73430da829904256a423cfb9e8a735",
+ "event_hash": "458d5b6645dd0319be4085b14899ce0c5c59d7ea72bebf19dff836e8e124de4f"
+}

@@ -23,6 +23,8 @@ jobs:
         run: python verify-pack.py --self-test
       - name: Verify the shipped fixture chain offline (unsigned, so --allow-unsigned)
         run: python verify-pack.py --records fixtures/records --manifest fixtures/manifest.json --allow-unsigned
+      - name: Verify the shipped coverage fixture chain offline (v1.8, v1.13)
+        run: python verify-pack.py --records fixtures/coverage/records --manifest fixtures/coverage/manifest.json --allow-unsigned
       - name: An unsigned chain is not a pass without --allow-unsigned (exit 3)
         run: |
           set +e
@@ -46,11 +48,36 @@ jobs:
           if [ "$rc" -ne 1 ]; then
             echo "tampered chain exited $rc, expected 1: verifier is broken" >&2; exit 1
           fi
+      - name: Edits outside the preimage must fail (v1.12 prompt, v1.12 asserted label, v1.13 key list)
+        run: |
+          expect_fail() {
+            # $1 records dir, $2 manifest, $3 sequence, $4 python edit of record d
+            rm -rf /tmp/edited && cp -r "$1" /tmp/edited
+            python - "$3" "$4" <<'EOF'
+          import json, sys
+          p = f'/tmp/edited/{int(sys.argv[1]):020d}.bin'
+          d = json.load(open(p)); exec(sys.argv[2]); json.dump(d, open(p, 'w'))
+          EOF
+            set +e
+            python verify-pack.py --records /tmp/edited --manifest "$2" --allow-unsigned
+            rc=$?
+            set -e
+            if [ "$rc" -ne 1 ]; then
+              echo "edit '$4' at seq $3 exited $rc, expected 1: verifier is broken" >&2; exit 1
+            fi
+          }
+          expect_fail fixtures/records fixtures/manifest.json 3 \
+            "d['messages'][0]['content'] = 'edited after sealing'"
+          expect_fail fixtures/records fixtures/manifest.json 4 \
+            "d['identity']['asserted']['agent_name'] = 'impostor-agent'"
+          expect_fail fixtures/coverage/records fixtures/coverage/manifest.json 1 \
+            "d['coverage_key_inventory']['keys_json'] = d['coverage_key_inventory']['keys_json'].replace('\"governed\":false', '\"governed\":true')"
       - name: Fixtures were generated from this verifier
         run: |
           python fixtures/generate.py --out /tmp/regen
-          diff -r /tmp/regen fixtures/records
-          diff /tmp/regen.manifest.json fixtures/manifest.json
+          diff -r /tmp/regen/records fixtures/records
+          diff /tmp/regen/manifest.json fixtures/manifest.json
+          diff -r /tmp/regen/coverage fixtures/coverage
       - name: Embedded signature test vectors match their generator
         run: python fixtures/generate-signature-vectors.py --check
       - name: Every tampered signed pack fails with its exit code and reason

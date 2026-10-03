@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.5.0 (2026-10-03)
+
+- `verify-pack.py` from meilynx-proxy `c1581f0`.
+- Chain `schema_version` v1.12 (`llm_request` and the MCP kinds): the sealed
+  caller identity. The record hashes the agent id, identification tier,
+  credential kind and key id, the verified delegated user, and a digest of
+  the labels the caller asserted (SPEC §4.3, §4.5). The verifier recomputes
+  that digest from the stored labels, so a label rewritten after sealing
+  fails. On an MCP record, the hashed delegated user must agree with the
+  principal chain's attestation marker.
+- The stored-content check (SPEC §4.4) runs on every v1.12 record that
+  carries a content block, as on v1.10 and v1.11.
+- Chain `schema_version` v1.13 (`coverage.key_inventory`): the provider-key
+  inventory for one provider and day, sealed on the coverage chain with its
+  per-key list hashed verbatim (SPEC §4.3).
+- Releases up to 0.4.0 report an intact v1.12 or v1.13 record as a
+  verification failure. Use this release for any pack that holds one.
+- Fixtures: the request chain gains three v1.12 records (an agent's model
+  call under a `full` capture policy, its MCP tool call on behalf of a
+  verified user, and a project-key call with no capture policy), and a new
+  coverage chain in `fixtures/coverage/` holds a v1.8 and a v1.13 record.
+  `fixtures/generate.py --out DIR` now writes the same layout under `DIR`.
+- `--self-test` adds v1.12 and v1.13 fixture hashes (24a to 24h, 16c, 16d).
+
 ## 0.4.0 (2026-09-28)
 
 - `verify-pack.py` from meilynx-proxy `ce114ab`.

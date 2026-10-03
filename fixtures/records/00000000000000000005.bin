@@ -1,0 +1,40 @@
+{
+ "schema_version": "v1.12",
+ "event_kind": "llm_request",
+ "sequence_number": 5,
+ "timestamp_utc": "2026-10-01T14:00:07.000000000Z",
+ "event_id": "00000000-0000-4000-8000-000000000005",
+ "request_id": "55555555-5555-4555-8555-555555555555",
+ "model_requested": "gpt-4.1-mini",
+ "model_executed": "gpt-4.1-mini-2025-04-14",
+ "provider": "openai",
+ "workflow": "advisor-copilot",
+ "action": "allow",
+ "input_tokens": 14,
+ "output_tokens": 22,
+ "total_tokens": 36,
+ "estimated_cost_usd": 4.7e-05,
+ "policy_version": "0000000000000000000000000000000000000000000000000000000000000000",
+ "findings": [],
+ "messages": [
+  {
+   "role": "user",
+   "content": "Define tracking error in one sentence."
+  }
+ ],
+ "response_text": "Tracking error is the standard deviation of the difference between a portfolio's returns and its benchmark's returns.",
+ "identity": {
+  "tier": "t3",
+  "credential_kind": "project_key",
+  "credential_kid": "pk:0123456789abcdef",
+  "asserted_digest": "853e0e4229bba4ce4f18859afc9f6c19a7e1a54987518b62075a20b3c0026bd7",
+  "asserted": {
+   "user_agent_family": {
+    "family": "openai-python",
+    "major": 1
+   }
+  }
+ },
+ "previous_hash": "3c2e8ce01777d3d3c9ffde54fb29717a40a90b6d8f6149ab8eddb79a1af19220",
+ "event_hash": "119bf1bd2a0e4223705724ecf649a443d180c7cb000da7fc6308d88f1bf4a510"
+}

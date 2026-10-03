@@ -5,9 +5,9 @@ enough that a verifier can be written from it without reading Meilynx code.
 `verify-pack.py` in this repository is one such verifier; its `--self-test`
 pins the values below against fixture hashes.
 
-Status: describes chain records with `schema_version` v1 through v1.11 and
+Status: describes chain records with `schema_version` v1 through v1.13 and
 pack manifest `schema_version` 1.0, as produced by meilynx-proxy at commit
-`ce114ab` (2026-09-28).
+`c1581f0` (2026-10-03).
 
 ## 1. Records
 
@@ -23,14 +23,17 @@ prefix, named by its sequence number zero-padded to 20 digits:
 
 A chain begins at sequence `0` on every proxy instance start and runs until
 that instance stops. Different instances write different chains (distinct
-prefixes); a chain never spans instances.
+prefixes); a chain never spans instances. Model-call and MCP records share
+the request chain; coverage records (`coverage_computed`,
+`coverage_key_inventory`) are written to a separate per-tenant coverage chain
+with the same format and genesis.
 
 Every record carries at least these fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.11"`). Absent means `"v1"`. |
-| `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`). Absent means `llm_request`. |
+| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.13"`). Absent means `"v1"`. |
+| `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`). Absent means `llm_request`. |
 | `sequence_number` | integer | Position in the chain, starting at 0. |
 | `timestamp_utc` | string | RFC 3339 UTC timestamp, nanosecond precision, `Z` suffix. |
 | `event_id` | string | Unique id of this record. |
@@ -44,7 +47,8 @@ Every record carries at least these fields:
 | `event_hash` | string | Hex SHA-256 of this record's preimage (§3). |
 
 Kind-specific payloads live under `admin_action`, `auth_session`,
-`mcp_event`, `coverage`, `join_context` and `content`. LLM records also carry
+`mcp_event`, `coverage`, `coverage_key_inventory`, `join_context`, `content`
+and `identity`. LLM records also carry
 `messages`, `response_text`, `findings`, `policy_version`,
 `raw_request`/`raw_response` and routing metadata; **only the fields listed
 in the preimage tables (§4) are covered by `event_hash`**. From v1.10 the
@@ -84,6 +88,7 @@ no separators and no length prefixes.
 | f64 | 8 bytes little-endian IEEE 754; `null` is fed as `0.0` with **no** presence byte. |
 | principal | a tag byte then the principal's fields: `0x01` + `subject` (string) + `issuer` (optional string) for `{"kind":"human_user"}`; `0x02` + `agent_ref` (string) for `{"kind":"agent"}`. |
 | principal chain | `authenticated` (principal) then `0x00` if `on_behalf_of` is absent, else `0x01` + `on_behalf_of` (principal). |
+| sealed identity | `agent_id` (optional string), `tier` (string), `credential_kind` (string), `credential_kid` (optional string), then `0x00` if `delegated_human` is absent, else `0x01` + `subject` (string) + `issuer` (string), then `asserted_digest` (string). See §4.5. |
 
 Two normalizations apply before hashing:
 
@@ -136,6 +141,7 @@ wire names differ from the serde `event_kind` values stored in the JSON:
 | `mcp_error` | `mcp.error` |
 | `mcp_catalog_drift` | `mcp.catalog_drift` |
 | `coverage_computed` | `coverage.computed` |
+| `coverage_key_inventory` | `coverage.key_inventory` |
 
 ### 4.3 Per-version suffixes
 
@@ -201,6 +207,38 @@ at least one tool call; a record without tool calls stays v1.10. Tool-call
 digests on any other version, or a v1.11 record without
 `tool_calls_sha256_jcs`, are invalid and fail verification.
 
+**v1.12 `llm_request`**: the three `join_context` fields as in v1.10, then
+one presence byte for the `content` block: `0x00` if the record carries none,
+else `0x01` followed by the eight v1.11 `content` fields in their v1.11
+order. Then the sealed identity (§3, §4.5). A record carrying an `identity`
+block is v1.12, whatever its join or content state; the proxy stamps it
+whenever it resolved the caller's identity. 34 entries counting the presence
+byte, when `content` is present.
+
+**v1.12 MCP kinds**: the v1.9 MCP fields (with the three `join_context`
+fields fed presence-tagged whether or not the caller asserted any), then the
+sealed identity. 44 entries. One number covers both lanes: v1.10 and v1.11
+are LLM content buckets, so the MCP lane goes from v1.9 to v1.12.
+
+An `identity` block on any version other than v1.12, or a v1.12 record
+without one, is invalid and fails verification, as is v1.12 on any kind
+other than `llm_request` and the MCP kinds. On an MCP record, a
+`delegated_human` must be present exactly when the principal chain's
+stored `on_behalf_of_attestation` marker is `verified`; a record where the
+two disagree fails verification.
+
+**v1.13 `coverage.key_inventory`**: from `coverage_key_inventory`:
+`provider`, `day`, `attribution_unit`, `claim_language_key`,
+`registry_version` (strings), `proxy_key_count`,
+`unresolved_proxy_key_count`, `governed_key_count`, `ungoverned_key_count`
+(i64, no presence byte), `listing_fetched_at` (string), `keys_json`
+(string, fed verbatim as stored, never re-serialized). 27 fields. One record
+per provider and UTC day whose inventory changed: which provider API keys
+reported usage, and whether each resolved to a key the proxy itself routes
+with. `keys_json` holds key ids, the last four characters of each key, names
+and usage counts, never key material. The payload on any other version or
+kind, or v1.13 on any other kind, is invalid and fails verification.
+
 MCP kinds are: `mcp.tool_call`, `mcp.policy_decision`, `mcp.tool_result`,
 `mcp.tools_list.served`, `mcp.error`, `mcp.catalog_drift`. Any MCP hasher
 called with a non-MCP kind is an error.
@@ -209,10 +247,11 @@ called with a non-MCP kind is an error.
 Scheme (RFC 8785) serialization of the payload in question. For MCP records
 the verifier checks that the digest string is what the record hashed; it does
 not recompute the digest from a payload, because the payload is not part of
-the record. For v1.10 LLM records it also recomputes the stored-content
-digests (§4.4).
+the record. For LLM records with a `content` block (v1.10, v1.11, v1.12) it
+also recomputes the stored-content digests (§4.4), and for v1.12 records the
+asserted-claims digest (§4.5).
 
-### 4.4 LLM content attestation (v1.10, v1.11)
+### 4.4 LLM content attestation (v1.10, v1.11, v1.12)
 
 `capture_policy` names what the record retains:
 
@@ -236,7 +275,8 @@ The six `content` fields:
 | `stored_tool_calls_sha256_jcs` (v1.11) | JCS of the record's own `tool_calls`; absent when none were retained |
 
 Because the digests are in the preimage and the content they describe is in
-the record, a verifier checks, for every v1.10 and v1.11 record:
+the record, a verifier checks, for every v1.10 and v1.11 record and every
+v1.12 record that carries a `content` block:
 
 1. `stored_prompt_sha256_jcs`, when present, equals SHA-256(JCS(`messages`));
    when absent, `messages` is empty.
@@ -252,10 +292,36 @@ content is outside the preimage) and fails these checks. `prompt_sha256_jcs`
 and `response_sha256` cover content the record may no longer hold: whoever
 holds the original can show it is what the record was sealed over.
 
+A v1.12 record with no `content` block was sealed with no capture policy.
+Its prompt and response are stored but not bound, as before v1.10, and are
+not checked.
+
 JCS follows RFC 8785: object keys sorted by UTF-16 code units, no
 whitespace, strings escaped as in RFC 8785 §3.2.2.2, numbers in ECMAScript
 form (`1.0` → `1`, `1e-7` → `1e-7`, `1e21` → `1e+21`). A plain sorted-keys
 JSON dump differs on numbers and must not be used.
+
+### 4.5 Sealed identity (v1.12)
+
+A v1.12 record carries an `identity` block naming who called the proxy:
+
+| Field | Hashed | Meaning |
+|---|---|---|
+| `agent_id` | yes (optional string) | The registered agent the credential belongs to; absent for project-key traffic |
+| `tier` | yes | How the caller was identified: `t1`, the agent's own credential (an agent key or a trusted workload token); `t2`, that credential plus a verified user token; `t3`, no agent credential, only labels the caller asserted (project-key traffic); `t4`, only signals the proxy inferred |
+| `credential_kind` | yes | `agent_key`, `workload`, `project_key` or `none` |
+| `credential_kid` | yes (optional string) | The credential's key id, or `pk:` and a fingerprint for the project key |
+| `delegated_human` | yes (presence byte, then `subject` and `issuer`) | The user the agent acted for, present only when the proxy verified that user's token |
+| `asserted_digest` | yes | Hex SHA-256 over the JCS form of `asserted` |
+| `asserted` | no, bound through `asserted_digest` | What the caller claimed about itself, unverified: `agent_name`, `client_info`, `user_agent_family`, `on_behalf_of` (each omitted when absent) |
+
+The asserted labels are stored beside their digest rather than hashed, so a
+reader sees the values and the digest proves they are the ones the proxy
+saw. A verifier therefore checks, for every v1.12 record, that
+`asserted_digest` equals SHA-256(JCS(`asserted`)). A label rewritten after
+sealing leaves the chain hash intact and fails this check. The labels are
+claims a caller made, never evidence of who it was; only the hashed fields
+record what the proxy verified.
 
 ## 5. Reference values
 
@@ -438,9 +504,13 @@ since; the chain hashes attest the records.
   `response_text`, `findings`, `raw_request`, `raw_response` and routing
   metadata are stored in the record but not in the preimage. From v1.10 the
   prompt, response and findings are bound through their digests (§4.4), and
-  from v1.11 the response's tool calls too; `raw_request`, `raw_response` and
-  routing metadata remain unbound. For MCP records the payload is bound through its digest
-  fields.
+  from v1.11 the response's tool calls too, on records sealed under a
+  capture policy; `raw_request`, `raw_response` and routing metadata remain
+  unbound. For MCP records the payload is bound through its digest fields.
+  On v1.12 records the caller's asserted labels are bound through
+  `asserted_digest` (§4.5), and the principal chain's
+  `on_behalf_of_attestation` marker is stored but not hashed; the hashed
+  `delegated_human` must agree with it.
 - **Whether a detector missed something.** Under `redacted`, only spans a
   detector located are masked. The stored copy can still contain sensitive
   text no detector recognized.
