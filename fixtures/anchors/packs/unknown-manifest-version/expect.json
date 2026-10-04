@@ -3,7 +3,7 @@
     {
       "args": [],
       "contains": [
-        "manifest schema_version '1.2' is not one this verifier supports"
+        "manifest schema_version '2.0' is not one this verifier supports"
       ],
       "exit": 2
     }

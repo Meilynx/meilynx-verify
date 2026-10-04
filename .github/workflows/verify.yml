@@ -95,6 +95,16 @@ jobs:
           if [ "$rc" -ne 1 ]; then
             echo "tampered anchored head exited $rc, expected 1: verifier is broken" >&2; exit 1
           fi
+      - name: Segment objects; each case exits with its verdict offline and from a bucket, and exports match the per-record objects
+        run: python fixtures/run-segment-cases.py
+      - name: A segmented chain verifies offline and its anchors resolve through the segments (manifest 1.2)
+        run: |
+          set -o pipefail
+          python verify-pack.py --records fixtures/segments/segmented/records \
+            --manifest fixtures/segments/segmented/manifest.json --allow-unsigned \
+            --tsa-root test-rsa=fixtures/anchors/roots/rsa-root.pem \
+            --tsa-root test-ec=fixtures/anchors/roots/ec-root.pem | tee /tmp/segmented.out
+          grep -q "ANCHORS OK: chain=chain_tnt_fixture_run_a anchored_through=4 witnesses=2/2" /tmp/segmented.out
       - name: The PEM fixture roots are the DER roots the cases reference
         run: |
           for r in rsa ec; do
@@ -106,6 +116,8 @@ jobs:
           diff -r /tmp/regen/records fixtures/records
           diff /tmp/regen/manifest.json fixtures/manifest.json
           diff -r /tmp/regen/coverage fixtures/coverage
+          python fixtures/gen-segment-fixtures.py /tmp/regen/segments
+          diff -r /tmp/regen/segments fixtures/segments
       - name: Embedded signature test vectors match their generator
         run: python fixtures/generate-signature-vectors.py --check
       - name: Every tampered signed pack fails with its exit code and reason

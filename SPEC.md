@@ -5,21 +5,81 @@ enough that a verifier can be written from it without reading Meilynx code.
 `verify-pack.py` in this repository is one such verifier; its `--self-test`
 pins the values below against fixture hashes.
 
-Status: describes chain records with `schema_version` v1 through v1.13 and
-pack manifest `schema_version` 1.0 and 1.1, as produced by meilynx-proxy at
-commit `c831e20` (2026-10-03).
+Status: describes chain records with `schema_version` v1 through v1.13, the
+per-record and segment storage layouts, and pack manifest `schema_version`
+1.0, 1.1 and 1.2, as read by `verify-pack.py` from meilynx-proxy commit
+`ed2bc9f` (2026-10-04). The segment layout and manifest 1.2 are specified
+ahead of the proxy release that writes them; a chain written before that
+release is per-record, and its packs carry manifest 1.0 or 1.1.
 
 ## 1. Records
 
 A chain is an ordered sequence of records. Each record is one JSON document
-(UTF-8), stored as its own object in a write-once bucket under a chain
-prefix, named by its sequence number zero-padded to 20 digits:
+(UTF-8), stored in a write-once bucket under a chain prefix. The records are
+held by objects of two kinds, each named by the sequence numbers it holds,
+zero-padded to 20 digits:
+
+- A **per-record object** `{seq:020}.bin` holds one record. Its bytes are the
+  record's JSON document.
+- A **segment object** `{first:020}-{last:020}.seg` holds the records `first`
+  through `last`, inclusive, with `first ≤ last` and at most 1,024 records.
+  Its body is each record's bytes, exactly as a per-record object would hold
+  them, each followed by one line feed (`0x0A`), in sequence order. A
+  one-record segment is `{n:020}-{n:020}.seg`.
+
+A per-record chain:
 
 ```
 <prefix>/00000000000000000000.bin
 <prefix>/00000000000000000001.bin
 …
 ```
+
+The same chain in segments:
+
+```
+<prefix>/00000000000000000000-00000000000000001023.seg
+<prefix>/00000000000000001024-00000000000000001530.seg
+…
+```
+
+Records are written as compact JSON, which escapes a line feed inside a
+string, so splitting a segment body on `0x0A` returns each record's bytes
+unchanged. `event_hash` covers record fields (§3, §4), never object bytes:
+a record hashes the same in either layout.
+
+Writers close a segment at 1,024 records or 16 MiB of body, whichever comes
+first; a verifier enforces the record cap only. A writer also sets object
+metadata on each segment: `meilynx-segment-format` (`v1`),
+`meilynx-first-sequence`, `meilynx-last-sequence`, `meilynx-record-count`,
+`meilynx-first-previous-hash` (the first record's `previous_hash`),
+`meilynx-last-event-hash` (the last record's `event_hash`) and
+`meilynx-retention-horizon`. Metadata lets a reader with list access
+cross-check a segment without opening it. A verifier does not rely on it:
+the name and the body alone determine what a segment holds.
+
+**Coverage.** Each object name under the chain prefix parses to an inclusive
+range: `{n}.bin` is `[n, n]`, `{a}-{b}.seg` is `[a, b]`. Any other name is
+not a record object; `verify-pack.py` prints a NOTICE for a `.seg` name whose
+range is reversed or holds more than 1,024 records, and ignores it. The
+records a chain holds are the union of its objects' ranges, so a verifier
+reads both kinds under one prefix, in any mix. In a bucket, the objects that
+can hold sequence `s` sort between `{max(0, s − 1023):020}` and
+`{s + 1:020}` (exclusive), because zero padding keeps name order equal to
+sequence order; one bounded listing finds them.
+
+A verifier reads each sequence from every object whose range holds it, and
+concludes:
+
+| Finding | Verdict |
+|---|---|
+| The ranges cover every listed sequence, with no hole | Pass |
+| Two objects hold the sequence with byte-identical records | Pass, with `WARN seq=<n>: segment_overlap` naming both objects. The record is verified once. |
+| Two objects hold the sequence with different bytes | Fail (exit 1): `segment_fork`, naming both objects |
+| A segment body that does not end in a line feed, or does not hold exactly the number of records its name says | Fail (exit 1) at every sequence the name covers: the segment is malformed |
+| A sequence the manifest lists and no object holds | Fail (exit 1): missing record |
+| **Gap:** no object holds a sequence, and later objects exist | Fail (exit 1) at the first record after the hole, which does not link to the last record before it (§2) |
+| **Truncation:** the ranges cover a contiguous prefix and stop early | Pass on the records present, for a manifest that lists those records. The shortfall against the chain's final length is a completeness finding, not an integrity one (§8). |
 
 A chain begins at sequence `0` on every proxy instance start and runs until
 that instance stops. Different instances write different chains (distinct
@@ -335,12 +395,12 @@ useful for a from-scratch implementation:
 
 ## 6. Pack manifest
 
-`manifest.json` (schema_version `"1.0"` or `"1.1"`) describes one
+`manifest.json` (schema_version `"1.0"`, `"1.1"` or `"1.2"`) describes one
 verification window of one chain:
 
 ```json
 {
-  "schema_version": "1.0" | "1.1",
+  "schema_version": "1.0" | "1.1" | "1.2",
   "pack_id": "<uuid>",
   "window": "A" | "B",
   "signing_deferred": true | false,
@@ -362,7 +422,8 @@ verification window of one chain:
   "violation_kind": null,
   "error": null,
   "signature": { … present on window B only … },
-  "anchoring": { … present on 1.1 only, §6.1 … },
+  "anchoring": { … present on 1.1 and 1.2, §6.1 … },
+  "storage_layout": "per-record" | "segmented-v1",   … present on 1.2 only, §6.2 …
   "events": [
     {
       "sequence": 0,
@@ -375,7 +436,8 @@ verification window of one chain:
       "stored_event_hash": "<hex>",
       "recomputed_event_hash": "<hex>",
       "hash_match": true,
-      "previous_hash_match": true
+      "previous_hash_match": true,
+      "object": {"name": "<object name>", "index": 0}   … present on 1.2 only, §6.2 …
     }
   ]
 }
@@ -390,7 +452,7 @@ A verifier treats the manifest's `recomputed_event_hash` as a claim to check,
 not as truth: it recomputes from the record bytes and reports disagreement
 with the manifest as a failure.
 
-### 6.1 Chain-head anchors (manifest 1.1)
+### 6.1 Chain-head anchors (manifest 1.1 and later)
 
 A chain shows order and integrity. It does not show time: `timestamp_utc`
 comes from the proxy's clock, and a writer with access to the chain could
@@ -421,7 +483,10 @@ statement has exactly one imprint.
 
 `{seq}` is the head sequence the statement records for that chain. In an
 exported pack they sit under `records/anchors/`. The verifier reads anchors
-from the records directory offline, or from the bucket online.
+from the records directory offline, or from the bucket online. Anchors are
+per-record in every layout: the verifier resolves an anchor's `{seq}` to its
+record through the record objects of §1, so an anchor over a segmented chain
+names the same sequence and `event_hash` it would over a per-record one.
 
 **Token.** A token verifies when all of the following hold:
 
@@ -446,7 +511,7 @@ root from `sigstore/root-signing` `trusted_root.json`) and `globalsign-r45`
 own validity period); the verifier then names that root and its fingerprint
 in a NOTICE. No revocation check is made.
 
-**Manifest section.** A 1.1 manifest carries `anchoring`:
+**Manifest section.** A 1.1 or 1.2 manifest carries `anchoring`:
 
 ```json
 "anchoring": {
@@ -492,6 +557,48 @@ A pass prints `ANCHORS OK: chain=<name> anchored_through=<seq>
 witnesses=<verified>/<listed>`. An anchor shows that the covered records
 existed no later than the token's `genTime` and are unchanged since. It does
 not show that the chain is complete (§8).
+
+### 6.2 Storage layout (manifest 1.2)
+
+A 1.2 manifest is a 1.1 manifest, `anchoring` included, with two additions
+that record where each record is stored. It is meant for a pack over a chain
+stored in segment objects (§1); a pack over a per-record chain can stay on
+1.1. A verifier reads either `storage_layout` value.
+
+- `storage_layout`: `"per-record"` or `"segmented-v1"`. Absent, or any other
+  value, is cannot evaluate (exit 2): the verifier does not know how to read
+  the chain.
+- `events[].object`: `{"name": "<object name>", "index": <n>}`. `name` is the
+  object holding the record, relative to `prefix` (`{seq:020}.bin` or
+  `{first:020}-{last:020}.seg`), and `index` is the record's 0-based position
+  in it, so `index` equals `sequence − first`.
+
+**What a verifier checks** (`verify-pack.py` does all of these), on top of
+§1, §6 and §6.1:
+
+| Finding | Verdict |
+|---|---|
+| An entry with no `object`, or one without `name` or `index` | Fail (exit 1) at that sequence |
+| An `object` whose name is not a record object, or whose range and `index` do not hold the entry's sequence | Fail (exit 1) at that sequence |
+| Reading from the bucket: no listed object of that name holds the sequence | Fail (exit 1) at that sequence |
+
+Offline, the reference is checked against its own name and not against the
+records directory, which may hold the same records as per-record files.
+
+**Exported packs.** `verify-pack.py --export-records DIR` writes one
+`{seq:020}.bin` file per record, byte-identical to a per-record object,
+whatever the bucket's layout: it splits segments. An exported pack therefore
+reads like a per-record pack, while its 1.2 manifest still names the segment
+each record came from. `--export-records` works from `--bucket` and from a
+`--records` directory.
+
+Per-entry hashes are unchanged from 1.1, and a signed pack's signature covers
+the 1.2 manifest's exact bytes as before (§7).
+
+**Older verifiers.** A verifier from before this layout fails closed. Given a
+1.2 manifest it is cannot evaluate (exit 2). Pointed at a segmented chain in
+a bucket with a 1.1 manifest, it finds no `{seq}.bin` object and reports
+every record missing (exit 1). It never passes such a chain.
 
 ## 7. Signed packs (window B)
 
@@ -603,7 +710,10 @@ since; the chain hashes attest the records.
 
 - **Completeness.** The chain proves that the records it contains are intact
   and in order. It cannot show that an interaction which never reached the
-  proxy was recorded.
+  proxy was recorded. A chain whose objects stop before the last record its
+  writer sealed (truncation, §1) verifies on the records present; the
+  shortfall is not an integrity failure, and this verifier does not report
+  it.
 - **Unhashed fields.** For LLM records before v1.10, `messages`,
   `response_text`, `findings`, `raw_request`, `raw_response` and routing
   metadata are stored in the record but not in the preimage. From v1.10 the
