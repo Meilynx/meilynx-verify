@@ -1,0 +1,16 @@
+{
+  "about": "The chain was finalized at final_next_sequence=5, but its objects stop at seq 3: the segment holding seq 4 was never written (ADR-0081 D7). The records present verify; the shortfall is a completeness verdict (the reconciler's finalized_mismatch), not an integrity one.",
+  "runs": [
+    {
+      "absent": [
+        "WARN",
+        "FAIL"
+      ],
+      "args": [],
+      "contains": [
+        "OK: all 4 events verified"
+      ],
+      "exit": 0
+    }
+  ]
+}

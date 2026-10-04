@@ -1,0 +1,23 @@
+{
+  "about": "One chain in both layouts: per-record objects for seq 0 and 4, a segment for 1..3.",
+  "export_matches_legacy": true,
+  "runs": [
+    {
+      "absent": [
+        "WARN",
+        "FAIL"
+      ],
+      "args": [
+        "--tsa-root",
+        "test-rsa=roots/rsa-root.der",
+        "--tsa-root",
+        "test-ec=roots/ec-root.der"
+      ],
+      "contains": [
+        "OK: all 5 events verified",
+        "ANCHORS OK"
+      ],
+      "exit": 0
+    }
+  ]
+}

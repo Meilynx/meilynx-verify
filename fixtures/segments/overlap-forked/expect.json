@@ -1,0 +1,17 @@
+{
+  "about": "Seq 2 is held by two segments with different bytes (ADR-0081 D7): a fork, FAIL.",
+  "runs": [
+    {
+      "absent": [
+        "FAIL seq=3",
+        "FAIL seq=4"
+      ],
+      "args": [],
+      "contains": [
+        "FAIL seq=2: record fetch error: segment_fork: 00000000000000000000-00000000000000000002.seg and 00000000000000000002-00000000000000000004.seg hold different bytes for seq=2",
+        "PASS seq=3"
+      ],
+      "exit": 1
+    }
+  ]
+}

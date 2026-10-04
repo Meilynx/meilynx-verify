@@ -9,7 +9,7 @@
         "seals": [],
         "unanchored_tail": {
           "from_seq": 0,
-          "to_seq": 4
+          "to_seq": 3
         }
       }
     ],
@@ -24,6 +24,10 @@
       "event_id": "evt-000000",
       "hash_match": true,
       "model_requested": "claude-sonnet-4-6",
+      "object": {
+        "index": 0,
+        "name": "00000000000000000000-00000000000000000001.seg"
+      },
       "previous_hash_match": true,
       "project_id": "fixture-proj",
       "recomputed_event_hash": "912266119ebee9f4f3f1aff8580f611add342140b5ec00b1fd4e8f34fb230b7f",
@@ -37,6 +41,10 @@
       "event_id": "evt-000001",
       "hash_match": true,
       "model_requested": "claude-sonnet-4-6",
+      "object": {
+        "index": 1,
+        "name": "00000000000000000000-00000000000000000001.seg"
+      },
       "previous_hash_match": true,
       "project_id": "fixture-proj",
       "recomputed_event_hash": "7a48540e5ae5edf61dbb242a504e3f4c7c643d811458ffafe50b6ce9d39377ac",
@@ -50,6 +58,10 @@
       "event_id": "evt-000002",
       "hash_match": true,
       "model_requested": "claude-sonnet-4-6",
+      "object": {
+        "index": 0,
+        "name": "00000000000000000002-00000000000000000003.seg"
+      },
       "previous_hash_match": true,
       "project_id": "fixture-proj",
       "recomputed_event_hash": "857802f0512bc8bec9b45bbcb1855fae9a88a4689b4598531c6c5152f24ccfe4",
@@ -63,6 +75,10 @@
       "event_id": "evt-000003",
       "hash_match": true,
       "model_requested": "claude-sonnet-4-6",
+      "object": {
+        "index": 1,
+        "name": "00000000000000000002-00000000000000000003.seg"
+      },
       "previous_hash_match": true,
       "project_id": "fixture-proj",
       "recomputed_event_hash": "ce4ff33b11b0c8190dcd8709f76bfbae351be90c45a8de573a50e77831a48fc8",
@@ -70,36 +86,24 @@
       "sequence": 3,
       "stored_event_hash": "ce4ff33b11b0c8190dcd8709f76bfbae351be90c45a8de573a50e77831a48fc8",
       "timestamp_utc": "2026-05-01T00:00:03+00:00"
-    },
-    {
-      "action": "allow",
-      "event_id": "evt-000004",
-      "hash_match": true,
-      "model_requested": "claude-sonnet-4-6",
-      "previous_hash_match": true,
-      "project_id": "fixture-proj",
-      "recomputed_event_hash": "528c8f5d0117b04e1941a42a0b895b900c79980bd334ea38b1c3b6d6218672a2",
-      "request_id": "req-000004",
-      "sequence": 4,
-      "stored_event_hash": "528c8f5d0117b04e1941a42a0b895b900c79980bd334ea38b1c3b6d6218672a2",
-      "timestamp_utc": "2026-05-01T00:00:04+00:00"
     }
   ],
   "first_sequence": 0,
   "from_sequence": 0,
-  "generated_at": "2026-10-03T04:33:51.527896Z",
+  "generated_at": "2026-10-03T04:33:51.440657Z",
   "generator_version": "0.1.0",
   "genesis_hash": "c2989403cf897daccd825cc41377b804343c5a4851eac1daf32b58eb1fa4edf8",
   "hash_algorithm": "SHA-256",
   "hash_version": "v1",
-  "last_sequence": 4,
+  "last_sequence": 3,
   "pack_id": "00000000-0000-0000-0000-000000002758",
   "prefix": "audit/chain_tnt_fixture_run_a/",
-  "records_checked": 5,
-  "schema_version": "2.0",
+  "records_checked": 4,
+  "schema_version": "1.2",
   "signing_deferred": true,
+  "storage_layout": "segmented-v1",
   "substrate_name": "Anchor fixture substrate",
-  "to_sequence": 4,
+  "to_sequence": 3,
   "verified": true,
   "violation_kind": null,
   "window": "A"

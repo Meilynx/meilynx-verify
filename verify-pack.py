@@ -37,9 +37,21 @@ Usage (offline — the records were handed to you with the manifest):
     client library, no credentials — the verdict is computed entirely from
     the bytes on your disk.
 
+Segment objects (ADR-0081):
+    A managed proxy's run chain may store records as segment objects,
+    `<first:020d>-<last:020d>.seg`, each holding up to 1,024 consecutive
+    records separated by line feeds. --bucket and a --records directory read
+    both layouts, in any mix. --export-records writes one
+    `<seq:020d>.bin` file per record, byte-identical to a per-record object,
+    from either source. A sequence held by two objects with identical bytes
+    prints `WARN ... segment_overlap` and still verifies; with different
+    bytes it fails (`segment_fork`).
+
 Prerequisites (online mode only):
     pip install google-cloud-storage
     gcloud auth application-default login
+    The principal needs storage.objects.list and storage.objects.get on the
+    bucket (roles/storage.objectViewer has both).
 
 Signed packs (window B):
     A signed pack carries `manifest.json.sigstore.json` next to
@@ -73,7 +85,8 @@ Exit codes (the same in --bucket and --records mode; when several apply,
        unsigned pack exits 0 only with --allow-unsigned, and still prints
        that authenticity is not established.
     1  verification failed: a record (hash mismatch, chain break, missing or
-       unreadable record, content check) or the signature, with the reason:
+       unreadable record, content check, two objects holding different
+       bytes for one sequence) or the signature, with the reason:
          signature required by manifest but missing
          manifest bytes changed since signing
          untrusted certificate chain
@@ -83,9 +96,10 @@ Exit codes (the same in --bucket and --records mode; when several apply,
          transparency-log entry does not match this signature
          signed outside certificate validity
          malformed signature material
-    2  cannot evaluate: an unsupported hash_version, signature method or
-       bundle format (update this verifier), an unusable --trusted-root, or
-       a command-line usage error.
+    2  cannot evaluate: an unsupported hash_version, manifest
+       schema_version, storage_layout, signature method or bundle format
+       (update this verifier), an unusable --trusted-root, or a
+       command-line usage error.
     3  unsigned pack: the chain verified, but no signature establishes who
        produced the manifest. Pass --allow-unsigned to accept it. A signed
        pack stripped of its signature and relabelled window A lands here,
@@ -97,8 +111,8 @@ by GCS when you authenticate with credentials that have storage.objects.get.
 Self-test (encoding drift check):
   Run `python verify-pack.py --self-test` to check the encoding against the
   substrate's reference values. Exercises both the +00:00 fixture and the
-  Z-suffix normalization path, the offline --records path, and the
-  signature checks (ECDSA test vectors, a synthetic signed pack with one
+  Z-suffix normalization path, the offline --records path, segment
+  objects (ADR-0081), and the signature checks (ECDSA test vectors, a synthetic signed pack with one
   tampered variant per failure reason, and a real Sigstore public-good
   bundle). Should always pass; if it fails, the verifier has drifted.
 """
@@ -117,12 +131,16 @@ from pathlib import Path
 GENESIS_STRING = "meilynx-genesis-v1"
 SUPPORTED_HASH_VERSIONS = {"v1"}
 # Manifest schema versions this verifier understands. 1.1 adds the
-# `anchoring` section (chain-head anchors, MEI-2758 / ADR-0075).
-SUPPORTED_MANIFEST_SCHEMA_VERSIONS = ("1.0", "1.1")
+# `anchoring` section (chain-head anchors, MEI-2758 / ADR-0075). 1.2 adds
+# `storage_layout` and a per-entry `object` reference, for a chain stored as
+# segment objects (MEI-2863 / ADR-0081 D9).
+SUPPORTED_MANIFEST_SCHEMA_VERSIONS = ("1.0", "1.1", "1.2")
 # Pack features this verifier checks, read by the release-sync gate
 # (check-meilynx-verify-sync.sh --covers) so a generator never ships a
-# feature the public verifier would silently skip.
-VERIFIER_CAPABILITIES = frozenset({"chain-anchors-v1"})
+# feature the public verifier would silently skip. `segmented-records-v1`
+# reads segment objects; the gate requires it of the public release once a
+# proxy build contains crates/meilynx-audit/src/segment_writer.rs (ADR-0081 D9).
+VERIFIER_CAPABILITIES = frozenset({"chain-anchors-v1", "segmented-records-v1"})
 
 # Exit codes (listed in the module docstring).
 EXIT_OK = 0
@@ -2722,37 +2740,220 @@ def record_file_name(seq):
     return f"{seq:020d}.bin"
 
 
-def gcs_fetcher(bucket_name, prefix, storage_client):
-    """Return `fetch(seq) -> bytes` that reads `<prefix><seq>.bin` from GCS
-    (CMEK decrypts transparently for a principal with storage.objects.get)."""
+# ---------------------------------------------------------------------------
+# Record objects: per-record and segment layouts (ADR-0081, MEI-2863)
+#
+# A managed proxy's run chain may store its records as segment objects, each
+# holding a contiguous range of records: `{first:020}-{last:020}.seg`, whose
+# body is every record's bytes (exactly what a `{seq:020}.bin` object holds)
+# followed by one line feed, in sequence order. Every reader parses an object
+# name under the chain prefix into a range through one parser, so a chain
+# that mixes both layouts reads without special handling (D6).
+#
+# Verdicts when two objects hold the same sequence (D7): byte-identical
+# copies are a WARN `segment_overlap`, not a failure; differing copies are a
+# `segment_fork` FAIL. A hole between ranges fails through the chain linkage
+# (the record after it does not link to the record before it), and a chain
+# whose ranges stop early verifies on the records present: that shortfall is
+# a completeness verdict, not an integrity one.
+# ---------------------------------------------------------------------------
+
+SEGMENT_MAX_RECORDS = 1024
+STORAGE_LAYOUTS = ("per-record", "segmented-v1")
+_RECORD_OBJECT_NAME = re.compile(r"(\d{20})\.bin")
+_SEGMENT_OBJECT_NAME = re.compile(r"(\d{20})-(\d{20})\.seg")
+_SEGMENT_CACHE_SIZE = 8
+
+
+def record_object_range(name):
+    """ADR-0081 D6: the inclusive range [first, last] of sequences the object
+    `name` (relative to the chain prefix) holds, or None when it is not a
+    record object. `{n:020}.bin` holds [n, n]; `{a:020}-{b:020}.seg` holds
+    [a, b] when a <= b and it holds at most SEGMENT_MAX_RECORDS records."""
+    m = _RECORD_OBJECT_NAME.fullmatch(name)
+    if m:
+        n = int(m.group(1))
+        return n, n
+    m = _SEGMENT_OBJECT_NAME.fullmatch(name)
+    if m:
+        first, last = int(m.group(1)), int(m.group(2))
+        if first <= last and last - first + 1 <= SEGMENT_MAX_RECORDS:
+            return first, last
+    return None
+
+
+def split_segment(body, first, last):
+    """ADR-0081 D2: the records a segment body holds, in sequence order, each
+    byte-identical to the `{seq:020}.bin` object it replaces. Compact JSON
+    escapes line feeds inside strings, so splitting on 0x0A is exact. Raises
+    ValueError unless the body holds exactly last - first + 1 records, each
+    followed by one line feed."""
+    expected = last - first + 1
+    if not body.endswith(b"\n"):
+        raise ValueError("its body does not end with a line feed")
+    records = body[:-1].split(b"\n")
+    if len(records) != expected:
+        raise ValueError(f"its body holds {len(records)} record(s), its name says {expected}")
+    return records
+
+
+class RecordNotFound(FileNotFoundError):
+    """No record object holds the sequence."""
+
+
+class SegmentFork(ValueError):
+    """Two objects hold different bytes for one sequence (ADR-0081 D7)."""
+
+
+class ChainRecords:
+    """The record objects under one chain prefix, in either layout, and
+    `self(seq) -> bytes` over them: the fetch function the chain walk, the
+    anchor check and --export-records read through.
+
+    `list_names(lo, hi)` returns the names (relative to the chain prefix)
+    among which every object holding a sequence in [lo, hi] is found; extra
+    names are ignored. `read(name)` returns one object's bytes. `report`
+    prints the overlap WARN, once per sequence."""
+
+    def __init__(self, list_names, read, report=print):
+        self._list_names = list_names
+        self._read = read
+        self._report = report
+        self._holders = {}  # seq -> [object name, ...]
+        self._indexed = set()
+        self._listed = []  # [(lo, hi)] windows already listed
+        self._expected = []  # [(lo, hi)] windows to list in one pass when first read
+        self._failed = []  # [(lo, hi, error)] windows whose listing failed
+        self._segments = {}  # name -> [record bytes] | ValueError, most recent last
+        self._warned = set()
+
+    def expect(self, lo, hi):
+        """List [lo, hi] in one pass the first time a sequence in it is read,
+        rather than one listing per sequence."""
+        self._expected.append((lo, hi))
+
+    def list_window(self, lo, hi):
+        """Index every record object that can hold a sequence in [lo, hi]."""
+        try:
+            names = self._list_names(lo, hi)
+        except Exception as exc:  # ADR-0013 A: propagate loud — every record in the window then fails its fetch
+            self._failed.append((lo, hi, exc))
+            raise OSError(f"cannot list the chain's record objects: {exc}") from exc
+        for name in names:
+            if name in self._indexed:
+                continue
+            span = record_object_range(name)
+            if span is None:
+                if _SEGMENT_OBJECT_NAME.fullmatch(name):
+                    self._report(f"NOTICE: {name} is not a record object: a segment holds from 1 to "
+                                 f"{SEGMENT_MAX_RECORDS} records, first <= last (ADR-0081 D6)")
+                self._indexed.add(name)
+                continue
+            self._indexed.add(name)
+            for seq in range(span[0], span[1] + 1):
+                self._holders.setdefault(seq, []).append(name)
+        self._listed.append((lo, hi))
+
+    def holders(self, seq):
+        """The names of every object holding `seq`, in name order."""
+        if not any(lo <= seq <= hi for lo, hi in self._listed):
+            for lo, hi, exc in self._failed:
+                if lo <= seq <= hi:
+                    raise OSError(f"cannot list the chain's record objects: {exc}")
+            window = next((w for w in self._expected if w[0] <= seq <= w[1]), (seq, seq))
+            if window in self._expected:
+                self._expected.remove(window)
+            self.list_window(*window)
+        return sorted(self._holders.get(seq, ()))
+
+    def _record(self, name, seq):
+        first, last = record_object_range(name)
+        if first == last and name.endswith(".bin"):
+            return self._read(name)
+        records = self._segments.pop(name, None)
+        if records is None:
+            try:
+                records = split_segment(self._read(name), first, last)
+            except ValueError as exc:
+                records = exc
+        self._segments[name] = records
+        while len(self._segments) > _SEGMENT_CACHE_SIZE:
+            del self._segments[next(iter(self._segments))]
+        if isinstance(records, ValueError):
+            raise ValueError(f"segment {name} is malformed: {records}") from records
+        return records[seq - first]
+
+    def __call__(self, seq):
+        names = self.holders(seq)
+        if not names:
+            raise RecordNotFound(f"no record object holds seq={seq}")
+        raw = self._record(names[0], seq)
+        for name in names[1:]:
+            if self._record(name, seq) != raw:
+                raise SegmentFork(f"segment_fork: {names[0]} and {name} hold different bytes for seq={seq}")
+        if len(names) > 1 and seq not in self._warned:
+            self._warned.add(seq)
+            self._report(f"WARN seq={seq}: segment_overlap: {' and '.join(names)} each hold this record, "
+                         f"byte-identical")
+        return raw
+
+
+def gcs_fetcher(bucket_name, prefix, storage_client, report=print):
+    """Return a ChainRecords over `<prefix>` in GCS (CMEK decrypts
+    transparently for a principal with storage.objects.get and .list).
+
+    Each listing is bounded by name: the objects that can hold a sequence in
+    [lo, hi] start at most SEGMENT_MAX_RECORDS - 1 below lo and at most at hi,
+    and zero padding keeps name order equal to sequence order."""
     bucket = storage_client.bucket(bucket_name)
 
-    def fetch(seq):
-        return bucket.blob(f"{prefix}{record_file_name(seq)}").download_as_bytes()
+    def list_names(lo, hi):
+        blobs = storage_client.list_blobs(
+            bucket_name,
+            prefix=prefix,
+            start_offset=f"{prefix}{max(0, lo - (SEGMENT_MAX_RECORDS - 1)):020d}",
+            end_offset=f"{prefix}{hi + 1:020d}",
+        )
+        return [b.name[len(prefix):] for b in blobs]
 
-    return fetch
+    def read(name):
+        return bucket.blob(f"{prefix}{name}").download_as_bytes()
+
+    return ChainRecords(list_names, read, report)
 
 
-def local_fetcher(records_path):
+def local_fetcher(records_path, report=print):
     """Return `fetch(seq) -> bytes` that reads chain records from disk, with
     no network and no Google client library — the path an examiner or a
     third-party reviewer runs when they were handed the records alongside
     the manifest.
 
     `records_path` is either:
-      - a directory holding one file per record named `<seq:020d>.bin` (or
-        `.json`), exactly as exported from the bucket; or
+      - a directory holding the chain's record objects as the bucket stores
+        them, `<seq:020d>.bin` and `<first:020d>-<last:020d>.seg` in any mix
+        (ADR-0081), or files named `<seq:020d>.json`; or
       - a single `.jsonl` file (one record per line) / `.json` file (an
         array of records), each record carrying its own `sequence_number`.
     """
     path = Path(records_path)
     if path.is_dir():
+        objects = ChainRecords(
+            lambda lo, hi: sorted(p.name for p in path.iterdir() if p.is_file()),
+            lambda name: (path / name).read_bytes(),
+            report,
+        )
+        # One directory listing holds every sequence.
+        objects.list_window(0, float("inf"))
+
         def fetch(seq):
-            for name in (record_file_name(seq), f"{seq:020d}.json"):
-                candidate = path / name
+            try:
+                return objects(seq)
+            except RecordNotFound:
+                candidate = path / f"{seq:020d}.json"
                 if candidate.exists():
                     return candidate.read_bytes()
-            raise FileNotFoundError(f"no record file for seq={seq} under {path}")
+                raise RecordNotFound(f"no record file for seq={seq} under {path}")
+
         return fetch
 
     if not path.exists():
@@ -2811,10 +3012,54 @@ def timestamp_recording_fetcher(fetch, times):
 def verify_manifest(bucket_name, manifest, storage_client):
     """Walk each event in the manifest, re-fetch from GCS, recompute hash."""
     prefix = manifest.get('prefix', 'audit/')
-    return verify_manifest_with(gcs_fetcher(bucket_name, prefix, storage_client), manifest)
+    objects = gcs_fetcher(bucket_name, prefix, storage_client)
+    objects.expect(*manifest_sequence_window(manifest))
+    return verify_manifest_with(objects, manifest, holders=objects.holders)
 
 
-def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=False):
+def manifest_sequence_window(manifest):
+    """(lowest, highest) sequence the manifest's events name, (0, 0) for none.
+    A malformed entry is left to the chain walk to report."""
+    seqs = [e['sequence'] for e in manifest.get('events', [])
+            if isinstance(e, dict) and type(e.get('sequence')) is int] or [0]
+    return min(seqs), max(seqs)
+
+
+def manifest_storage_layout_error(manifest):
+    """None when the manifest's storage layout is one this verifier reads (a
+    manifest before 1.2 has none: its chain is per-record), else the message
+    to print before exiting 2. ADR-0081 D9."""
+    if manifest.get("schema_version") != "1.2":
+        return None
+    layout = manifest.get("storage_layout")
+    if layout in STORAGE_LAYOUTS:
+        return None
+    return (f"manifest storage_layout {layout!r} is not one this verifier reads "
+            f"({', '.join(STORAGE_LAYOUTS)}). Re-run with an updated verifier.")
+
+
+def object_reference_problem(entry, holders=None):
+    """Manifest 1.2 (ADR-0081 D9): None when the entry's `object` reference
+    names a record object that holds the entry's sequence at `index`, else
+    the problem. With `holders` (--bucket mode) the bucket listing must also
+    show that object holding the sequence. An offline directory is not
+    consulted: it may hold the same records as per-record files written by
+    --export-records."""
+    seq = entry['sequence']
+    ref = entry.get('object')
+    if not isinstance(ref, dict) or 'name' not in ref or 'index' not in ref:
+        return "manifest 1.2 entry has no object reference ({name, index})"
+    name, index = ref['name'], ref['index']
+    span = record_object_range(name) if isinstance(name, str) else None
+    if (span is None or isinstance(index, bool) or not isinstance(index, int)
+            or not span[0] <= seq <= span[1] or index != seq - span[0]):
+        return f"manifest object reference {json.dumps(ref, sort_keys=True)} does not hold seq={seq}"
+    if holders is not None and name not in holders(seq):
+        return f"manifest names object {name} for this record, and the bucket holds no such object"
+    return None
+
+
+def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=False, holders=None):
     """Walk each event in the manifest, fetch its record through `fetch(seq)`,
     recompute the hash and check the chain linkage. Source-agnostic: `fetch`
     is the only thing that differs between the GCS and the offline path, so
@@ -2823,7 +3068,10 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
     `require_manifest_hash` is set for signed packs: every entry must carry
     `recomputed_event_hash`. That field is the only link from the signed
     manifest to the record bytes, so an entry without it would leave its
-    record outside what the signature covers."""
+    record outside what the signature covers.
+
+    `holders(seq)`, in --bucket mode, lists the objects holding a sequence,
+    against which a manifest 1.2 entry's object reference is checked."""
     hash_version = manifest.get('hash_version', '')
     if hash_version not in SUPPORTED_HASH_VERSIONS:
         print(
@@ -2863,6 +3111,7 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
         }
 
     all_passed = True
+    references_objects = manifest.get('schema_version') == '1.2'
     events_in_manifest = manifest.get('events', [])
     if not events_in_manifest:
         print("WARN: manifest.events is empty — nothing to verify.")
@@ -2926,6 +3175,13 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             report(f"FAIL seq={seq}: {problem}")
             all_passed = False
             content_ok = False
+        # MEI-2863 — a manifest 1.2 entry names the object holding its record.
+        if references_objects:
+            problem = object_reference_problem(entry, holders)
+            if problem:
+                report(f"FAIL seq={seq}: {problem}")
+                all_passed = False
+                content_ok = False
 
         manifest_recomputed = entry.get('recomputed_event_hash', '')
         if require_manifest_hash and not manifest_recomputed:
@@ -5528,6 +5784,181 @@ def offline_self_test():
     return ok
 
 
+def segment_self_test():
+    """MEI-2863 — segment objects (ADR-0081). The range parser, the segment
+    split, and the D7 verdicts on a synthetic five-record v1 chain stored as
+    segments: clean, mixed, identical overlap (WARN), forked overlap (FAIL),
+    gap (FAIL through the chain link), truncation (PASS on the records
+    present), the manifest 1.2 object reference, and --export-records
+    writing files byte-identical to per-record objects."""
+    import contextlib
+    import io
+    import tempfile
+
+    ok = True
+
+    def check(label, passed, what, output=''):
+        nonlocal ok
+        print(f"SELF-TEST assertion {label} {'PASS' if passed else 'FAIL'}: {what}")
+        if not passed and output:
+            print('\n'.join(f"    | {line}" for line in output.splitlines()))
+        ok = ok and passed
+
+    def n(seq):
+        return f"{seq:020d}"
+
+    def seg(first, last):
+        return f"{n(first)}-{n(last)}.seg"
+
+    check('26a',
+          record_object_range(f"{n(7)}.bin") == (7, 7)
+          and record_object_range(f"{n(3)}-{n(3)}.seg") == (3, 3)
+          and record_object_range(f"{n(1024)}-{n(2047)}.seg") == (1024, 2047)
+          and record_object_range(f"{n(0)}-{n(1024)}.seg") is None
+          and record_object_range(f"{n(5)}-{n(4)}.seg") is None
+          and record_object_range(f"{n(5)}.seg") is None
+          and record_object_range(f"{n(4)}-{n(5)}.bin") is None
+          and record_object_range("7.bin") is None
+          and record_object_range(f"{n(7)}.json") is None,
+          "object names parse to ranges: <n>.bin is [n, n], <a>-<b>.seg is [a, b] with 1 to 1024 "
+          "records, anything else is not a record (ADR-0081 D6)")
+
+    genesis = genesis_hash()
+    events = []
+    for seq in range(5):
+        event = {
+            'schema_version': 'v1',
+            'sequence_number': seq,
+            'timestamp_utc': f'2026-01-01T00:00:0{seq}+00:00',
+            'event_id': f'evt-{seq}',
+            'request_id': f'req-{seq}',
+            'model_requested': 'gpt-4.1-mini',
+            'action': 'allow',
+            'input_tokens': 11,
+            'output_tokens': 7,
+            'total_tokens': 18,
+            'cache_creation_input_tokens': None,
+            'cache_read_input_tokens': None,
+            'cached_input_tokens': None,
+            'reasoning_tokens': None,
+            'estimated_cost_usd': 0.000123,
+            'policy_reason': 'line one\nline two',
+            'previous_hash': events[-1]['event_hash'] if events else genesis,
+        }
+        event['event_hash'] = recompute_event_hash(event, seq, event['previous_hash'])
+        events.append(event)
+    raw = [json.dumps(e, separators=(',', ':')).encode('utf-8') for e in events]
+
+    body = b''.join(r + b'\n' for r in raw[1:4])
+    split_ok = split_segment(body, 1, 3) == raw[1:4]
+    for bad in (body[:-1], body + raw[4] + b'\n'):
+        try:
+            split_segment(bad, 1, 3)
+            split_ok = False
+        except ValueError:
+            pass
+    check('26b', split_ok,
+          "a segment body splits on 0x0A into records byte-identical to per-record objects (a line feed "
+          "inside a string is escaped); a body that does not hold exactly its named count is malformed")
+
+    def manifest_for(seqs, objects, version='1.2'):
+        manifest = {'hash_version': 'v1', 'prefix': 'audit/self-test/', 'schema_version': version,
+                    'storage_layout': 'segmented-v1', 'events': []}
+        for seq in seqs:
+            name = next(o for o in objects if record_object_range(o)[0] <= seq <= record_object_range(o)[1])
+            manifest['events'].append({'sequence': seq, 'recomputed_event_hash': events[seq]['event_hash'],
+                                       'object': {'name': name, 'index': seq - record_object_range(name)[0]}})
+        return manifest
+
+    def run(tmp, label, objects, seqs=range(5), fork=None, manifest=None, holders=None):
+        """Write `objects` to a fresh records directory and verify. `fork`
+        replaces one record's bytes in one object: (object name, seq)."""
+        records = Path(tmp) / label
+        records.mkdir()
+        for name in objects:
+            first, last = record_object_range(name)
+            chosen = []
+            for seq in range(first, last + 1):
+                r = raw[seq]
+                if fork == (name, seq):
+                    r = r.replace(b'"input_tokens":11', b'"input_tokens":12')
+                chosen.append(r)
+            data = chosen[0] if name.endswith('.bin') else b''.join(r + b'\n' for r in chosen)
+            (records / name).write_bytes(data)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            passed = verify_manifest_with(local_fetcher(records, report=print),
+                                          manifest or manifest_for(seqs, objects), holders=holders)
+        return passed, out.getvalue(), records
+
+    with tempfile.TemporaryDirectory() as tmp:
+        passed, out, records = run(tmp, 'segmented', [seg(0, 1), seg(2, 4)])
+        check('26c', passed and out.count('PASS seq=') == 5, "a chain stored as segments verifies", out)
+
+        passed, out, _ = run(tmp, 'mixed', [f"{n(0)}.bin", seg(1, 3), f"{n(4)}.bin"])
+        check('26d', passed and out.count('PASS seq=') == 5,
+              "a chain mixing per-record and segment objects verifies", out)
+
+        passed, out, _ = run(tmp, 'overlap', [seg(0, 2), seg(2, 4)])
+        check('26e', passed and out.count('WARN seq=2: segment_overlap') == 1 and 'FAIL' not in out,
+              "a sequence held twice with identical bytes is one WARN segment_overlap, not a failure", out)
+
+        passed, out, _ = run(tmp, 'fork', [seg(0, 2), seg(2, 4)], fork=(seg(2, 4), 2))
+        check('26f', not passed and 'FAIL seq=2: record fetch error: segment_fork' in out
+              and out.count('FAIL') == 1,
+              "a sequence held twice with different bytes fails as segment_fork", out)
+
+        passed, out, _ = run(tmp, 'gap', [seg(0, 1), seg(3, 4)], seqs=[0, 1, 3, 4])
+        check('26g', not passed and 'FAIL seq=3: chain break' in out and out.count('FAIL') == 1,
+              "a hole between segments fails: the record after it does not link to the one before", out)
+
+        passed, out, _ = run(tmp, 'truncated', [seg(0, 1), seg(2, 3)], seqs=range(4))
+        check('26h', passed and out.count('PASS seq=') == 4,
+              "a chain whose segments stop early verifies on the records present", out)
+
+        export = Path(tmp) / 'export'
+        with contextlib.redirect_stdout(io.StringIO()):
+            verify_manifest_with(exporting_fetcher(local_fetcher(records), export),
+                                 manifest_for(range(5), [seg(0, 1), seg(2, 4)]), quiet=True)
+        check('26i', all((export / record_file_name(s)).read_bytes() == raw[s] for s in range(5)),
+              "--export-records splits segments into <seq>.bin files byte-identical to per-record objects")
+
+        wrong = manifest_for(range(5), [seg(0, 1), seg(2, 4)])
+        wrong['events'][3]['object'] = {'name': seg(0, 1), 'index': 1}
+        del wrong['events'][4]['object']
+        passed, out, _ = run(tmp, 'reference', [seg(0, 1), seg(2, 4)], manifest=wrong)
+        elsewhere = manifest_for(range(5), [seg(0, 4)])
+        objects = ChainRecords(lambda lo, hi: [seg(0, 1), seg(2, 4)], lambda name: b'')
+        not_listed = object_reference_problem(elsewhere['events'][0], objects.holders)
+        check('26j', not passed and 'FAIL seq=3: manifest object reference' in out
+              and 'FAIL seq=4: manifest 1.2 entry has no object reference' in out
+              and out.count('FAIL') == 2 and not_listed is not None
+              and object_reference_problem(manifest_for([0], [seg(0, 1)])['events'][0], objects.holders) is None,
+              "a manifest 1.2 object reference must hold its record, and in --bucket mode be listed", out)
+
+        passed, out, records = run(tmp, 'malformed', [seg(0, 1), seg(2, 4)])
+        (records / seg(2, 4)).write_bytes(raw[2] + b'\n' + raw[3] + b'\n')
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            passed = verify_manifest_with(local_fetcher(records), manifest_for(range(5), [seg(0, 1), seg(2, 4)]))
+        out = out.getvalue()
+        check('26k', not passed and all(f'FAIL seq={s}: record fetch error: segment {seg(2, 4)} is malformed' in out
+                                        for s in (2, 3, 4)),
+              "a segment whose body does not hold its named count fails every record it names", out)
+
+    layouts = (manifest_storage_layout_error({'schema_version': '1.1'}),
+               manifest_storage_layout_error({'schema_version': '1.2', 'storage_layout': 'segmented-v1'}),
+               manifest_storage_layout_error({'schema_version': '1.2', 'storage_layout': 'per-record'}),
+               manifest_storage_layout_error({'schema_version': '1.2'}),
+               manifest_storage_layout_error({'schema_version': '1.2', 'storage_layout': 'segmented-v2'}))
+    check('26l', layouts[:3] == (None, None, None) and None not in layouts[3:],
+          "a manifest 1.2 storage_layout is per-record or segmented-v1; absent or unknown is refused (exit 2)",
+          repr(layouts))
+    check('26m', 'segmented-records-v1' in VERIFIER_CAPABILITIES,
+          "VERIFIER_CAPABILITIES advertises segmented-records-v1 (ADR-0081 D9)")
+    return ok
+
+
 def attribution_self_test():
     """MEI-2476 — every FAIL line names the record that failed. A four-record
     v1 chain has record 1 tampered in one way per assertion. Each must print
@@ -7109,9 +7540,10 @@ def anchor_self_test():
 
     errors = (manifest_schema_version_error({"schema_version": "1.1"}),
               manifest_schema_version_error({}),
-              manifest_schema_version_error({"schema_version": "1.2"}))
-    check("25u", errors[0] is None and errors[1] is None and errors[2] is not None,
-          "manifest schema_version 1.0 / 1.1 / absent is understood; anything else is refused (exit 2)",
+              manifest_schema_version_error({"schema_version": "1.2"}),
+              manifest_schema_version_error({"schema_version": "2.0"}))
+    check("25u", errors[0] is None and errors[1] is None and errors[2] is None and errors[3] is not None,
+          "manifest schema_version 1.0 / 1.1 / 1.2 / absent is understood; anything else is refused (exit 2)",
           repr(errors))
     check("25v", "chain-anchors-v1" in VERIFIER_CAPABILITIES,
           "VERIFIER_CAPABILITIES advertises chain-anchors-v1")
@@ -7136,7 +7568,8 @@ def main():
     source.add_argument(
         '--records',
         help=(
-            'Offline mode: a directory of exported chain records (<seq:020d>.bin), '
+            'Offline mode: a directory of chain record objects as the bucket stores them '
+            '(<seq:020d>.bin and <first:020d>-<last:020d>.seg, in any mix), '
             'or a .jsonl / .json file of records. No network, no Google client library.'
         ),
     )
@@ -7145,9 +7578,10 @@ def main():
         '--export-records',
         metavar='DIR',
         help=(
-            'Online mode only: also write every fetched record to DIR/<seq:020d>.bin, '
-            'so the verified chain can be handed to a reviewer who has no bucket access '
-            '(they then run --records DIR).'
+            'Also write every record read to DIR/<seq:020d>.bin, one file per record and '
+            'byte-identical to a per-record object (segments are split), so the verified '
+            'chain can be handed to a reviewer who has no bucket access (they then run '
+            '--records DIR). With --bucket, or with a --records directory.'
         ),
     )
     parser.add_argument(
@@ -7156,7 +7590,7 @@ def main():
         help=(
             'Run encoding self-test against the substrate fixture hashes and exit. '
             'Exercises both the +00:00 fixture and the Z-suffix normalization path, '
-            'the offline --records path on a synthetic chain, and the signature '
+            'the offline --records path on a synthetic chain, segment objects, and the signature '
             'checks (ECDSA test vectors, a tamper matrix, a real Sigstore bundle).'
         ),
     )
@@ -7206,6 +7640,7 @@ def main():
     if args.self_test:
         ok = run_self_test()
         ok = offline_self_test() and ok
+        ok = segment_self_test() and ok
         ok = attribution_self_test() and ok
         ok = content_self_test() and ok
         ok = tool_calls_self_test() and ok
@@ -7215,8 +7650,11 @@ def main():
 
     if not (args.bucket or args.records) or not args.manifest:
         parser.error("--manifest plus one of --bucket / --records is required (or use --self-test)")
-    if args.export_records and not args.bucket:
-        parser.error("--export-records only applies with --bucket")
+    if args.export_records and args.records:
+        if not Path(args.records).is_dir():
+            parser.error("--export-records with --records needs a records directory")
+        if Path(args.export_records).resolve() == Path(args.records).resolve():
+            parser.error("--export-records needs a directory other than --records")
 
     manifest_path = Path(args.manifest)
     if not manifest_path.exists():
@@ -7232,7 +7670,7 @@ def main():
         print(f"ERROR: manifest is not valid JSON: {exc}", file=sys.stderr)
         sys.exit(EXIT_FAIL)
 
-    version_error = manifest_schema_version_error(manifest)
+    version_error = manifest_schema_version_error(manifest) or manifest_storage_layout_error(manifest)
     if version_error:
         print(f"ERROR: {version_error}", file=sys.stderr)
         sys.exit(EXIT_CANNOT_EVALUATE)
@@ -7256,6 +7694,7 @@ def main():
         print(f"Offline verification: records from {args.records}")
         anchors_dir = Path(args.records) / 'anchors'
         anchor_source = DirectoryAnchorSource(anchors_dir) if Path(args.records).is_dir() else None
+        holders = None
     else:
         try:
             from google.cloud import storage as gcs
@@ -7269,12 +7708,14 @@ def main():
 
         client = gcs.Client()
         fetch = gcs_fetcher(args.bucket, manifest.get('prefix', 'audit/'), client)
+        fetch.expect(*manifest_sequence_window(manifest))
+        holders = fetch.holders
         anchor_chain = chain_for_prefix(manifest.get('prefix', 'audit/'))
         anchor_source = BucketAnchorSource(args.bucket, anchor_chain, client) if anchor_chain else None
-        if args.export_records:
-            fetch = exporting_fetcher(fetch, args.export_records)
-            if anchor_source is not None:
-                anchor_source = ExportingAnchorSource(anchor_source, args.export_records)
+    if args.export_records:
+        fetch = exporting_fetcher(fetch, args.export_records)
+        if anchor_source is not None:
+            anchor_source = ExportingAnchorSource(anchor_source, args.export_records)
 
     record_times = {}
     fetch = timestamp_recording_fetcher(fetch, record_times)
@@ -7289,7 +7730,7 @@ def main():
         chain_status = CANNOT_EVALUATE
         anchor_status = CANNOT_EVALUATE
     else:
-        passed = verify_manifest_with(fetch, manifest, require_manifest_hash=signed)
+        passed = verify_manifest_with(fetch, manifest, require_manifest_hash=signed, holders=holders)
         chain_status = PASSED if passed else FAILED
         print()
         anchor_status = verify_anchors(manifest, fetch, anchor_source, tsa_roots.get, record_times)

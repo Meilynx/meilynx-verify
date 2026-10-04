@@ -1,0 +1,22 @@
+{
+  "about": "Seq 2 is held by two segments with byte-identical records (ADR-0081 D7): a WARN segment_overlap, not a failure.",
+  "export_matches_legacy": true,
+  "runs": [
+    {
+      "absent": [
+        "FAIL"
+      ],
+      "args": [
+        "--tsa-root",
+        "test-rsa=roots/rsa-root.der",
+        "--tsa-root",
+        "test-ec=roots/ec-root.der"
+      ],
+      "contains": [
+        "WARN seq=2: segment_overlap: 00000000000000000000-00000000000000000002.seg and 00000000000000000002-00000000000000000004.seg each hold this record, byte-identical",
+        "OK: all 5 events verified"
+      ],
+      "exit": 0
+    }
+  ]
+}

@@ -1,0 +1,2 @@
+# Segment objects (SPEC §1): the line feed after each record is part of the format.
+fixtures/segments/**/*.seg binary

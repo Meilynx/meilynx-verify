@@ -1,0 +1,24 @@
+{
+  "about": "The whole chain stored as two segment objects. Anchors at seq 2 and 4 resolve to their records through the segments.",
+  "export_matches_legacy": true,
+  "runs": [
+    {
+      "absent": [
+        "WARN",
+        "FAIL"
+      ],
+      "args": [
+        "--tsa-root",
+        "test-rsa=roots/rsa-root.der",
+        "--tsa-root",
+        "test-ec=roots/ec-root.der"
+      ],
+      "contains": [
+        "PASS seq=4",
+        "ANCHORS OK: chain=chain_tnt_fixture_run_a anchored_through=4",
+        "OK: all 5 events verified"
+      ],
+      "exit": 0
+    }
+  ]
+}

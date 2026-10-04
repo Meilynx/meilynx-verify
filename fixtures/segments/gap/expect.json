@@ -1,0 +1,18 @@
+{
+  "about": "No object holds seq 2 and later objects exist (ADR-0081 D7). The manifest lists the records present; seq 3 does not link to seq 1, so the chain fails there.",
+  "runs": [
+    {
+      "absent": [
+        "FAIL seq=0",
+        "FAIL seq=1",
+        "FAIL seq=4"
+      ],
+      "args": [],
+      "contains": [
+        "FAIL seq=3: chain break",
+        "PASS seq=4"
+      ],
+      "exit": 1
+    }
+  ]
+}

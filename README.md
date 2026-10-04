@@ -38,8 +38,8 @@ Exit codes, the same online and offline:
 | Code | Meaning |
 |---|---|
 | `0` | Every record verified, and on a signed pack the signature too. An unsigned pack reaches `0` only with `--allow-unsigned`, and the output still says authenticity is not established. |
-| `1` | Verification failed. The output names the first record that failed and why (hash mismatch, chain break, missing record, unknown record kind), why the signature failed, or which chain-head anchor failed and why. |
-| `2` | This verifier cannot evaluate the pack: an unsupported hash version, manifest version, signature method or bundle format (use a newer release), an unusable `--trusted-root`, or an anchor from a witness with no trust root (pass `--tsa-root`). |
+| `1` | Verification failed. The output names the first record that failed and why (hash mismatch, chain break, missing record, unknown record kind, two stored copies of one record that differ), why the signature failed, or which chain-head anchor failed and why. |
+| `2` | This verifier cannot evaluate the pack: an unsupported hash version, manifest version, storage layout, signature method or bundle format (use a newer release), an unusable `--trusted-root`, or an anchor from a witness with no trust root (pass `--tsa-root`). |
 | `3` | The records verified, but the pack is unsigned, so nothing shows who produced the manifest. |
 
 When more than one applies, `1` outranks `2`, and `2` outranks `3`.
@@ -74,16 +74,20 @@ A **pack** is what a Meilynx proxy's `integrity-pack` command produces:
 | File | What it is |
 |---|---|
 | `manifest.json` | The window verified (`from_sequence`..`to_sequence`), the hash algorithm and version, the genesis hash, and one entry per record with the hash the generator recomputed |
-| `records/<seq>.bin` | The chain records themselves, one JSON document per file, named by 20-digit zero-padded sequence number (the layout of the write-once bucket they came from) |
+| `records/<seq>.bin` | The chain records themselves, one JSON document per file, named by 20-digit zero-padded sequence number. This is the per-record layout of the write-once bucket; a chain the bucket stores in segment objects is exported in the same form (see "Segment objects" below). |
 | `manifest.json.sigstore.json` | Present on a signed pack: a Sigstore bundle holding a keyless cosign signature over `manifest.json`, the signing certificate, and the Rekor transparency-log proof |
 | `records/anchors/<seq>.json` and `records/anchors/<seq>.<witness>.tsr` | Present on an anchored chain: the chain-head statement the proxy timestamped, and one RFC 3161 token per witness |
 
 Records are exported alongside the manifest with
 `verify-pack.py --bucket … --export-records DIR` by someone who has read
 access to the bucket, or copied straight out of the bucket prefix. A reviewer
-then runs the offline form above.
+then runs the offline form above. `--export-records` also works with a
+`--records` directory, which turns a copy of a segmented prefix into one file
+per record.
 
-Online form, for a reviewer who has been granted read access to the bucket:
+Online form, for a reviewer who has been granted read access to the bucket
+(`storage.objects.list` and `storage.objects.get`, which
+`roles/storage.objectViewer` holds):
 
 ```bash
 pip install google-cloud-storage && gcloud auth application-default login
@@ -181,6 +185,38 @@ signatures, digests and certificates) and nine offline packs, checks that
 every verdict matches the one the proxy's own verifier gave, and compares
 each token verdict with `openssl ts -verify`.
 
+## Segment objects
+
+A chain's records are stored either one object per record,
+`<seq:020>.bin`, or in segment objects, `<first:020>-<last:020>.seg`, each
+holding up to 1,024 consecutive records separated by line feeds. Each record
+inside a segment is byte-for-byte the per-record object it replaces, and its
+hash is unchanged. The verifier reads both kinds under one chain prefix, in
+any mix, from a bucket or from a records directory. The format is in
+[SPEC.md](SPEC.md) §1, and the pack manifest that records each record's
+segment (version 1.2) in §6.2.
+
+- A record held by two objects with identical bytes prints
+  `WARN seq=<n>: segment_overlap` and verifies once.
+- A record held by two objects with different bytes fails with
+  `segment_fork` (exit `1`).
+- A missing range fails at the first record after it, which does not link to
+  the record before the hole.
+- A chain whose objects stop early verifies on the records present. That is
+  a completeness question, not an integrity failure.
+
+**Upgrade to 0.7.0 or later before verifying a chain written after the
+segment rollout.** An older verifier reports a segmented chain as FAIL
+(missing records) in `--bucket` mode, and exits `2` on a 1.2 manifest. It
+never reports such a chain as a pass.
+
+`fixtures/segments/` holds six packs built from the anchored sample: the
+chain in segments, a mix of both layouts, an identical and a differing
+overlap, a gap and a truncation, each with the exit code and lines it must
+produce. `fixtures/run-segment-cases.py` runs each one offline and against a
+stand-in bucket, and checks that the exported records are byte-identical to
+the anchored sample's per-record objects.
+
 ## What a passing verdict means, and what it does not
 
 A pass proves that, for every record in the window:
@@ -212,9 +248,11 @@ It does **not** prove:
 ## Versions
 
 The verifier understands chain records with `schema_version` v1 through
-v1.13, and pack manifests 1.0 and 1.1 (1.1 adds chain-head anchors). A
-record of an unknown version or kind fails verification rather than being
-skipped; a manifest of an unknown version is cannot evaluate (exit `2`). Changes to the verifier are listed in
+v1.13, stored per record or in segment objects, and pack manifests 1.0, 1.1
+and 1.2 (1.1 adds chain-head anchors, 1.2 the storage layout). A record of an
+unknown version or kind fails verification rather than being skipped; a
+manifest of an unknown version or storage layout is cannot evaluate (exit
+`2`). Changes to the verifier are listed in
 [CHANGELOG.md](CHANGELOG.md). The canonical source of this file is the
 `meilynx-integrity-pack` crate in the proxy; releases here are byte-identical
 copies tagged with the proxy commit they came from.
