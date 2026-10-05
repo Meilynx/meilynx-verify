@@ -92,14 +92,14 @@ Every record carries at least these fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.13"`). Absent means `"v1"`. |
+| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.14"`). Absent means `"v1"`. |
 | `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`). Absent means `llm_request`. |
 | `sequence_number` | integer | Position in the chain, starting at 0. |
 | `timestamp_utc` | string | RFC 3339 UTC timestamp, nanosecond precision, `Z` suffix. |
 | `event_id` | string | Unique id of this record. |
 | `request_id` | string | Id of the request that produced it. |
 | `model_requested` | string | Model the caller asked for (empty for non-LLM kinds). |
-| `action` | string | Governance decision: `allow`, `warn`, `redact`, `mask_output`, `block` (older records may carry `Allow`, `Warn`, `Redact`, `MaskOutput`, `Block`). |
+| `action` | string | Governance decision: `allow`, `warn`, `redact`, `mask_output`, `hold`, `block` (older records may carry `Allow`, `Warn`, `Redact`, `MaskOutput`, `Block`). `hold` appears only on an MCP `mcp_policy_decision` for a tool call waiting on an approver; records sealed before it carry `block` for a held call, with `mcp_event.decision` `require_approval` and a reason starting `rbac_require_approval_hold`. |
 | `input_tokens`, `output_tokens` | integer | Token counts, 0 when not applicable. |
 | `total_tokens`, `cache_creation_input_tokens`, `cache_read_input_tokens`, `cached_input_tokens`, `reasoning_tokens` | integer or absent | Optional token buckets. Absent and `0` hash differently (see §3). |
 | `estimated_cost_usd` | number or null | Estimated cost. |
@@ -299,6 +299,23 @@ with. `keys_json` holds key ids, the last four characters of each key, names
 and usage counts, never key material. The payload on any other version or
 kind, or v1.13 on any other kind, is invalid and fails verification.
 
+**v1.14 MCP kinds**: the v1.12 MCP fields up to and including the three
+`join_context` fields, then one presence byte for the `identity` block:
+`0x00` if the record carries none, else `0x01` followed by the sealed
+identity (§4.5). Then `mcp_event.stage` (optional string). 46 entries
+counting the presence byte, when `identity` is present. A record is v1.14
+exactly when it carries a stage, which only `mcp.policy_decision` records
+do: the check the decision is, one of `access` (membership, session, the
+approval matrix including holds and standing approvals), `limit` (rate limit
+or quota), `tool_call` (content checks over the tool arguments),
+`tool_result` (content checks over the tool result), `taint` (session taint)
+and `adapter_fail_open` (not a proxy check: a coding-agent hook adapter's
+replayed claim that it allowed the tool under fail-open). Every other MCP
+record keeps its v1.12 (or earlier) bucket. A stage on any other version, or
+a v1.14 record without one, is invalid and fails verification, as is v1.14
+on any kind other than the MCP kinds. A v1.14 record's identity, when
+present, is checked as in §4.5.
+
 MCP kinds are: `mcp.tool_call`, `mcp.policy_decision`, `mcp.tool_result`,
 `mcp.tools_list.served`, `mcp.error`, `mcp.catalog_drift`. Any MCP hasher
 called with a non-MCP kind is an error.
@@ -361,9 +378,10 @@ whitespace, strings escaped as in RFC 8785 §3.2.2.2, numbers in ECMAScript
 form (`1.0` → `1`, `1e-7` → `1e-7`, `1e21` → `1e+21`). A plain sorted-keys
 JSON dump differs on numbers and must not be used.
 
-### 4.5 Sealed identity (v1.12)
+### 4.5 Sealed identity (v1.12, v1.14)
 
-A v1.12 record carries an `identity` block naming who called the proxy:
+A v1.12 record carries an `identity` block naming who called the proxy (a
+v1.14 MCP record carries it too, when the proxy resolved one):
 
 | Field | Hashed | Meaning |
 |---|---|---|
@@ -377,7 +395,8 @@ A v1.12 record carries an `identity` block naming who called the proxy:
 
 The asserted labels are stored beside their digest rather than hashed, so a
 reader sees the values and the digest proves they are the ones the proxy
-saw. A verifier therefore checks, for every v1.12 record, that
+saw. A verifier therefore checks, for every v1.12 record and every v1.14
+record that carries an identity, that
 `asserted_digest` equals SHA-256(JCS(`asserted`)). A label rewritten after
 sealing leaves the chain hash intact and fails this check. The labels are
 claims a caller made, never evidence of who it was; only the hashed fields
