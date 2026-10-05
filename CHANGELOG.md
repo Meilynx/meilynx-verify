@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.8.0 (2026-10-05)
+
+- `verify-pack.py` from meilynx-proxy `b44e24c`.
+- **Upgrade before verifying MCP chains written after this release.** A
+  verifier older than 0.8.0 stops at the first `mcp_policy_decision` record
+  with `unknown schema_version 'v1.14'`.
+- Chain v1.14 (SPEC §4.3): every `mcp_policy_decision` record carries
+  `mcp_event.stage`, the check the decision is (`access`, `limit`,
+  `tool_call`, `tool_result`, `taint`, `adapter_fail_open`). The stage is
+  hashed: the v1.12 MCP preimage with the identity block presence-tagged,
+  then the stage. A stage on any other version, or v1.14 without one, fails
+  verification. The asserted-label check (§4.5) runs on a v1.14 record that
+  carries an identity.
+- Action `hold` (SPEC §1): a tool call waiting on an approver is sealed
+  `hold` instead of `block`. Released calls stay `allow`; denied calls and
+  repeats of an approval already used stay `block`. The action is hashed as
+  stored, so the preimage recipe is unchanged.
+- Self-test 27a-d pins two v1.14 fixtures (a `tool_result`-stage allow
+  carrying every earlier axis, and a bare held decision) and the fail-closed
+  cases.
+
 ## 0.7.0 (2026-10-04)
 
 - `verify-pack.py` from meilynx-proxy `ed2bc9f`.

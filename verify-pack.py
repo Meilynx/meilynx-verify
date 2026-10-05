@@ -177,7 +177,8 @@ def normalize_timestamp(ts):
 #   event_id                     UTF-8 bytes
 #   request_id                   UTF-8 bytes
 #   model_requested              UTF-8 bytes
-#   action                       UTF-8 bytes ("Allow","Warn","Redact","MaskOutput","Block")
+#   action                       UTF-8 bytes of the stored snake_case string ("allow", "warn",
+#                                "redact", "mask_output", "hold", "block")
 #   input_tokens                 u32 little-endian (4 bytes)
 #   output_tokens                u32 little-endian (4 bytes)
 #   total_tokens                 presence byte (0=None, 1=Some) + u64 LE if Some
@@ -1037,12 +1038,16 @@ def check_sealed_identity(event):
     are the labels the record was sealed over: recompute `asserted_digest`
     from `identity.asserted`. The labels are stored-not-hashed, so a rewritten
     label leaves the chain hash intact; this check is what catches it. Returns
-    a list of problems; empty means the identity checks out. Records on any
-    other schema version carry no identity and return no problems."""
+    a list of problems; empty means the identity checks out. MEI-2898 — a
+    v1.14 MCP record carries the identity forward, optionally: checked when
+    present. Records on any other schema version carry no identity and return
+    no problems."""
     version = event.get('schema_version') or 'v1'
-    if version != 'v1.12':
-        return []
     identity = event.get('identity')
+    if version == 'v1.14' and identity is None:
+        return []
+    if version not in ('v1.12', 'v1.14'):
+        return []
     if not isinstance(identity, dict):
         return [f"{version} record has no identity block"]
     problems = []
@@ -1153,6 +1158,66 @@ def compute_event_hash_v1_12_mcp(
     return h.hexdigest()
 
 
+MCP_DECISION_STAGES = ('access', 'limit', 'tool_call', 'tool_result', 'taint', 'adapter_fail_open')
+
+
+def compute_event_hash_v1_14_mcp(
+    event_kind,
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    mcp_event, join_context, identity,
+):
+    """MEI-2898 — v1.14 mcp.* hash: the v1.12 layout with the identity block
+    presence-tagged (1-byte tag, then the block; 0 alone when absent), then
+    the decision stage's wire name with the same presence tag every optional
+    string uses. Mirror of `compute_event_hash_v1_14_mcp` in sqlite.rs.
+    v1.13 is the coverage key-inventory bucket, so the MCP lane skips to
+    v1.14. The v1.12 feeds are DUPLICATED here, not shared."""
+    if event_kind not in MCP_EVENT_KINDS:
+        raise ValueError(
+            f"MEI-2898: compute_event_hash_v1_14_mcp called with non-MCP kind {event_kind!r}"
+        )
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(event_kind.encode('utf-8'))
+    h.update(mcp_event['virtual_server'].encode('utf-8'))
+    h.update(mcp_event['upstream_slug'].encode('utf-8'))
+    h.update(mcp_event['method'].encode('utf-8'))
+    h.update(encode_optional_str(mcp_event.get('tool_name')))
+    h.update(encode_optional_str(mcp_event.get('jsonrpc_id')))
+    h.update(mcp_event['protocol_version'].encode('utf-8'))
+    h.update(encode_optional_str(mcp_event.get('decision')))
+    h.update(encode_optional_str(mcp_event.get('reason')))
+    h.update(encode_optional_str(mcp_event.get('payload_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('mcp_bundle_sha256')))
+    h.update(encode_optional_str(mcp_event.get('correlated_event_id')))
+    h.update(encode_optional_i64(mcp_event.get('error_code')))
+    h.update(mcp_event['traceparent'].encode('utf-8'))
+    h.update(encode_principal_chain(mcp_event['principal_chain']))
+    h.update(encode_optional_str(mcp_event.get('redacted_payload_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('redaction_pre_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('redaction_post_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('hold_id')))
+    join = join_context or {}
+    h.update(encode_optional_str(join.get('correlation_id')))
+    h.update(encode_optional_str(join.get('session_id')))
+    h.update(encode_optional_str(join.get('agent_name')))
+    if identity is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(encode_sealed_identity(identity))
+    # MEI-2898 — the v1.14 addition.
+    h.update(encode_optional_str(mcp_event.get('stage')))
+    return h.hexdigest()
+
+
 def _on_behalf_of_is_verified(mcp_event):
     """Mirror of `PrincipalChain::on_behalf_of_is_verified`: a verified leg is
     present AND marked `verified`; an unmarked leg is asserted (fail-safe)."""
@@ -1210,10 +1275,17 @@ def compute_event_hash_dispatch(
     # MEI-2646 — ADR-0013 A: fail closed. The sealed identity enters only the
     # v1.12 preimage (both lanes); on any other version it would sit on the
     # record unhashed, rewritable without breaking the chain.
-    if identity is not None and schema_version != 'v1.12':
+    if identity is not None and schema_version not in ('v1.12', 'v1.14'):
         raise ValueError(
             f"MEI-2646: identity block present on a {schema_version!r} event — "
-            f"it is hashed only in the v1.12 bucket."
+            f"it is hashed only in the v1.12 bucket (and the MCP v1.14 bucket that "
+            f"carries it forward)."
+        )
+    # MEI-2898 — the decision stage enters only the v1.14 preimage.
+    if mcp_event is not None and mcp_event.get('stage') is not None and schema_version != 'v1.14':
+        raise ValueError(
+            f"MEI-2898: decision stage present on a {schema_version!r} event — "
+            f"it is hashed only in the v1.14 bucket."
         )
     # MEI-2646 — the hashed delegated_human and the stored-not-hashed MEI-2633
     # attestation marker must agree.
@@ -1223,10 +1295,11 @@ def compute_event_hash_dispatch(
                 "MEI-2646: identity.delegated_human disagrees with the principal chain's "
                 "on_behalf_of_attestation — the two must agree"
             )
-    if join_context is not None and schema_version not in ('v1.9', 'v1.10', 'v1.11', 'v1.12'):
+    if join_context is not None and schema_version not in ('v1.9', 'v1.10', 'v1.11', 'v1.12', 'v1.14'):
         raise ValueError(
             f"MEI-2151: join_context present on a {schema_version!r} event — "
-            f"caller-asserted join keys are hashed only in the v1.9, v1.10, v1.11 and v1.12 buckets."
+            f"caller-asserted join keys are hashed only in the v1.9, v1.10, v1.11, v1.12 "
+            f"and v1.14 buckets."
         )
     if schema_version in ('v1', 'v1.1'):
         return compute_event_hash(
@@ -1507,6 +1580,31 @@ def compute_event_hash_dispatch(
         raise ValueError(
             f"MEI-2646: schema_version v1.12 is defined only for llm_request "
             f"and mcp.* events; got event_kind {event_kind!r}"
+        )
+    if schema_version == 'v1.14':
+        # MEI-2898 — the MCP decision-stage bucket: the v1.12 mcp.* preimage
+        # with the identity block presence-tagged, then the stage. Stamped
+        # exactly when the record carries a stage, which only
+        # mcp.policy_decision records do.
+        if event_kind not in MCP_EVENT_KINDS:
+            raise ValueError(
+                f"MEI-2898: schema_version v1.14 is defined only for mcp.* events; "
+                f"got event_kind {event_kind!r}"
+            )
+        if mcp_event is None:
+            raise ValueError(f"MEI-2898: {event_kind!r} event missing mcp_event payload")
+        if mcp_event.get('stage') is None:
+            raise ValueError(
+                "MEI-2898: schema_version v1.14 requires a decision stage; a record "
+                "sealed without one must stay in its pre-v1.14 bucket."
+            )
+        return compute_event_hash_v1_14_mcp(
+            event_kind,
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            mcp_event, join_context, identity,
         )
     raise ValueError(
         f"MEI-639: unknown schema_version {schema_version!r} — "
@@ -2303,6 +2401,108 @@ def run_self_test():
               f'edited detected: {edited_detected}, bare problems: {check_llm_content(bare)}', file=sys.stderr)
         ok = False
 
+    # MEI-2898 Assertion 27a — the v1.14 mcp.policy_decision fixtures (direct
+    # fn): every earlier axis carried forward under a tool_result-stage allow,
+    # and the bare shape (absent identity and join keys) of a call held at the
+    # access stage with action "hold". Paired with
+    # mei2898_v1_14_fixture_hashes_pinned.
+    for label, payload, join, identity, action, expected in (
+        ('27a', _V1_14_MCP_DECISION_FIXTURE_PAYLOAD, _V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD,
+         _V1_12_IDENTITY_T2_FIXTURE_PAYLOAD, 'allow', V1_14_MCP_DECISION_FIXTURE_HASH),
+        ('27a-hold', _V1_14_MCP_HOLD_FIXTURE_PAYLOAD, None, None, 'hold', V1_14_MCP_HOLD_FIXTURE_HASH),
+    ):
+        got = compute_event_hash_v1_14_mcp(
+            EVENT_KIND_MCP_POLICY_DECISION, mcp_event=payload, join_context=join,
+            identity=identity, **dict(mcp_fixture_args, action=action),
+        )
+        if got == expected:
+            print(f'SELF-TEST assertion {label} PASS: v1.14 mcp.policy_decision fixture hash matches')
+        else:
+            print(f'SELF-TEST assertion {label} FAIL: v1.14 mcp.policy_decision fixture drift', file=sys.stderr)
+            print(f'  expected: {expected}', file=sys.stderr)
+            print(f'  got:      {got}', file=sys.stderr)
+            ok = False
+
+    # MEI-2898 Assertion 27b — both fixtures through the production recompute
+    # path from synthetic exported-JSON bodies, and the identity label check
+    # on a v1.14 record (present: checked; absent: nothing to check).
+    for label, payload, join, identity, action, expected in (
+        ('27b', _V1_14_MCP_DECISION_FIXTURE_PAYLOAD, _V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD,
+         _V1_12_IDENTITY_T2_FIXTURE_PAYLOAD, 'allow', V1_14_MCP_DECISION_FIXTURE_HASH),
+        ('27b-hold', _V1_14_MCP_HOLD_FIXTURE_PAYLOAD, None, None, 'hold', V1_14_MCP_HOLD_FIXTURE_HASH),
+    ):
+        ev = dict(
+            schema_version='v1.14', event_kind='mcp_policy_decision',
+            timestamp_utc=ts_1760.replace('+00:00', 'Z'),
+            event_id='evt-mcp-fixture', request_id='req-mcp-fixture',
+            model_requested='', action=action, input_tokens=0, output_tokens=0,
+            mcp_event=dict(payload),
+        )
+        if join is not None:
+            ev['join_context'] = dict(join)
+        if identity is not None:
+            ev['identity'] = dict(identity)
+        got = recompute_event_hash(ev, 11, 'prev-fixture')
+        if got == expected and not check_sealed_identity(ev):
+            print(f'SELF-TEST assertion {label} PASS: verify_manifest recompute path handles v1.14')
+        else:
+            print(f'SELF-TEST assertion {label} FAIL: recompute_event_hash mis-hashes v1.14 '
+                  f'or the identity check rejected an intact record', file=sys.stderr)
+            print(f'  expected: {expected}', file=sys.stderr)
+            print(f'  got:      {got}', file=sys.stderr)
+            ok = False
+
+    # MEI-2898 Assertion 27c — the stage is attested: each stage, and its
+    # absence, gives a different hash; and the action is attested too, so a
+    # hold rewritten to block (or the reverse) breaks the chain.
+    seen = set()
+    for stage in MCP_DECISION_STAGES:
+        seen.add(compute_event_hash_v1_14_mcp(
+            EVENT_KIND_MCP_POLICY_DECISION, mcp_event=dict(_V1_14_MCP_HOLD_FIXTURE_PAYLOAD, stage=stage),
+            join_context=None, identity=None, **dict(mcp_fixture_args, action='hold'),
+        ))
+    seen.add(compute_event_hash_v1_14_mcp(
+        EVENT_KIND_MCP_POLICY_DECISION, mcp_event=dict(_V1_14_MCP_HOLD_FIXTURE_PAYLOAD, stage=None),
+        join_context=None, identity=None, **dict(mcp_fixture_args, action='hold'),
+    ))
+    as_block = compute_event_hash_v1_14_mcp(
+        EVENT_KIND_MCP_POLICY_DECISION, mcp_event=_V1_14_MCP_HOLD_FIXTURE_PAYLOAD,
+        join_context=None, identity=None, **dict(mcp_fixture_args, action='block'),
+    )
+    if len(seen) == len(MCP_DECISION_STAGES) + 1 and as_block != V1_14_MCP_HOLD_FIXTURE_HASH:
+        print('SELF-TEST assertion 27c PASS: every stage and the hold action are attested')
+    else:
+        print('SELF-TEST assertion 27c FAIL: two stages (or hold and block) hash the same', file=sys.stderr)
+        ok = False
+
+    # MEI-2898 Assertion 27d — the fail-closed invariants: a stage on any other
+    # bucket is a hard error, v1.14 without a stage is a hard error, and v1.14
+    # is defined only for mcp.* events.
+    rejected = 0
+    for version in ('v1.5', 'v1.7', 'v1.9', 'v1.12'):
+        try:
+            compute_event_hash_dispatch(
+                version, event_kind=EVENT_KIND_MCP_POLICY_DECISION,
+                mcp_event=_V1_14_MCP_HOLD_FIXTURE_PAYLOAD, **mcp_fixture_args,
+            )
+        except ValueError as e:
+            rejected += 'MEI-2898' in str(e)
+    for kwargs in (
+        dict(event_kind=EVENT_KIND_MCP_POLICY_DECISION,
+             mcp_event=dict(_V1_14_MCP_HOLD_FIXTURE_PAYLOAD, stage=None)),
+        dict(event_kind=EVENT_KIND_LLM_REQUEST),
+    ):
+        try:
+            compute_event_hash_dispatch('v1.14', **kwargs, **mcp_fixture_args)
+        except ValueError as e:
+            rejected += 'MEI-2898' in str(e)
+    if rejected == 6:
+        print('SELF-TEST assertion 27d PASS: a stage outside v1.14, v1.14 without a stage, '
+              'and v1.14 on a non-MCP kind are rejected')
+    else:
+        print(f'SELF-TEST assertion 27d FAIL: only {rejected} of 6 fail-closed cases rejected', file=sys.stderr)
+        ok = False
+
     # MEI-2151 Assertion 17e — the fail-closed invariant: a join_context on any
     # bucket other than v1.9 is a hard error, not a silently-unhashed field.
     # Mirror of the Rust dispatcher guard. This is the assertion that would
@@ -2637,6 +2837,40 @@ V1_12_LLM_REQUEST_FIXTURE_HASH = "62826a249c726dd87608fa0c05db6387b045b9583e76fa
 V1_12_LLM_REQUEST_BARE_FIXTURE_HASH = "99ab7d921ff414be33abe689efb6671b13b32a274c868c72b4868461c2f29e96"
 V1_12_MCP_TOOL_CALL_FIXTURE_HASH = "c2f71dbf0ff7e00ac709c6b5a4f44222edf2d1ef29324252f6961f8cc6311780"
 
+# MEI-2898 — v1.14 mcp.policy_decision fixtures. Paired with
+# meilynx-audit/tests/mei2898_decision_stage_chain_round_trip.rs and the
+# control plane's McpEvidenceChainHasherTests. The first carries every axis
+# forward (redaction, join, a T2 identity) under a tool_result-stage allow; the
+# second is the bare shape (no identity, no join keys: both presence tags
+# absent) of a call held at the access stage, sealed with action "hold".
+_V1_14_MCP_DECISION_FIXTURE_PAYLOAD = dict(
+    _V1_12_MCP_TOOL_CALL_FIXTURE_PAYLOAD,
+    decision='allow',
+    reason='allow',
+    correlated_event_id='evt-mcp-result',
+    stage='tool_result',
+)
+_V1_14_MCP_HOLD_FIXTURE_PAYLOAD = dict(
+    virtual_server='crm',
+    upstream_slug='crm',
+    method='tools/call',
+    tool_name='crm__send_client_email',
+    jsonrpc_id='43',
+    protocol_version='2026-07-28',
+    decision='require_approval',
+    reason='rbac_require_approval_hold:rule-42',
+    correlated_event_id='evt-mcp-call',
+    mcp_bundle_sha256='a' * 64,
+    traceparent='00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01',
+    principal_chain=dict(
+        authenticated=dict(kind='agent', agent_ref='agt_01J9ZK3Q7R8S9T0V1W2X3Y4Z5A'),
+    ),
+    hold_id='hold-0123456789abcdef',
+    stage='access',
+)
+V1_14_MCP_DECISION_FIXTURE_HASH = "d36fa042cb3e49ada8f7b1807e10251a1a7dd64b9e40317990e38e9aaa3476e6"
+V1_14_MCP_HOLD_FIXTURE_HASH = "b0a1b82c017b9385df9e8e056fc42d23e3e86ff220d947828d5b34c0353e94f2"
+
 # MEI-2456 — tool-call digest fixture. Paired with
 # meilynx-proxy/src/audit_capture.rs::tool_call_digests_are_pinned_for_the_verifier:
 # the record's `tool_calls` exactly as the proxy serializes them, and the
@@ -2674,8 +2908,11 @@ _V1_2_AUTH_FIXTURE_PAYLOAD = dict(
 def action_str(event):
     """
     Extract the action string from the stored event JSON.
-    GovernanceAction serializes as a string: "Allow", "Warn", "Redact",
-    "MaskOutput", "Block".
+    GovernanceAction serializes as its snake_case string ("allow", "warn",
+    "redact", "mask_output", "hold", "block") and is hashed verbatim.
+    MEI-2897 — "hold" is a held MCP call waiting on approval; records sealed
+    before it carry "block" for a held call, with mcp_event.decision
+    "require_approval" and an rbac_require_approval_hold reason.
     """
     a = event.get('action', 'Allow')
     if isinstance(a, str):
