@@ -5,7 +5,7 @@ enough that a verifier can be written from it without reading Meilynx code.
 `verify-pack.py` in this repository is one such verifier; its `--self-test`
 pins the values below against fixture hashes.
 
-Status: describes chain records with `schema_version` v1 through v1.13, the
+Status: describes chain records with `schema_version` v1 through v1.16, the
 per-record and segment storage layouts, and pack manifest `schema_version`
 1.0, 1.1 and 1.2, as read by `verify-pack.py` from meilynx-proxy commit
 `ed2bc9f` (2026-10-04). The segment layout and manifest 1.2 are specified
@@ -92,8 +92,8 @@ Every record carries at least these fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.14"`). Absent means `"v1"`. |
-| `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`). Absent means `llm_request`. |
+| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.16"`). Absent means `"v1"`. |
+| `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`, `decision_receipt`). Absent means `llm_request`. |
 | `sequence_number` | integer | Position in the chain, starting at 0. |
 | `timestamp_utc` | string | RFC 3339 UTC timestamp, nanosecond precision, `Z` suffix. |
 | `event_id` | string | Unique id of this record. |
@@ -320,6 +320,50 @@ MCP kinds are: `mcp.tool_call`, `mcp.policy_decision`, `mcp.tool_result`,
 `mcp.tools_list.served`, `mcp.error`, `mcp.catalog_drift`. Any MCP hasher
 called with a non-MCP kind is an error.
 
+**v1.15 `decision.receipt`** — from `decision_receipt`, after the kind
+attestation: `receipt_id`, `receipt_type`, `receipt_type_version`,
+`registry_digest`, `source_kind`, `source_ref` (strings),
+`subject_ref_sha256` (optional string), `evidence_set_sha256` (string),
+`policy_version` (optional string), `outcome` (string),
+`outcome_reason_code`, `outcome_reason_sha256`, `decider_user_id`,
+`decider_role`, `decider_identity_provenance` (optional strings),
+`credential_status` (string), `credential_class`, `credential_registry`
+(optional strings), `credential_verified_at` (optional i64),
+`procedure_status` (string), `procedure_id`, `procedure_version`,
+`procedure_document_sha256` (optional strings), `procedure_effective_at`
+(optional i64), `clock_rule`, `clock_start_basis` (strings),
+`clock_started_at`, `clock_deadline_at` (i64, Unix seconds),
+`clock_decided_at`, `clock_elapsed_seconds` (optional i64), `clock_status`
+(string), `held_before_use` (optional bool: one presence byte, then `0x01`
+or `0x00`), `supersedes_receipt_id` (optional string), `cp_anchor_event_id`,
+`cp_anchor_event_hash` (strings), `issued_at` (i64). 52 fields. The record's
+`request_id` equals its `event_id`, `model_requested` is empty and the token
+and cost fields are zero or absent. The stored `evidence` list is outside the
+preimage; the verifier recomputes its RFC 8785 digest and requires it to
+equal `evidence_set_sha256`. It also requires `clock_elapsed_seconds` and
+`clock_status` to follow from the three clock timestamps (`within` when the
+decision time is at or before the deadline, `breached` after it, `lapsed`
+with no decision time), a `decider_user_id` exactly when `outcome` is not
+`lapsed`, class, registry and verification time when `credential_status` is
+`verified`, id and version when `procedure_status` is `recorded`, and the
+base `action` to be the outcome's projection (`approved` → `allow`,
+`escalated` → `hold`, `rejected` and `lapsed` → `block`). `decision.receipt`
+on any other version, or v1.15 on any other kind, is invalid and fails
+verification.
+
+**v1.16 `llm_request`** — the v1.12 `llm_request` layout with the
+`identity` block presence-tagged as in the v1.14 MCP kinds (`0x00` when the
+record carries none, else `0x01` followed by the sealed identity, §4.5),
+then `evaluation_trace.outcomes_sha256_jcs` (string). A record is v1.16
+exactly when it carries an `evaluation_trace`: the per-rule outcomes of the
+governance evaluation and the request's delivery outcome, stored under
+`evaluation_trace.outcomes` and bound by that digest, which the verifier
+recomputes (RFC 8785). The trace's timing fields are stored but not hashed.
+A trace on any other version, or a v1.16 record without one, is invalid and
+fails verification, as is v1.16 on any kind other than `llm_request`. A
+v1.16 record's `content` block, when present, is checked as in §4.4, and its
+identity as in §4.5.
+
 `*_sha256_jcs` values are hex SHA-256 digests over the JSON Canonicalization
 Scheme (RFC 8785) serialization of the payload in question. For MCP records
 the verifier checks that the digest string is what the record hashed; it does
@@ -328,7 +372,7 @@ the record. For LLM records with a `content` block (v1.10, v1.11, v1.12) it
 also recomputes the stored-content digests (§4.4), and for v1.12 records the
 asserted-claims digest (§4.5).
 
-### 4.4 LLM content attestation (v1.10, v1.11, v1.12)
+### 4.4 LLM content attestation (v1.10, v1.11, v1.12, v1.16)
 
 `capture_policy` names what the record retains:
 
@@ -353,7 +397,7 @@ The six `content` fields:
 
 Because the digests are in the preimage and the content they describe is in
 the record, a verifier checks, for every v1.10 and v1.11 record and every
-v1.12 record that carries a `content` block:
+v1.12 or v1.16 record that carries a `content` block:
 
 1. `stored_prompt_sha256_jcs`, when present, equals SHA-256(JCS(`messages`));
    when absent, `messages` is empty.
@@ -378,7 +422,7 @@ whitespace, strings escaped as in RFC 8785 §3.2.2.2, numbers in ECMAScript
 form (`1.0` → `1`, `1e-7` → `1e-7`, `1e21` → `1e+21`). A plain sorted-keys
 JSON dump differs on numbers and must not be used.
 
-### 4.5 Sealed identity (v1.12, v1.14)
+### 4.5 Sealed identity (v1.12, v1.14, v1.16)
 
 A v1.12 record carries an `identity` block naming who called the proxy (a
 v1.14 MCP record carries it too, when the proxy resolved one):
@@ -395,7 +439,7 @@ v1.14 MCP record carries it too, when the proxy resolved one):
 
 The asserted labels are stored beside their digest rather than hashed, so a
 reader sees the values and the digest proves they are the ones the proxy
-saw. A verifier therefore checks, for every v1.12 record and every v1.14
+saw. A verifier therefore checks, for every v1.12 record and every v1.14 or v1.16
 record that carries an identity, that
 `asserted_digest` equals SHA-256(JCS(`asserted`)). A label rewritten after
 sealing leaves the chain hash intact and fails this check. The labels are
@@ -743,7 +787,10 @@ since; the chain hashes attest the records.
   On v1.12 records the caller's asserted labels are bound through
   `asserted_digest` (§4.5), and the principal chain's
   `on_behalf_of_attestation` marker is stored but not hashed; the hashed
-  `delegated_human` must agree with it.
+  `delegated_human` must agree with it. On v1.15 records the `evidence`
+  list is stored but not hashed; `evidence_set_sha256` binds it (§4.3). On
+  v1.16 records the evaluation trace's timing is stored but not hashed; its
+  outcomes are bound by `outcomes_sha256_jcs` (§4.3).
 - **Whether a detector missed something.** Under `redacted`, only spans a
   detector located are masked. The stored copy can still contain sensitive
   text no detector recognized.
