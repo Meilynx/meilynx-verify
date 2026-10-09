@@ -248,7 +248,7 @@ It does **not** prove:
 ## Versions
 
 The verifier understands chain records with `schema_version` v1 through
-v1.16, stored per record or in segment objects, and pack manifests 1.0, 1.1
+v1.14, stored per record or in segment objects, and pack manifests 1.0, 1.1
 and 1.2 (1.1 adds chain-head anchors, 1.2 the storage layout). A record of an
 unknown version or kind fails verification rather than being skipped; a
 manifest of an unknown version or storage layout is cannot evaluate (exit
