@@ -140,13 +140,7 @@ SUPPORTED_MANIFEST_SCHEMA_VERSIONS = ("1.0", "1.1", "1.2")
 # feature the public verifier would silently skip. `segmented-records-v1`
 # reads segment objects; the gate requires it of the public release once a
 # proxy build contains crates/meilynx-audit/src/segment_writer.rs (ADR-0081 D9).
-# `decision-receipts-v1` (MEI-2989, ADR-0086 D6) reads v1.15 decision.receipt
-# records and recomputes their evidence-set digest and clock arithmetic.
-# `evaluation-trace-v1` (MEI-3037, ADR-0087) reads v1.16 llm_request records
-# and recomputes their evaluation outcome digest.
-VERIFIER_CAPABILITIES = frozenset(
-    {"chain-anchors-v1", "segmented-records-v1", "decision-receipts-v1", "evaluation-trace-v1"}
-)
+VERIFIER_CAPABILITIES = frozenset({"chain-anchors-v1", "segmented-records-v1"})
 
 # Exit codes (listed in the module docstring).
 EXIT_OK = 0
@@ -284,8 +278,6 @@ EVENT_KIND_COVERAGE_COMPUTED = 'coverage.computed'
 # MEI-2641 (ADR-0052 dated edit 2026-10-01) — the provider-key inventory kind
 # (v1.13 bucket).
 EVENT_KIND_COVERAGE_KEY_INVENTORY = 'coverage.key_inventory'
-# MEI-2989 (ADR-0086) — the decision receipt kind (v1.15 bucket).
-EVENT_KIND_DECISION_RECEIPT = 'decision.receipt'
 
 MCP_EVENT_KINDS = {
     EVENT_KIND_MCP_TOOL_CALL,
@@ -312,8 +304,6 @@ SERDE_EVENT_KIND_TO_WIRE = {
     'coverage_computed': EVENT_KIND_COVERAGE_COMPUTED,
     # MEI-2641 — serde snake_case form of the v1.13 kind.
     'coverage_key_inventory': EVENT_KIND_COVERAGE_KEY_INVENTORY,
-    # MEI-2989 — serde snake_case form of the v1.15 kind.
-    'decision_receipt': EVENT_KIND_DECISION_RECEIPT,
 }
 
 
@@ -721,153 +711,6 @@ def compute_event_hash_v1_13_coverage_key_inventory(
     return h.hexdigest()
 
 
-# MEI-2989 (ADR-0086 D1) — the 36 receipt fields in preimage order, with how
-# each feeds: required utf-8 string, optional string (presence tag), required
-# i64 LE, optional i64 (presence tag + LE), optional bool (presence tag + byte).
-DECISION_RECEIPT_FEED = (
-    ('receipt_id', 'str'), ('receipt_type', 'str'), ('receipt_type_version', 'str'),
-    ('registry_digest', 'str'), ('source_kind', 'str'), ('source_ref', 'str'),
-    ('subject_ref_sha256', 'opt_str'), ('evidence_set_sha256', 'str'),
-    ('policy_version', 'opt_str'), ('outcome', 'str'),
-    ('outcome_reason_code', 'opt_str'), ('outcome_reason_sha256', 'opt_str'),
-    ('decider_user_id', 'opt_str'), ('decider_role', 'opt_str'),
-    ('decider_identity_provenance', 'opt_str'), ('credential_status', 'str'),
-    ('credential_class', 'opt_str'), ('credential_registry', 'opt_str'),
-    ('credential_verified_at', 'opt_i64'), ('procedure_status', 'str'),
-    ('procedure_id', 'opt_str'), ('procedure_version', 'opt_str'),
-    ('procedure_document_sha256', 'opt_str'), ('procedure_effective_at', 'opt_i64'),
-    ('clock_rule', 'str'), ('clock_start_basis', 'str'),
-    ('clock_started_at', 'i64'), ('clock_deadline_at', 'i64'),
-    ('clock_decided_at', 'opt_i64'), ('clock_elapsed_seconds', 'opt_i64'),
-    ('clock_status', 'str'), ('held_before_use', 'opt_bool'),
-    ('supersedes_receipt_id', 'opt_str'), ('cp_anchor_event_id', 'str'),
-    ('cp_anchor_event_hash', 'str'), ('issued_at', 'i64'),
-)
-
-
-def compute_event_hash_v1_15_decision_receipt(
-    sequence_number, timestamp_utc, event_id, request_id,
-    model_requested, action, input_tokens, output_tokens,
-    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
-    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
-    receipt,
-):
-    """MEI-2989 (ADR-0086 D1/D6) — v1.15 decision.receipt hash. `receipt` is a
-    dict matching `DecisionReceiptFields`. Mirror of
-    `compute_event_hash_v1_15_decision_receipt` in sqlite.rs and
-    `DecisionReceiptChainHasher.ComputeV115` on the control plane: the SAME
-    v1.2 prefix, then the event_kind wire-name, then the 36 receipt fields in
-    `DECISION_RECEIPT_FEED` order. The stored `evidence` list is outside the
-    preimage; `evidence_set_sha256` binds it (see `check_decision_receipt`)."""
-    h = _v1_2_prefix_hash(
-        sequence_number, timestamp_utc, event_id, request_id,
-        model_requested, action, input_tokens, output_tokens,
-        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
-        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
-    )
-    h.update(EVENT_KIND_DECISION_RECEIPT.encode('utf-8'))
-    for name, kind in DECISION_RECEIPT_FEED:
-        value = receipt.get(name)
-        if kind == 'str':
-            h.update(str(value if value is not None else '').encode('utf-8'))
-        elif kind == 'opt_str':
-            h.update(encode_optional_str(value))
-        elif kind == 'i64':
-            h.update(struct.pack('<q', int(value)))
-        elif kind == 'opt_i64':
-            if value is None:
-                h.update(b'\x00')
-            else:
-                h.update(b'\x01' + struct.pack('<q', int(value)))
-        elif kind == 'opt_bool':
-            if value is None:
-                h.update(b'\x00')
-            else:
-                h.update(b'\x01' + (b'\x01' if bool(value) else b'\x00'))
-    return h.hexdigest()
-
-
-RECEIPT_OUTCOME_TO_ACTION = {'approved': 'allow', 'escalated': 'hold', 'rejected': 'block', 'lapsed': 'block'}
-
-
-def check_decision_receipt(event):
-    """MEI-2989 (ADR-0086 D6) — for a v1.15 record, check what the hash alone
-    cannot: the stored `evidence` list hashes to `evidence_set_sha256`; the
-    sealed clock arithmetic (`clock_elapsed_seconds`, `clock_status`) follows
-    from the three timestamps; a `verified` credential carries its class,
-    registry and verification time; a `recorded` procedure carries its id and
-    version; a decider is present exactly when someone decided; and the base
-    `action` is the outcome's projection. Returns a list of problems; empty
-    means the receipt checks out. Records on any other schema version carry no
-    receipt and return no problems."""
-    if (event.get('schema_version') or 'v1') != 'v1.15':
-        return []
-    receipt = event.get('decision_receipt')
-    if not isinstance(receipt, dict):
-        return ['v1.15 record carries no decision_receipt payload']
-    problems = []
-    rid = receipt.get('receipt_id', '?')
-
-    evidence = receipt.get('evidence')
-    if evidence is None:
-        evidence = []
-    recomputed = sha256_jcs(evidence)
-    if recomputed != receipt.get('evidence_set_sha256'):
-        problems.append(
-            f"decision receipt {rid}: stored evidence list hashes to {recomputed}, "
-            f"not the sealed evidence_set_sha256 {receipt.get('evidence_set_sha256')}"
-        )
-
-    outcome = receipt.get('outcome')
-    decided = receipt.get('clock_decided_at')
-    started = receipt.get('clock_started_at')
-    deadline = receipt.get('clock_deadline_at')
-    status = receipt.get('clock_status')
-    if outcome == 'lapsed':
-        if receipt.get('decider_user_id') is not None:
-            problems.append(f"decision receipt {rid}: a lapsed receipt names a decider")
-        if decided is not None or receipt.get('clock_elapsed_seconds') is not None:
-            problems.append(f"decision receipt {rid}: a lapsed receipt carries a decision time")
-        if status != 'lapsed':
-            problems.append(f"decision receipt {rid}: outcome lapsed but clock_status {status!r}")
-    else:
-        if receipt.get('decider_user_id') is None:
-            problems.append(f"decision receipt {rid}: a decided receipt names no decider")
-        if decided is None or started is None or deadline is None:
-            problems.append(f"decision receipt {rid}: a decided receipt is missing a clock timestamp")
-        else:
-            elapsed = int(decided) - int(started)
-            if receipt.get('clock_elapsed_seconds') != elapsed:
-                problems.append(
-                    f"decision receipt {rid}: sealed clock_elapsed_seconds "
-                    f"{receipt.get('clock_elapsed_seconds')} but the timestamps give {elapsed}"
-                )
-            expected = 'within' if int(decided) <= int(deadline) else 'breached'
-            if status != expected:
-                problems.append(
-                    f"decision receipt {rid}: sealed clock_status {status!r} but the timestamps give {expected!r}"
-                )
-
-    if receipt.get('credential_status') == 'verified' and (
-        receipt.get('credential_class') is None or receipt.get('credential_registry') is None
-        or receipt.get('credential_verified_at') is None
-    ):
-        problems.append(f"decision receipt {rid}: credential_status verified without class, registry and verification time")
-    if receipt.get('procedure_status') == 'recorded' and (
-        receipt.get('procedure_id') is None or receipt.get('procedure_version') is None
-    ):
-        problems.append(f"decision receipt {rid}: procedure_status recorded without id and version")
-
-    expected_action = RECEIPT_OUTCOME_TO_ACTION.get(outcome)
-    if expected_action is None:
-        problems.append(f"decision receipt {rid}: unknown outcome {outcome!r}")
-    elif action_str(event) != expected_action:
-        problems.append(
-            f"decision receipt {rid}: base action {action_str(event)!r} is not the projection of outcome {outcome!r} ({expected_action!r})"
-        )
-    return problems
-
-
 def compute_event_hash_v1_9_llm_request(
     sequence_number, timestamp_utc, event_id, request_id,
     model_requested, action, input_tokens, output_tokens,
@@ -1263,79 +1106,6 @@ def compute_event_hash_v1_12_llm_request(
     return h.hexdigest()
 
 
-def compute_event_hash_v1_16_llm_request(
-    sequence_number, timestamp_utc, event_id, request_id,
-    model_requested, action, input_tokens, output_tokens,
-    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
-    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
-    join_context, content, identity, evaluation_trace,
-):
-    """MEI-3037 (ADR-0087) — v1.16 llm_request hash: the v1.12 layout with the
-    identity block presence-tagged (an evaluated request can carry no
-    identity), followed by the evaluation outcome digest. The stored outcomes
-    are bound by that digest (`check_evaluation_trace`); the trace's timing is
-    outside the hash. Mirror of `compute_event_hash_v1_16_llm_request` in
-    sqlite.rs. The v1.12 feeds are duplicated, not shared, so a v1.16 change
-    can never move a v1.12 hash."""
-    h = _v1_2_prefix_hash(
-        sequence_number, timestamp_utc, event_id, request_id,
-        model_requested, action, input_tokens, output_tokens,
-        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
-        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
-    )
-    h.update(EVENT_KIND_LLM_REQUEST.encode('utf-8'))
-    join = join_context or {}
-    h.update(encode_optional_str(join.get('correlation_id')))
-    h.update(encode_optional_str(join.get('session_id')))
-    h.update(encode_optional_str(join.get('agent_name')))
-    if content is None:
-        h.update(b'\x00')
-    else:
-        h.update(b'\x01')
-        h.update(content['capture_policy'].encode('utf-8'))
-        h.update(encode_optional_str(content.get('prompt_sha256_jcs')))
-        h.update(encode_optional_str(content.get('response_sha256')))
-        h.update(encode_optional_str(content.get('stored_prompt_sha256_jcs')))
-        h.update(encode_optional_str(content.get('stored_response_sha256')))
-        h.update(encode_optional_str(content.get('findings_sha256_jcs')))
-        h.update(encode_optional_str(content.get('tool_calls_sha256_jcs')))
-        h.update(encode_optional_str(content.get('stored_tool_calls_sha256_jcs')))
-    if identity is None:
-        h.update(b'\x00')
-    else:
-        h.update(b'\x01')
-        h.update(encode_sealed_identity(identity))
-    # MEI-3037 — the v1.16 addition.
-    h.update(evaluation_trace['outcomes_sha256_jcs'].encode('utf-8'))
-    return h.hexdigest()
-
-
-def check_evaluation_trace(event):
-    """MEI-3037 (ADR-0087) — a v1.16 record's hash covers the digest of its
-    evaluation outcomes, not the outcomes themselves. Recompute the digest from
-    the stored outcomes so an edit after sealing is caught; refuse a trace on
-    any other version (it would ride the record unhashed). The timing half is
-    not checked: it is outside the hash by design. Mirror of
-    `check_evaluation_trace` in meilynx-audit/src/evaluation_trace.rs."""
-    version = event.get('schema_version') or 'v1'
-    trace = event.get('evaluation_trace')
-    if version != 'v1.16':
-        if trace is not None:
-            return [f'{version} record carries an evaluation_trace; it is hashed only in the v1.16 bucket']
-        return []
-    if trace is None:
-        return ['v1.16 record has no evaluation_trace']
-    sealed = trace.get('outcomes_sha256_jcs')
-    if not isinstance(sealed, str):
-        return ['evaluation_trace has no outcomes_sha256_jcs']
-    outcomes = trace.get('outcomes')
-    if not isinstance(outcomes, dict):
-        return ['evaluation_trace has no outcomes']
-    if sha256_jcs(outcomes) != sealed:
-        return ['evaluation outcomes do not match outcomes_sha256_jcs (the outcomes were changed after sealing)']
-    return []
-
-
 def compute_event_hash_v1_12_mcp(
     event_kind,
     sequence_number, timestamp_utc, event_id, request_id,
@@ -1463,8 +1233,7 @@ def compute_event_hash_dispatch(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     event_kind=EVENT_KIND_LLM_REQUEST, auth_session=None, admin_action=None,
     mcp_event=None, coverage=None, join_context=None, content=None,
-    identity=None, coverage_key_inventory=None, decision_receipt=None,
-    evaluation_trace=None,
+    identity=None, coverage_key_inventory=None,
 ):
     """MEI-639 — Python mirror of compute_event_hash_dispatch in sqlite.rs.
 
@@ -1473,32 +1242,6 @@ def compute_event_hash_dispatch(
       - "v1.2" → compute_event_hash_v1_2_* based on event_kind.
       - Unknown → raise ValueError (forward-compat guard, matches Rust).
     """
-    # MEI-3037 — ADR-0013 A: fail closed. The evaluation outcome digest is
-    # hashed only by the v1.16 llm_request hasher; anywhere else the trace would
-    # sit on the record unhashed.
-    if evaluation_trace is not None and (
-        schema_version != 'v1.16' or event_kind != EVENT_KIND_LLM_REQUEST
-    ):
-        raise ValueError(
-            f"MEI-3037: evaluation_trace present on a {schema_version!r} "
-            f"{event_kind!r} event — it is hashed only in the v1.16 llm_request bucket."
-        )
-    # MEI-2989 — ADR-0013 A: fail closed. The receipt payload is hashed only by
-    # the v1.15 decision.receipt hasher; anywhere else it would sit on the record
-    # unhashed. A decider on a lapse (or none on a decision) is malformed.
-    if decision_receipt is not None and (
-        schema_version != 'v1.15' or event_kind != EVENT_KIND_DECISION_RECEIPT
-    ):
-        raise ValueError(
-            f"MEI-2989: decision_receipt payload present on a {schema_version!r} "
-            f"{event_kind!r} event — it is hashed only in the v1.15 decision.receipt bucket."
-        )
-    if decision_receipt is not None and (
-        (decision_receipt.get('outcome') == 'lapsed') != (decision_receipt.get('decider_user_id') is None)
-    ):
-        raise ValueError(
-            "MEI-2989: a decision receipt has a decider exactly when someone decided (ADR-0086 D1 field 29)."
-        )
     # MEI-2641 — ADR-0013 A: fail closed. The key-inventory payload is hashed
     # only by the v1.13 coverage.key_inventory hasher; anywhere else it would
     # sit on the record unhashed.
@@ -1517,26 +1260,26 @@ def compute_event_hash_dispatch(
     # the fact without breaking the chain.
     # MEI-2424 — the same rule for the content attestation: its digests are
     # hashed only in the v1.10 and v1.11 buckets.
-    if content is not None and schema_version not in ('v1.10', 'v1.11', 'v1.12', 'v1.16'):
+    if content is not None and schema_version not in ('v1.10', 'v1.11', 'v1.12'):
         raise ValueError(
             f"MEI-2424: content attestation present on a {schema_version!r} event — "
-            f"content digests are hashed only in the v1.10, v1.11, v1.12 and v1.16 buckets."
+            f"content digests are hashed only in the v1.10, v1.11 and v1.12 buckets."
         )
     # MEI-2456 — and the tool-call digests only in v1.11: the v1.10 hash does
     # not read them, so a v1.10 record carrying one would present it unhashed.
-    if _has_tool_call_digests(content) and schema_version not in ('v1.11', 'v1.12', 'v1.16'):
+    if _has_tool_call_digests(content) and schema_version not in ('v1.11', 'v1.12'):
         raise ValueError(
             f"MEI-2456: tool-call digests present on a {schema_version!r} event — "
-            f"they are hashed only in the v1.11, v1.12 and v1.16 buckets."
+            f"they are hashed only in the v1.11 and v1.12 buckets."
         )
     # MEI-2646 — ADR-0013 A: fail closed. The sealed identity enters only the
     # v1.12 preimage (both lanes); on any other version it would sit on the
     # record unhashed, rewritable without breaking the chain.
-    if identity is not None and schema_version not in ('v1.12', 'v1.14', 'v1.16'):
+    if identity is not None and schema_version not in ('v1.12', 'v1.14'):
         raise ValueError(
             f"MEI-2646: identity block present on a {schema_version!r} event — "
-            f"it is hashed only in the v1.12 bucket (and the MCP v1.14 and LLM v1.16 "
-            f"buckets that carry it forward)."
+            f"it is hashed only in the v1.12 bucket (and the MCP v1.14 bucket that "
+            f"carries it forward)."
         )
     # MEI-2898 — the decision stage enters only the v1.14 preimage.
     if mcp_event is not None and mcp_event.get('stage') is not None and schema_version != 'v1.14':
@@ -1552,11 +1295,11 @@ def compute_event_hash_dispatch(
                 "MEI-2646: identity.delegated_human disagrees with the principal chain's "
                 "on_behalf_of_attestation — the two must agree"
             )
-    if join_context is not None and schema_version not in ('v1.9', 'v1.10', 'v1.11', 'v1.12', 'v1.14', 'v1.16'):
+    if join_context is not None and schema_version not in ('v1.9', 'v1.10', 'v1.11', 'v1.12', 'v1.14'):
         raise ValueError(
             f"MEI-2151: join_context present on a {schema_version!r} event — "
-            f"caller-asserted join keys are hashed only in the v1.9, v1.10, v1.11, v1.12, "
-            f"v1.14 and v1.16 buckets."
+            f"caller-asserted join keys are hashed only in the v1.9, v1.10, v1.11, v1.12 "
+            f"and v1.14 buckets."
         )
     if schema_version in ('v1', 'v1.1'):
         return compute_event_hash(
@@ -1725,23 +1468,6 @@ def compute_event_hash_dispatch(
             cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
             coverage_key_inventory,
         )
-    if schema_version == 'v1.15':
-        # MEI-2989 — v1.15 introduces exactly one new event class:
-        # decision.receipt. Same kind-only gate posture as v1.8 and v1.13.
-        if event_kind != EVENT_KIND_DECISION_RECEIPT:
-            raise ValueError(
-                f"MEI-2989: schema_version v1.15 is defined only for "
-                f"decision.receipt events; got event_kind {event_kind!r}"
-            )
-        if decision_receipt is None:
-            raise ValueError("MEI-2989: DecisionReceipt event missing decision_receipt payload")
-        return compute_event_hash_v1_15_decision_receipt(
-            sequence_number, timestamp_utc, event_id, request_id,
-            model_requested, action, input_tokens, output_tokens,
-            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
-            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
-            decision_receipt,
-        )
     if schema_version == 'v1.9':
         # MEI-2151 — v1.9 is the first bucket that is NOT keyed to a new event
         # class: it is the existing llm_request / mcp.* preimages plus the
@@ -1821,27 +1547,6 @@ def compute_event_hash_dispatch(
             total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
             cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
             join_context, content,
-        )
-    if schema_version == 'v1.16':
-        # MEI-3037 — the LLM-lane evaluation bucket: the v1.12 llm_request
-        # preimage with identity presence-tagged, then the evaluation outcome
-        # digest. Stamped exactly when the record carries a trace.
-        if event_kind != EVENT_KIND_LLM_REQUEST:
-            raise ValueError(
-                f"MEI-3037: schema_version v1.16 is defined only for llm_request "
-                f"events; got event_kind {event_kind!r}"
-            )
-        if evaluation_trace is None:
-            raise ValueError(
-                "MEI-3037: schema_version v1.16 requires an evaluation_trace; a "
-                "record sealed without one must stay in its pre-v1.16 bucket."
-            )
-        return compute_event_hash_v1_16_llm_request(
-            sequence_number, timestamp_utc, event_id, request_id,
-            model_requested, action, input_tokens, output_tokens,
-            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
-            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
-            join_context, content, identity, evaluation_trace,
         )
     if schema_version == 'v1.12':
         # MEI-2646 — the identity bucket on BOTH lanes: the llm_request
@@ -2426,175 +2131,6 @@ def run_self_test():
         print(f'  got:      {got_v113_loop} (misplaced rejected: {misplaced_rejected})', file=sys.stderr)
         ok = False
 
-    # MEI-2989 Assertion 28a — v1.15 decision.receipt fixture (direct fn),
-    # paired with the Rust mei2989_v1_15_decision_receipt_fixture_hash_pinned
-    # literal and the control plane's pinned vector.
-    got_v115 = compute_event_hash_v1_15_decision_receipt(
-        sequence_number=9, timestamp_utc='2026-10-01T15:00:31.000000+00:00',
-        event_id='evt-receipt-1', request_id='evt-receipt-1', model_requested='',
-        action='allow', input_tokens=0, output_tokens=0, total_tokens=None,
-        cache_creation_input_tokens=None, cache_read_input_tokens=None,
-        cached_input_tokens=None, reasoning_tokens=None, estimated_cost_usd=None,
-        previous_hash='b' * 64, receipt=_V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD,
-    )
-    if got_v115 == V1_15_DECISION_RECEIPT_FIXTURE_HASH:
-        print('SELF-TEST assertion 28a PASS: v1.15 decision.receipt fixture hash matches')
-    else:
-        print('SELF-TEST assertion 28a FAIL: v1.15 decision.receipt fixture drift', file=sys.stderr)
-        print(f'  expected: {V1_15_DECISION_RECEIPT_FIXTURE_HASH}', file=sys.stderr)
-        print(f'  got:      {got_v115}', file=sys.stderr)
-        ok = False
-
-    # MEI-2989 Assertion 28b — the same record through recompute_event_hash (the
-    # production path) from a synthetic exported-JSON body with a Z-suffix
-    # timestamp, and the receipt checks pass on the intact record.
-    synthetic_receipt_event = dict(
-        schema_version='v1.15',
-        event_kind='decision_receipt',
-        timestamp_utc='2026-10-01T15:00:31.000000Z',
-        event_id='evt-receipt-1', request_id='evt-receipt-1', model_requested='',
-        action='allow', input_tokens=0, output_tokens=0,
-        decision_receipt=dict(_V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD),
-    )
-    got_v115_loop = recompute_event_hash(synthetic_receipt_event, 9, 'b' * 64)
-    receipt_problems = check_decision_receipt(synthetic_receipt_event)
-    if got_v115_loop == V1_15_DECISION_RECEIPT_FIXTURE_HASH and not receipt_problems:
-        print('SELF-TEST assertion 28b PASS: verify_manifest recompute path handles v1.15 decision.receipt')
-    else:
-        print('SELF-TEST assertion 28b FAIL: recompute_event_hash or check_decision_receipt mis-handles v1.15', file=sys.stderr)
-        print(f'  got: {got_v115_loop} problems: {receipt_problems}', file=sys.stderr)
-        ok = False
-
-    # MEI-2989 Assertion 28c — the stored-not-hashed evidence list and the
-    # sealed clock verdict are checked: an edited evidence entry, a decision
-    # time moved past the deadline with the verdict left at `within`, and a
-    # decider removed from a decided receipt are all caught.
-    edited_evidence = dict(synthetic_receipt_event, decision_receipt=dict(
-        _V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD,
-        evidence=[dict(_V1_15_DECISION_RECEIPT_FIXTURE_EVIDENCE[0], event_hash='2' * 64), _V1_15_DECISION_RECEIPT_FIXTURE_EVIDENCE[1]],
-    ))
-    moved_clock = dict(synthetic_receipt_event, decision_receipt=dict(
-        _V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD, clock_decided_at=1791021601,
-    ))
-    no_decider = dict(synthetic_receipt_event, decision_receipt=dict(
-        _V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD, decider_user_id=None,
-    ))
-    wrong_action = dict(synthetic_receipt_event, action='block')
-    caught = [bool(check_decision_receipt(e)) for e in (edited_evidence, moved_clock, no_decider, wrong_action)]
-    if all(caught):
-        print('SELF-TEST assertion 28c PASS: edited evidence, a moved clock, a missing decider and a wrong action are caught')
-    else:
-        print(f'SELF-TEST assertion 28c FAIL: only {sum(caught)} of 4 receipt edits caught', file=sys.stderr)
-        ok = False
-
-    # MEI-2989 Assertion 28d — the fail-closed invariants: a receipt payload on
-    # any other version or kind, v1.15 on another kind, v1.15 without a payload,
-    # and a decider on a lapse are all refused by the dispatcher.
-    rejected = 0
-    for case in (
-        dict(synthetic_receipt_event, schema_version='v1.13'),
-        dict(synthetic_receipt_event, event_kind='coverage_key_inventory'),
-        dict(synthetic_receipt_event, event_kind='llm_request', decision_receipt=None),
-        dict(synthetic_receipt_event, decision_receipt=None),
-        dict(synthetic_receipt_event, decision_receipt=dict(_V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD, outcome='lapsed')),
-    ):
-        try:
-            recompute_event_hash(case, 9, 'b' * 64)
-        except ValueError:
-            rejected += 1
-    if rejected == 5:
-        print('SELF-TEST assertion 28d PASS: a receipt outside v1.15, v1.15 without a receipt, and a malformed receipt are refused')
-    else:
-        print(f'SELF-TEST assertion 28d FAIL: only {rejected} of 5 fail-closed cases rejected', file=sys.stderr)
-        ok = False
-
-    # MEI-3037 Assertion 29a — the v1.16 fixtures (direct fn): the outcome
-    # digest over the JCS form, and the hash with and without an identity
-    # (the identity presence tag is new in v1.16).
-    fixture_trace = {'outcomes_sha256_jcs': V1_16_OUTCOMES_DIGEST_FIXTURE}
-    got_digest = sha256_jcs(_V1_16_OUTCOMES_FIXTURE)
-    got_ident = compute_event_hash_v1_16_llm_request(
-        *_V1_16_FIXTURE_ARGS, None, None, _V1_16_IDENTITY_FIXTURE, fixture_trace,
-    )
-    got_bare = compute_event_hash_v1_16_llm_request(*_V1_16_FIXTURE_ARGS, None, None, None, fixture_trace)
-    if (got_digest, got_ident, got_bare) == (
-        V1_16_OUTCOMES_DIGEST_FIXTURE, V1_16_LLM_REQUEST_FIXTURE_HASH, V1_16_LLM_REQUEST_BARE_FIXTURE_HASH,
-    ):
-        print('SELF-TEST assertion 29a PASS: v1.16 outcome digest and llm_request fixture hashes match')
-    else:
-        print('SELF-TEST assertion 29a FAIL: v1.16 fixture drift', file=sys.stderr)
-        print(f'  digest {got_digest}\n  ident  {got_ident}\n  bare   {got_bare}', file=sys.stderr)
-        ok = False
-
-    # MEI-3037 Assertion 29b — the production recompute path on an exported
-    # v1.16 record, and the outcome check passing on it. Timing rides the
-    # record outside the hash: editing it changes neither verdict.
-    v116_event = dict(
-        schema_version='v1.16', event_kind='llm_request', timestamp_utc='2026-10-09T16:21:00Z',
-        event_id='evt-v116-fixture', request_id='req-v116-fixture', model_requested='gpt-6-luna',
-        action='block', input_tokens=452, output_tokens=70, total_tokens=522,
-        identity=dict(_V1_16_IDENTITY_FIXTURE),
-        evaluation_trace={
-            'outcomes_sha256_jcs': V1_16_OUTCOMES_DIGEST_FIXTURE,
-            'outcomes': json.loads(json.dumps(_V1_16_OUTCOMES_FIXTURE)),
-            'timing': {'stages': [{'name': 'upstream', 'offset_us': 16400, 'duration_us': 2193000}], 'rules': [
-                {'offset_us': 2210200, 'duration_us': 22000}]},
-        },
-    )
-    retimed = json.loads(json.dumps(v116_event))
-    retimed['evaluation_trace']['timing']['rules'][0]['duration_us'] = 1
-    try:
-        recomputed = [recompute_event_hash(e, 7, 'deadbeef' * 8) for e in (v116_event, retimed)]
-    except ValueError as exc:
-        recomputed = [str(exc)]
-    if (recomputed == [V1_16_LLM_REQUEST_FIXTURE_HASH] * 2
-            and not check_evaluation_trace(v116_event) and not check_evaluation_trace(retimed)):
-        print('SELF-TEST assertion 29b PASS: verify_manifest recompute path handles v1.16; timing is outside the hash')
-    else:
-        print(f'SELF-TEST assertion 29b FAIL: recompute {recomputed}, problems {check_evaluation_trace(v116_event)}', file=sys.stderr)
-        ok = False
-
-    # MEI-3037 Assertion 29c — an outcome edited after sealing still hashes
-    # (the preimage holds only the digest) and is caught by the outcome check.
-    edits = []
-    for mutate in (
-        lambda o: o['rules'][0].update(outcome='clean'),
-        lambda o: o['rules'][0].update(action='allow'),
-        lambda o: o.update(deciding_rule_id=None),
-        lambda o: o['delivery'].update(outcome='delivered'),
-        lambda o: o['rules'].append(dict(o['rules'][0], rule_id='extra')),
-    ):
-        edited = json.loads(json.dumps(v116_event))
-        mutate(edited['evaluation_trace']['outcomes'])
-        edits.append(
-            recompute_event_hash(edited, 7, 'deadbeef' * 8) == V1_16_LLM_REQUEST_FIXTURE_HASH
-            and bool(check_evaluation_trace(edited))
-        )
-    if all(edits):
-        print('SELF-TEST assertion 29c PASS: five outcome edits after sealing are caught by the outcome check')
-    else:
-        print(f'SELF-TEST assertion 29c FAIL: only {sum(edits)} of 5 outcome edits caught', file=sys.stderr)
-        ok = False
-
-    # MEI-3037 Assertion 29d — the fail-closed invariants: a trace on any other
-    # version, v1.16 on another kind and v1.16 without a trace are refused by
-    # the dispatcher, and the record check flags a trace outside v1.16.
-    rejected = 0
-    for case in (
-        dict(v116_event, schema_version='v1.12'),
-        dict(v116_event, event_kind='mcp_tool_call'),
-        dict(v116_event, evaluation_trace=None),
-    ):
-        try:
-            recompute_event_hash(case, 7, 'deadbeef' * 8)
-        except ValueError:
-            rejected += 1
-    if rejected == 3 and check_evaluation_trace(dict(v116_event, schema_version='v1.12')):
-        print('SELF-TEST assertion 29d PASS: a trace outside v1.16 and v1.16 without a trace are refused')
-    else:
-        print(f'SELF-TEST assertion 29d FAIL: only {rejected} of 3 fail-closed cases rejected', file=sys.stderr)
-        ok = False
-
     # MEI-2151 Assertion 17a — v1.9 llm_request fixture (direct fn), paired
     # with the Rust mei2151_v1_9_llm_request_fixture_hash_pinned literal.
     got_v19_llm = compute_event_hash_v1_9_llm_request(
@@ -3146,84 +2682,6 @@ _V1_8_COVERAGE_FIXTURE_PAYLOAD = dict(
     numerator_source='instance_sqlite',
     denominator_fetched_at='2026-08-19T01:00:00Z',
 )
-# MEI-2989 (ADR-0086) — v1.15 decision.receipt fixture. Paired with
-# meilynx-audit/tests/mei2989_decision_receipt_chain_round_trip.rs::mei2989_v1_15_decision_receipt_fixture_hash_pinned
-# and the control plane's Mei2989DecisionReceiptSealingTests.PinnedVectorHash;
-# no side may drift independently.
-# MEI-3037 (ADR-0087) — v1.16 llm_request fixtures. Paired with the same
-# constants in meilynx-audit (`evaluation_trace.rs` for the outcome digest,
-# `tests/mei3037_evaluation_trace_chain_round_trip.rs` for the hashes);
-# neither side may drift independently.
-_V1_16_OUTCOMES_FIXTURE = {
-    'v': 1,
-    'rules': [{
-        'rule_id': 'payment-risk-policy', 'rule_name': 'Payment risk policy',
-        'stage': 'post_response', 'validator_kind': 'webhook',
-        'outcome': 'matched', 'action': 'block',
-    }],
-    'deciding_rule_id': 'payment-risk-policy',
-    'delivery': {'mode': 'non_streaming', 'outcome': 'withheld'},
-}
-V1_16_OUTCOMES_DIGEST_FIXTURE = "7feba313b876be8fb7cb1efcd2bc6fea4a2650aaed592946047471d3dd9cba38"
-_V1_16_IDENTITY_FIXTURE = {
-    'agent_id': 'agt_fixture', 'tier': 't1', 'credential_kind': 'agent_key',
-    'credential_kid': 'kid-fixture', 'delegated_human': None, 'asserted_digest': 'a' * 64,
-}
-_V1_16_FIXTURE_ARGS = (
-    7, '2026-10-09T16:21:00+00:00', 'evt-v116-fixture', 'req-v116-fixture',
-    'gpt-6-luna', 'block', 452, 70, 522, None, None, None, None, None, 'deadbeef' * 8,
-)
-V1_16_LLM_REQUEST_FIXTURE_HASH = "985cec7081f7c4efab7a745fba9f3aa73e68ea1f9b3f42dc8a51cc38359173cc"
-V1_16_LLM_REQUEST_BARE_FIXTURE_HASH = "254d2401a772b260d64d6fd843b17f0c0147b3306f57af6a35d25ae3c4115bef"
-
-V1_15_DECISION_RECEIPT_FIXTURE_HASH = "4e93ecd462a3acd7a0a73e1fe98317a35fe0da3c1876e8389d4b63c668450682"
-_V1_15_DECISION_RECEIPT_FIXTURE_EVIDENCE = [
-    {"chain_id": "chain-1", "content_digests": {"payload_sha256_jcs": "c" * 64}, "event_hash": "1" * 64,
-     "event_id": "evt-toolcall-1", "role": "ai_contribution", "sequence_number": 6},
-    {"chain_id": "chain-1", "content_digests": {}, "event_hash": "a" * 64,
-     "event_id": "evt-decision-1", "role": "hold", "sequence_number": 7},
-]
-_V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD = dict(
-    receipt_id='0f0e0d0c-0b0a-4908-8706-050403020100',
-    receipt_type='finra-communication-review',
-    receipt_type_version='1',
-    registry_digest='5' * 64,
-    source_kind='mcp_hold',
-    source_ref='hold-' + '7' * 32,
-    subject_ref_sha256=None,
-    evidence_set_sha256=hashlib.sha256(json.dumps(
-        _V1_15_DECISION_RECEIPT_FIXTURE_EVIDENCE, separators=(',', ':'), sort_keys=True, ensure_ascii=False,
-    ).encode('utf-8')).hexdigest(),
-    policy_version='d' * 64,
-    outcome='approved',
-    outcome_reason_code=None,
-    outcome_reason_sha256=None,
-    decider_user_id='11111111-2222-4333-8444-555555555555',
-    decider_role='compliance-officer',
-    decider_identity_provenance=None,
-    credential_status='not_verified',
-    credential_class='registered_principal',
-    credential_registry=None,
-    credential_verified_at=None,
-    procedure_status='not_recorded',
-    procedure_id=None,
-    procedure_version=None,
-    procedure_document_sha256=None,
-    procedure_effective_at=None,
-    clock_rule='finra-3110-review-window@P2D',
-    clock_start_basis='sealed_record',
-    clock_started_at=1790848800,   # 2026-10-01T10:00:00Z
-    clock_deadline_at=1791021600,  # 2026-10-03T10:00:00Z
-    clock_decided_at=1790866800,   # 2026-10-01T15:00:00Z
-    clock_elapsed_seconds=18000,
-    clock_status='within',
-    held_before_use=True,
-    supersedes_receipt_id=None,
-    cp_anchor_event_id='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
-    cp_anchor_event_hash='e' * 64,
-    issued_at=1790866801,          # 2026-10-01T15:00:01Z
-    evidence=_V1_15_DECISION_RECEIPT_FIXTURE_EVIDENCE,
-)
 # MEI-2641 — v1.13 coverage.key_inventory fixture. Paired with
 # meilynx-audit/tests/mei2641_key_inventory_chain_round_trip.rs::mei2641_v1_13_key_inventory_fixture_hash_pinned;
 # neither side may drift independently.
@@ -3509,8 +2967,6 @@ def recompute_event_hash(event, seq, previous_hash):
         content=event.get('content'),
         identity=event.get('identity'),
         coverage_key_inventory=event.get('coverage_key_inventory'),
-        decision_receipt=event.get('decision_receipt'),
-        evaluation_trace=event.get('evaluation_trace'),
     )
 
 
@@ -3953,19 +3409,6 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
         # MEI-2646 — a v1.12 record's hash covers the digest of its asserted
         # labels; this checks the stored labels still match it.
         for problem in check_sealed_identity(event):
-            report(f"FAIL seq={seq}: {problem}")
-            all_passed = False
-            content_ok = False
-        # MEI-2989 — a v1.15 record's hash covers the digest of its evidence list
-        # and its sealed clock verdict; this checks the stored list and the
-        # arithmetic still match them.
-        for problem in check_decision_receipt(event):
-            report(f"FAIL seq={seq}: {problem}")
-            all_passed = False
-            content_ok = False
-        # MEI-3037 — a v1.16 record's hash covers the digest of its evaluation
-        # outcomes; this checks the stored outcomes still match it.
-        for problem in check_evaluation_trace(event):
             report(f"FAIL seq={seq}: {problem}")
             all_passed = False
             content_ok = False
