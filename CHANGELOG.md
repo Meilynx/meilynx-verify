@@ -1,5 +1,40 @@
 # Changelog
 
+## 0.9.0 (2026-10-09)
+
+- `verify-pack.py` from meilynx-proxy `69cd187`.
+- **Upgrade before verifying chains written after this release.** A
+  verifier older than 0.9.0 stops at the first `decision_receipt` record
+  with `unknown schema_version 'v1.15'`, or at the first evaluated
+  `llm_request` record with `unknown schema_version 'v1.16'`.
+- Chain v1.15 (SPEC §4.3): a new record kind, `decision_receipt`, sealed by
+  the proxy when a decision taken on a held call or a reviewed item is
+  recorded. The v1.2 prefix, the kind attestation, then 36 receipt fields in
+  the order §4.3 lists. The stored `evidence` list is outside the preimage
+  and bound by `evidence_set_sha256`, which the verifier recomputes (RFC
+  8785). The verifier also checks the sealed clock arithmetic against the
+  timestamps, the decider rule, the completeness of a `verified` credential
+  and a `recorded` procedure, and that the base `action` is the outcome's
+  projection. `decision_receipt` on any other version, or v1.15 on any other
+  kind, fails verification.
+- Chain v1.16 (SPEC §4.3): an `llm_request` record the governance pipeline
+  evaluated carries an `evaluation_trace`: which rules ran, what each
+  decided, which rule decided the request and how the response reached the
+  caller. The preimage is the v1.12 layout with the identity block
+  presence-tagged, then `outcomes_sha256_jcs`; the stored outcomes are bound
+  by that digest, which the verifier recomputes (RFC 8785). Timing is stored
+  but not hashed. A trace on any other version, or v1.16 without one, fails
+  verification.
+- `VERIFIER_CAPABILITIES` declares `decision-receipts-v1` and
+  `evaluation-trace-v1`; Meilynx gates a production roll of a proxy that
+  seals either bucket on a public release that reads it.
+- Self-test 28a-d pins one v1.15 fixture (hash and manifest recompute path)
+  and the fail-closed cases: edited evidence, a moved clock, a missing
+  decider, a wrong action, a receipt outside v1.15, v1.15 without a receipt
+  and a malformed receipt. Self-test 29a-d pins the v1.16 outcome digest and
+  two record hashes (with and without an identity), five outcome edits
+  caught after sealing, and the fail-closed cases.
+
 ## 0.8.0 (2026-10-05)
 
 - `verify-pack.py` from meilynx-proxy `b44e24c`.
