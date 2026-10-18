@@ -38,8 +38,8 @@ Exit codes, the same online and offline:
 | Code | Meaning |
 |---|---|
 | `0` | Every record verified, and on a signed pack the signature too. An unsigned pack reaches `0` only with `--allow-unsigned`, and the output still says authenticity is not established. |
-| `1` | Verification failed. The output names the first record that failed and why (hash mismatch, chain break, missing record, unknown record kind, two stored copies of one record that differ), why the signature failed, or which chain-head anchor failed and why. |
-| `2` | This verifier cannot evaluate the pack: an unsupported hash version, manifest version, storage layout, signature method or bundle format (use a newer release), an unusable `--trusted-root`, or an anchor from a witness with no trust root (pass `--tsa-root`). |
+| `1` | Verification failed. The output names the first record that failed and why (hash mismatch, chain break, missing record, unknown record kind, content that no longer matches its sealed digest, two stored copies of one record that differ, a hash-only stub that does not match the signed manifest or does not link), why the signature failed, which chain-head anchor failed and why, or, with `--conditions-sha256`, an acceptance record that does not verify or a `--conditions-acceptance` record that does not recompute or is not the acceptance of that set. |
+| `2` | This verifier cannot evaluate the pack: an unsupported hash version, manifest version, storage layout, evidence class, signature method or bundle format (use a newer release), a pack signed by a per-tenant signer checked without `--certificate-identity`, an unusable `--trusted-root`, an anchor from a witness with no trust root (pass `--tsa-root`), a content-stripped pack whose content claim, removed-field list or stub list this verifier does not read, whose records still carry a removed field, or that is checked with `--bucket` (use `--records`), a `--conditions-sha256` verdict whose acceptance is not in the pack and was not given with `--conditions-acceptance`, or a command-line usage error. |
 | `3` | The records verified, but the pack is unsigned, so nothing shows who produced the manifest. |
 
 When more than one applies, `1` outranks `2`, and `2` outranks `3`.
@@ -107,13 +107,30 @@ confirms all of the following:
   certificate;
 - the certificate chains to a Sigstore Fulcio certificate authority that was
   trusted when the entry was logged, and was itself valid at that time;
-- the certificate names the Meilynx signing identity:
+- the certificate names the expected signer. By default that is the Meilynx
+  signing identity:
   - identity `https://github.com/Meilynx/meilynx-proxy/.github/workflows/integrity-pack-signed.yml@refs/heads/main`
   - OIDC issuer `https://token.actions.githubusercontent.com`
 
 A pack whose manifest says it is signed, and whose signature is missing or
 fails any of these checks, exits `1` with the reason. A signed pack that has
 had its signature removed and been relabelled as unsigned exits `3`, not `0`.
+
+A pack exported for one project may instead be signed by that project's own
+signer, a Google service account (`<name>@<project>.iam.gserviceaccount.com`,
+OIDC issuer `https://accounts.google.com`). Pass the exact email the evidence
+holder published for the project; the issuer follows from the email form:
+
+```bash
+python3 verify-pack.py --records ./records --manifest manifest.json \
+  --certificate-identity <name>@<project>.iam.gserviceaccount.com
+```
+
+There is no default and no pattern match for this signer. Without
+`--certificate-identity`, such a pack exits `2`, and the output names the
+email in its certificate for you to compare with the published one. Any other
+email exits `1` with `signer identity mismatch`. The format is in
+[SPEC.md](SPEC.md) §7.2.
 
 The trust anchors (the Fulcio certificates and the Rekor log key) are the
 Sigstore public-good values, written out in `verify-pack.py` as
@@ -217,6 +234,28 @@ produce. `fixtures/run-segment-cases.py` runs each one offline and against a
 stand-in bucket, and checks that the exported records are byte-identical to
 the anchored sample's per-record objects.
 
+## OCSF evidence export
+
+A proxy can also write its sealed records to an object store as OCSF events:
+gzip NDJSON objects, each with a manifest and, when the proxy holds an export
+signing key, a detached signature. The export is a copy; the chain is the
+record. Pass `--ocsf-export` with the pack to check the copy against it, and
+`--ocsf-public-key` with the proxy's export public key (a P-256 JWK) to check
+the manifest signatures:
+
+```sh
+python3 verify-pack.py --records ./records --manifest manifest.json \
+  --ocsf-export ./export/ocsf/v1/<proxy>/<chain>/2026/10/11/index.json \
+  --ocsf-public-key ocsf-export-key.jwk
+```
+
+`PATH` is a `.manifest.json`, a day's `index.json`, or a directory of
+manifests. A changed object, event or digest fails (exit `1`). An event the
+pack does not hold prints `WARN export_record_outside_pack`, and a missing
+range between manifests prints `WARN export_gap`; both still pass. An
+unsigned manifest, or one checked without the key, is exit `3`. The format
+is in [SPEC.md](SPEC.md) §9.
+
 ## What a passing verdict means, and what it does not
 
 A pass proves that, for every record in the window:
@@ -234,10 +273,11 @@ It does **not** prove:
 - that fields outside the hash preimage are unchanged. Which fields are
   hashed is listed per record version in [SPEC.md](SPEC.md). For LLM-lane
   records sealed under a capture policy (v1.10 and later), digests of the
-  prompt, response, findings and tool calls are in the preimage and the
-  verifier checks the stored content against them; without a capture policy
-  that content is stored but not bound. For MCP-lane records a digest of the
-  payload is in the preimage.
+  prompt, response, findings and tool calls are in the preimage. On v1.10,
+  v1.11 and v1.12 records the verifier checks the stored content against
+  them; on v1.16 and v1.18 records it does not yet (SPEC.md §4.4). Without
+  a capture policy that content is stored but not bound. For MCP-lane
+  records a digest of the payload is in the preimage.
 - who wrote the record. A signed pack (`manifest.json.sigstore.json`) binds
   the manifest to the signing identity, and the manifest binds each record's
   hash; the records themselves are not signed individually.
@@ -248,12 +288,14 @@ It does **not** prove:
 ## Versions
 
 The verifier understands chain records with `schema_version` v1 through
-v1.14, stored per record or in segment objects, and pack manifests 1.0, 1.1
-and 1.2 (1.1 adds chain-head anchors, 1.2 the storage layout). A record of an
-unknown version or kind fails verification rather than being skipped; a
-manifest of an unknown version or storage layout is cannot evaluate (exit
-`2`). Changes to the verifier are listed in
-[CHANGELOG.md](CHANGELOG.md). The canonical source of this file is the
+v1.18, stored per record or in segment objects, and pack manifests 1.0
+through 1.5 (1.1 adds chain-head anchors, 1.2 the storage layout, 1.3 the
+control-plane chain, 1.4 the evidence class, 1.5 content-stripped packs). A
+record of an unknown version or kind fails verification rather than being
+skipped; a manifest of an unknown version, storage layout or evidence class
+is cannot evaluate (exit `2`). `VERIFIER_CAPABILITIES` in `verify-pack.py`
+lists the pack features this release checks. Changes to the verifier are
+listed in [CHANGELOG.md](CHANGELOG.md). The canonical source of this file is the
 `meilynx-integrity-pack` crate in the proxy; releases here are byte-identical
 copies tagged with the proxy commit they came from.
 

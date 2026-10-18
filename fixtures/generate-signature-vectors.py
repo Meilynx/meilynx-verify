@@ -46,6 +46,11 @@ END = "# END GENERATED SIGNATURE VECTORS"
 
 IDENTITY = "https://selftest.invalid/meilynx-verify/test-only-signer"
 ISSUER = "https://selftest.invalid/test-only-oidc-issuer"
+# MEI-2749 — a per-tenant signer (ADR-0065 D3 as amended): Google's issuer and
+# a service-account email SAN, under the same TEST-ONLY CA. Only the issuer
+# string is Google's; nothing here was issued by Google or Fulcio.
+PER_TENANT_IDENTITY = "ps-selftest00@selftest-invalid.iam.gserviceaccount.com"
+PER_TENANT_ISSUER = "https://accounts.google.com"
 LOG_ORIGIN = "selftest.invalid - 1"
 LOG_NAME = "selftest.invalid"
 INTEGRATED_TIME = 1790000000  # 2026-09-21T14:13:20Z
@@ -218,13 +223,16 @@ def ca_hierarchy(label):
     return {"root": root, "inter": inter, "inter_key": inter_key, "inter_name": inter_name}
 
 
-def leaf_extensions(key_usage=KEY_USAGE_SIGNING, code_signing=True, extra=()):
+def leaf_extensions(key_usage=KEY_USAGE_SIGNING, code_signing=True, extra=(),
+                    san=(0x86, IDENTITY), issuer=ISSUER):
+    """`san` is (tag, value): 0x86 a URI (the workflow class), 0x81 an
+    rfc822Name email (the per-tenant class)."""
     return [
         extension(vp.OID_KEY_USAGE, key_usage, critical=True),
         *([extension(vp.OID_EXT_KEY_USAGE, EKU_CODE_SIGNING)] if code_signing else []),
-        extension(vp.OID_SUBJECT_ALT_NAME, seq(tlv(0x86, IDENTITY.encode())), critical=True),
-        extension(vp.OID_FULCIO_ISSUER_V1, ISSUER.encode()),
-        extension(vp.OID_FULCIO_ISSUER_V2, tlv(0x0C, ISSUER.encode())),
+        extension(vp.OID_SUBJECT_ALT_NAME, seq(tlv(san[0], san[1].encode())), critical=True),
+        extension(vp.OID_FULCIO_ISSUER_V1, issuer.encode()),
+        extension(vp.OID_FULCIO_ISSUER_V2, tlv(0x0C, issuer.encode())),
         *extra,
     ]
 
@@ -413,6 +421,24 @@ def build_chain():
     return records, (json.dumps(manifest, indent=2) + "\n").encode()
 
 
+def per_tenant_manifest(manifest_bytes):
+    """MEI-2749 — the same chain as a manifest 1.4 sandbox pack (ADR-0080 D8):
+    `evidence_class` inside the signed bytes, and the anchoring section every
+    manifest after 1.0 carries (unanchored here)."""
+    manifest = json.loads(manifest_bytes)
+    manifest["schema_version"] = "1.4"
+    manifest["pack_id"] = "00000000-0000-4000-8000-000000002749"
+    manifest["evidence_class"] = "sandbox-non-production"
+    manifest["anchoring"] = {
+        "state": "unanchored",
+        "chains": [{
+            "chain": "self-test", "reason": "no_anchors_found", "anchored_through_seq": None,
+            "unanchored_tail": {"from_seq": 0, "to_seq": 1}, "anchors": [], "seals": [],
+        }],
+    }
+    return (json.dumps(manifest, indent=2) + "\n").encode()
+
+
 def build():
     records, manifest = build_chain()
     digest = hashlib.sha256(manifest).digest()
@@ -481,7 +507,28 @@ def build():
         reason = vp.REASON_MALFORMED if label == "tbs_algorithm_mismatch" else vp.REASON_UNTRUSTED_CHAIN
         cases[label] = (bundle(cert, digest, s, entries[9 + offset]), reason)
 
+    # MEI-2749 — the per-tenant class, over the 1.4 sandbox manifest, in a log
+    # of its own (same log key) so the vectors above stay byte-identical. The
+    # second leaf carries the same email as a URI SAN: the per-tenant class
+    # matches email SANs only.
+    tenant_manifest = per_tenant_manifest(manifest)
+    tenant_digest = hashlib.sha256(tenant_manifest).digest()
+    tenant_signer = Key(vp.P256, "per-tenant signer")
+    tenant_leaf = leaf_certificate(ca_a, tenant_signer, 2749, *window, leaf_extensions(
+        san=(0x81, PER_TENANT_IDENTITY), issuer=PER_TENANT_ISSUER))
+    tenant_sig = tenant_signer.sign_digest(tenant_digest, "sha256")
+    uri_signer = Key(vp.P256, "per-tenant signer named by a URI")
+    uri_leaf = leaf_certificate(ca_a, uri_signer, 2750, *window, leaf_extensions(
+        san=(0x86, PER_TENANT_IDENTITY), issuer=PER_TENANT_ISSUER))
+    uri_sig = uri_signer.sign_digest(tenant_digest, "sha256")
+    _, tenant_entries = build_log(log_key, [hashedrekord(tenant_digest, tenant_sig, tenant_leaf),
+                                            hashedrekord(tenant_digest, uri_sig, uri_leaf)])
+
     return {
+        "per_tenant_identity": PER_TENANT_IDENTITY,
+        "per_tenant_manifest": tenant_manifest,
+        "bundle_per_tenant": bundle(tenant_leaf, tenant_digest, tenant_sig, tenant_entries[0]),
+        "bundle_per_tenant_uri_san": bundle(uri_leaf, tenant_digest, uri_sig, tenant_entries[1]),
         "identity": IDENTITY,
         "issuer": ISSUER,
         "manifest": manifest,
@@ -514,6 +561,12 @@ def render_block(v):
     ]
     for key in ("records", "trusted_root", "foreign_trusted_root", "bundle_valid",
                 "bundle_entry_mismatch", "bundle_outside_validity"):
+        lines.append(f"    \"{key}\": {chunked(compact(v[key]))},")
+    lines += [
+        f"    \"per_tenant_identity\": {json.dumps(v['per_tenant_identity'])},",
+        f"    \"per_tenant_manifest\": {chunked(b64(v['per_tenant_manifest']))},",
+    ]
+    for key in ("bundle_per_tenant", "bundle_per_tenant_uri_san"):
         lines.append(f"    \"{key}\": {chunked(compact(v[key]))},")
     lines += ["}", END]
     return "\n".join(lines) + "\n"

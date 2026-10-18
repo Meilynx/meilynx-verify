@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.10.0 (2026-10-18)
+
+- `verify-pack.py` from meilynx-proxy `4af1dd1`. The version number 0.9.0
+  is not used.
+- **Upgrade before verifying chains or packs written after this release.**
+  A verifier older than 0.10.0 stops at the first record of v1.15 to v1.18
+  with `unknown schema_version`, and exits 2 on a manifest 1.3, 1.4 or 1.5.
+- Chain v1.15 (SPEC §4.3, §4.6): a new record kind, `decision_receipt`.
+  The v1.2 prefix, the kind attestation, then 36 fields. The stored
+  `evidence` list is bound by `evidence_set_sha256`, which the verifier
+  recomputes. The verifier also checks the clock fields against the
+  timestamps, the decider and lapse rules, the completeness of a `verified`
+  credential and a `recorded` procedure, and that the base `action` is the
+  outcome's projection. Each evidence entry is compared with the pack record
+  it cites; an entry outside the pack is `WARN receipt_evidence_outside_pack`
+  and verifies. A manifest's optional `decision_receipts` index must list
+  every receipt in the pack, field for field.
+- Chain v1.16 (SPEC §4.3): an `llm_request` record may carry an
+  `evaluation_trace`, whose outcomes are bound by `outcomes_sha256_jcs` and
+  recomputed by the verifier. Timing is stored but not hashed.
+- Chain v1.17 (SPEC §4.3): an `mcp.policy_decision` record may carry a
+  `data_reach` block, hashed and shape-checked.
+- Chain v1.18 (SPEC §4.3): records on both lanes may carry a `customer`
+  block, hashed and shape-checked.
+- Manifest 1.3 (SPEC §6.3): a pack may carry the control-plane chain under
+  `control-plane/`. The verifier recomputes every record (recipe
+  `control-plane-v1`), walks the chain from genesis, and checks a receipt's
+  `cp_anchor_event_hash` against the record its `cp_anchor_event_id` names
+  when that record is in the pack (`WARN receipt_anchor_outside_pack`
+  otherwise). `--export-records` writes the chain too.
+- Manifest 1.4 (SPEC §6.4): `evidence_class`, printed before the records and
+  on every verdict; an unknown or missing class is cannot evaluate (exit 2).
+- Manifest 1.5 (SPEC §6.5): a content-stripped pack. Removed fields are
+  outside every preimage, so records still recompute, and sealed content
+  digests are checked without the content. Records that cannot be stripped
+  ship as hash-only stubs the chain links through. A stripped pack that
+  still carries a removed field, or one read with `--bucket`, is cannot
+  evaluate (exit 2).
+- Condition-set verdict (SPEC §6.6): `--conditions-sha256` and
+  `--conditions-acceptance` add one verdict line counting the window's
+  records sealed under an accepted condition set, with gap and exception
+  lines.
+- Signed packs (SPEC §7.2): a pack signed by a per-tenant signer (a Google
+  service account) verifies against the exact identity passed with
+  `--certificate-identity`; without it the pack is cannot evaluate (exit 2).
+- OCSF evidence export (SPEC §9): `--ocsf-export` and `--ocsf-public-key`
+  check an export against the pack: object digests, manifest signatures,
+  and each exported event's chain coordinates and digests.
+- `VERIFIER_CAPABILITIES` adds `decision-receipts-v1`,
+  `evaluation-trace-v1`, `data-reach-evidence-v1`, `customer-scope-v1`,
+  `control-plane-chain-v1`, `per-tenant-signer-v1`, `evidence-class-v1`,
+  `content-stripped-v1`, `customer-conditions-v1` and `ocsf-export-v1`.
+- Self-test: 28a-n (v1.15), 29a-d (v1.16), 30a-d (v1.17), 31a-e (v1.18),
+  cp1-cp6 (control-plane chain), 20s-y (per-tenant signer, manifest 1.4),
+  32a-i (manifest 1.5), 33a-g (condition-set verdict) and the OCSF export
+  cases (also numbered 31a-k).
+- `fixtures/generate-signature-vectors.py` from the same proxy commit (adds
+  the per-tenant signer vectors).
+
 ## 0.8.0 (2026-10-05)
 
 - `verify-pack.py` from meilynx-proxy `b44e24c`.
