@@ -2,8 +2,8 @@
 
 ## 0.10.0 (2026-10-18)
 
-- `verify-pack.py` from meilynx-proxy `4af1dd1`. The version number 0.9.0
-  is not used.
+- `verify-pack.py` from meilynx-proxy `4680d22`. The version number
+  0.9.0 is not used.
 - **Upgrade before verifying chains or packs written after this release.**
   A verifier older than 0.10.0 stops at the first record of v1.15 to v1.18
   with `unknown schema_version`, and exits 2 on a manifest 1.3, 1.4 or 1.5.
@@ -23,7 +23,16 @@
 - Chain v1.17 (SPEC §4.3): an `mcp.policy_decision` record may carry a
   `data_reach` block, hashed and shape-checked.
 - Chain v1.18 (SPEC §4.3): records on both lanes may carry a `customer`
-  block, hashed and shape-checked.
+  block, hashed and shape-checked. A `content` block on a v1.18 MCP record
+  fails verification.
+- Stored content (SPEC §4.4): the content check now runs on v1.16 and
+  v1.18 `llm_request` records that carry a `content` block, as on v1.12. A
+  prompt, response or tool-call list edited after sealing on those records
+  fails verification.
+- A record missing a field its hash reads (an `evaluation_trace` with no
+  `outcomes_sha256_jcs`, a `content` block with no `capture_policy`), and a
+  control-plane `sequence_number` outside the signed 64-bit range, fail with
+  a named line instead of stopping the verifier.
 - Manifest 1.3 (SPEC §6.3): a pack may carry the control-plane chain under
   `control-plane/`. The verifier recomputes every record (recipe
   `control-plane-v1`), walks the chain from genesis, and checks a receipt's
@@ -54,8 +63,8 @@
   `content-stripped-v1`, `customer-conditions-v1` and `ocsf-export-v1`.
 - Self-test: 28a-n (v1.15), 29a-d (v1.16), 30a-d (v1.17), 31a-e (v1.18),
   cp1-cp6 (control-plane chain), 20s-y (per-tenant signer, manifest 1.4),
-  32a-i (manifest 1.5), 33a-g (condition-set verdict) and the OCSF export
-  cases (also numbered 31a-k).
+  32a-i (manifest 1.5), 33a-g (condition-set verdict), 34a-k (OCSF export)
+  and 35a-f (stored content on v1.16 and v1.18, malformed records).
 - `fixtures/generate-signature-vectors.py` from the same proxy commit (adds
   the per-tenant signer vectors).
 

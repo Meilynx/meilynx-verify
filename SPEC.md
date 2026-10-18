@@ -9,7 +9,7 @@ Status: describes chain records with `schema_version` v1 through v1.18, the
 per-record and segment storage layouts, the control-plane chain record
 format `control-plane-v1`, pack manifest `schema_version` 1.0 through 1.5,
 and OCSF export mapping version `1`, as read by `verify-pack.py` from
-meilynx-proxy commit `4af1dd1` (2026-10-17).
+meilynx-proxy commit `4680d22` (2026-10-17).
 
 ## 1. Records
 
@@ -375,7 +375,9 @@ encoding. Then the sealed customer block. 57 entries counting the three
 presence bytes (`identity`, `data_reach`, `customer`), when `identity` and
 `data_reach` are present. v1.18 covers every MCP kind; unlike v1.14, a v1.18
 MCP record need not carry a stage. A `data_reach` block is allowed only as
-in v1.17: on an `mcp.policy_decision` whose stage is `tool_call`.
+in v1.17: on an `mcp.policy_decision` whose stage is `tool_call`. No MCP
+preimage reads `content`, so a v1.18 MCP record that carries a `content`
+block is invalid and fails verification.
 
 A record is v1.18 exactly when it carries a `customer` block, on either
 lane: the proxy stamps v1.18 on such a record in place of v1.12, v1.14,
@@ -429,7 +431,7 @@ The six `content` fields:
 
 Because the digests are in the preimage and the content they describe is in
 the record, a verifier checks, for every v1.10 and v1.11 record and every
-v1.12 record that carries a `content` block:
+v1.12, v1.16 and v1.18 `llm_request` record that carries a `content` block:
 
 1. `stored_prompt_sha256_jcs`, when present, equals SHA-256(JCS(`messages`));
    when absent, `messages` is empty.
@@ -445,16 +447,9 @@ content is outside the preimage) and fails these checks. `prompt_sha256_jcs`
 and `response_sha256` cover content the record may no longer hold: whoever
 holds the original can show it is what the record was sealed over.
 
-A v1.12 record with no `content` block was sealed with no capture policy.
-Its prompt and response are stored but not bound, as before v1.10, and are
-not checked.
-
-A v1.16 or v1.18 `llm_request` record carries the `content` block
-presence-tagged, as v1.12 does, and its digests are in the preimage.
-`verify-pack.py` does not run checks 1 to 4 on these records: a stored
-prompt, response or tool-call list edited after sealing on a v1.16 or v1.18
-record still verifies. A v1.16 or v1.18 record with no `content` block
-stores its prompt and response unbound, as before v1.10.
+A v1.12, v1.16 or v1.18 record with no `content` block was sealed with no
+capture policy. Its prompt and response are stored but not bound, as before
+v1.10, and are not checked.
 
 JCS follows RFC 8785: object keys sorted by UTF-16 code units, no
 whitespace, strings escaped as in RFC 8785 §3.2.2.2, numbers in ECMAScript
@@ -978,7 +973,9 @@ event_hash = hex(SHA-256( i64 LE sequence_number
                         || UTF-8 bytes of canonical(H) ))
 ```
 
-- `sequence_number` is fed as 8 bytes little-endian, two's complement.
+- `sequence_number` is fed as 8 bytes little-endian, two's complement. A
+  value outside the signed 64-bit range has no preimage and fails
+  verification.
 - `previous_hash` is fed as the stored text (64 hex characters), not as the
   32 bytes it encodes.
 - `H` is a JSON object with exactly the nine hashed members above

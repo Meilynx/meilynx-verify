@@ -256,7 +256,7 @@ SUPPORTED_MANIFEST_SCHEMA_VERSIONS = ("1.0", "1.1", "1.2", "1.3", "1.4", "1.5")
 EVIDENCE_CLASSES = {
     "sandbox-non-production": (
         "evidence sealed on a sandbox project, a self-serve evaluation tenant; "
-        "it is not production evidence (ADR-0080 D8)"
+        "it is not production evidence"
     ),
 }
 # Pack features this verifier checks, read by the release-sync gate
@@ -1381,6 +1381,8 @@ def control_plane_event_hash_v1(record):
     seq = control_plane_sequence(record)
     if seq is None:
         raise ValueError("sequence_number is not an integer")
+    if not -2**63 <= seq < 2**63:
+        raise ValueError(f"sequence_number {seq} is outside the signed 64-bit range the preimage encodes")
     prev = record.get('previous_hash')
     if not isinstance(prev, str) or isinstance(prev, ControlPlaneNumber):
         raise ValueError("previous_hash is not a string")
@@ -2191,12 +2193,16 @@ def check_llm_content(event, stripped=frozenset()):
     removed (STRIPPED_FIELDS). An axis whose content was removed is not
     re-derived: its sealed digest is inside the hash, which the walk
     recomputes, and that is all a stripped pack can show of it. The findings
-    axis is kept and checked."""
+    axis is kept and checked.
+
+    v1.16 and v1.18 carry the same presence-tagged content block
+    forward (CONTENT_ATTESTATION_VERSIONS), so their records get the v1.12
+    check: a block is re-derived, no block means no capture policy."""
     schema_version = event.get('schema_version') or 'v1'
-    if schema_version not in ('v1.10', 'v1.11', 'v1.12'):
+    if schema_version not in CONTENT_ATTESTATION_VERSIONS:
         return []
     content = event.get('content')
-    if schema_version == 'v1.12' and content is None:
+    if schema_version in CONTENT_PRESENCE_TAGGED_VERSIONS and content is None:
         return []
     if not isinstance(content, dict):
         return [f'{schema_version} record has no content payload']
@@ -2885,8 +2891,13 @@ def _on_behalf_of_is_verified(mcp_event):
 # v1.12, v1.16 and v1.18 ones that carry it forward. Mirror of the Rust guard
 # in meilynx-audit/src/sqlite.rs (`llm_schema_version_with_content`); a new
 # llm_request bucket that hashes `content.*` is added here and there together,
-# and self-test assertion 31e pins the v1.18 member.
+# and self-test assertion 31e pins the v1.18 member. `check_llm_content` reads
+# the same tuple, so a bucket that seals the digests is also one whose stored
+# content is re-derived from them (assertions 35a-35c).
 CONTENT_ATTESTATION_VERSIONS = ('v1.10', 'v1.11', 'v1.12', 'v1.16', 'v1.18')
+# The members whose preimage presence-tags the content block: a record sealed
+# with no capture policy carries none and stores its content unhashed.
+CONTENT_PRESENCE_TAGGED_VERSIONS = ('v1.12', 'v1.16', 'v1.18')
 
 
 def compute_event_hash_dispatch(
@@ -2933,6 +2944,12 @@ def compute_event_hash_dispatch(
             f"MEI-3037: evaluation_trace present on a {schema_version!r} "
             f"{event_kind!r} event — it is hashed only in the v1.16 and v1.18 llm_request buckets."
         )
+    # The hashers read the sealed digest; a trace without one has
+    # no defined preimage and is a failed record, not a crash.
+    if evaluation_trace is not None and not (
+        isinstance(evaluation_trace, dict) and isinstance(evaluation_trace.get('outcomes_sha256_jcs'), str)
+    ):
+        raise ValueError("evaluation_trace has no outcomes_sha256_jcs, so the record has no defined preimage.")
     # MEI-2989 — ADR-0013 A: fail closed. The receipt payload is hashed only by
     # the v1.15 decision.receipt hasher; anywhere else it would sit on the record
     # unhashed. A decider on a lapse (or none on a decision) is malformed.
@@ -2947,7 +2964,7 @@ def compute_event_hash_dispatch(
         (decision_receipt.get('outcome') == 'lapsed') != (decision_receipt.get('decider_user_id') is None)
     ):
         raise ValueError(
-            "MEI-2989: a decision receipt has a decider exactly when someone decided (ADR-0086 D1 field 29)."
+            "MEI-2989: a decision receipt has a decider exactly when someone decided."
         )
     # MEI-2641 — ADR-0013 A: fail closed. The key-inventory payload is hashed
     # only by the v1.13 coverage.key_inventory hasher; anywhere else it would
@@ -2974,6 +2991,20 @@ def compute_event_hash_dispatch(
             f"content digests are hashed only in the "
             f"{', '.join(CONTENT_ATTESTATION_VERSIONS[:-1])} and {CONTENT_ATTESTATION_VERSIONS[-1]} buckets."
         )
+    # The guard above is by version, and v1.18 (like v1.12) is
+    # defined on both lanes; only the llm_request preimage reads `content.*`.
+    # The MCP hashers never do and the writer never seals a content block on
+    # an MCP record, so one there would ride the record unhashed: refuse it.
+    # v1.12 MCP keeps its historical behaviour (admitted, its stored content
+    # checked against the unhashed digests) so packs already issued verify as
+    # they did; a sealing build stamps every MCP record v1.18.
+    if content is not None and schema_version == 'v1.18' and event_kind != EVENT_KIND_LLM_REQUEST:
+        raise ValueError(
+            f"content attestation present on a {schema_version!r} {event_kind!r} event — "
+            f"content digests are hashed only on the llm_request lane, so this content is unattested."
+        )
+    if content is not None and not (isinstance(content, dict) and isinstance(content.get('capture_policy'), str)):
+        raise ValueError("content attestation has no capture_policy, so the record has no defined preimage.")
     # MEI-2456 — and the tool-call digests only in v1.11: the v1.10 hash does
     # not read them, so a v1.10 record carrying one would present it unhashed.
     if _has_tool_call_digests(content) and schema_version not in ('v1.11', 'v1.12', 'v1.16', 'v1.18'):
@@ -5478,7 +5509,7 @@ class ChainRecords:
             if span is None:
                 if _SEGMENT_OBJECT_NAME.fullmatch(name):
                     self._report(f"NOTICE: {name} is not a record object: a segment holds from 1 to "
-                                 f"{SEGMENT_MAX_RECORDS} records, first <= last (ADR-0081 D6)")
+                                 f"{SEGMENT_MAX_RECORDS} records, first <= last")
                 self._indexed.add(name)
                 continue
             self._indexed.add(name)
@@ -5902,6 +5933,13 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             recomputed = recompute_event_hash(event, seq, stored_prev)
         except ValueError as exc:
             report(f"FAIL seq={seq}: {exc}")
+            all_passed = False
+            continue
+        except (KeyError, TypeError, AttributeError, struct.error) as exc:
+            # A field the preimage reads is missing or has the wrong
+            # shape: the record fails by name, never a traceback.
+            report(f"FAIL seq={seq}: the record is malformed and has no defined preimage "
+                   f"({type(exc).__name__}: {exc})")
             all_passed = False
             continue
 
@@ -8465,7 +8503,7 @@ def _verify_listed_and_found(anchoring, entry, listed, seals, window, record_fet
             print(f"NOTICE: unanchored tail seq={anchored_through + 1}..{hi}: these records are not yet "
                   f"covered by a chain-head anchor")
     print("NOTE: an anchor shows a record existed no later than the token's genTime and is unchanged "
-          "since; it does not show the chain is complete (ADR-0075 D13).")
+          "since; it does not show the chain is complete.")
     return PASSED
 
 
@@ -8587,7 +8625,7 @@ def content_lines(manifest):
     if not pack_is_stripped(manifest):
         return []
     lines = [
-        "CONTENT: stripped. This is an Evidence Exchange pack: captured content and personal data were removed "
+        "CONTENT: stripped. This is a content-stripped pack: captured content and personal data were removed "
         f"from every record ({', '.join(STRIPPED_FIELDS)}). Each record keeps every field its hash covers, so "
         "the chain is verified from the sealed digests; the removed content itself cannot be shown."
     ]
@@ -8944,7 +8982,7 @@ def segment_self_test():
           and record_object_range("7.bin") is None
           and record_object_range(f"{n(7)}.json") is None,
           "object names parse to ranges: <n>.bin is [n, n], <a>-<b>.seg is [a, b] with 1 to 1024 "
-          "records, anything else is not a record (ADR-0081 D6)")
+          "records, anything else is not a record")
 
     genesis = genesis_hash()
     events = []
@@ -9078,7 +9116,7 @@ def segment_self_test():
           "a manifest 1.2 storage_layout is per-record or segmented-v1; absent or unknown is refused (exit 2)",
           repr(layouts))
     check('26m', 'segmented-records-v1' in VERIFIER_CAPABILITIES,
-          "VERIFIER_CAPABILITIES advertises segmented-records-v1 (ADR-0081 D9)")
+          "VERIFIER_CAPABILITIES advertises segmented-records-v1")
     return ok
 
 
@@ -9302,7 +9340,7 @@ def receipt_self_test():
     base = dict(_V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD)
     late = dict(base, clock_decided_at=base['clock_deadline_at'] + 1,
                 clock_elapsed_seconds=base['clock_deadline_at'] + 1 - base['clock_started_at'])
-    unverified = dict(base, credential_status='verified', credential_registry='finra_crd')
+    unverified = dict(base, credential_status='verified', credential_registry='registry_id')
     lapse_with_decider = dict(base, outcome='lapsed', clock_decided_at=None, clock_elapsed_seconds=None,
                               clock_status='lapsed', issued_at=base['clock_deadline_at'] + 60)
     problems = [
@@ -9820,6 +9858,179 @@ def _exchange_selftest_manifest(records, stubs=(_EXCHANGE_SELFTEST_STUB,)):
     return manifest
 
 
+def content_carry_forward_self_test():
+    """The stored-content check on every bucket that seals the
+    content digests, and the malformed-input paths that must fail by name:
+    v1.16 and v1.18 records get the v1.12 check (35a, 35b), a content-stripped
+    axis reads the same on all three (35c), a content block on a v1.18 MCP
+    record is refused while v1.12 MCP keeps its behaviour (35d), a trace with
+    no sealed digest or a content block with no capture policy is a FAIL line
+    (35e), and a control-plane sequence_number outside 64 bits is a FAIL line
+    (35f)."""
+    import contextlib
+    import io
+    import tempfile
+
+    ok = True
+
+    def check(label, passed, what, detail=''):
+        nonlocal ok
+        print(f"SELF-TEST assertion {label} {'PASS' if passed else 'FAIL'}: {what}")
+        if not passed:
+            if detail:
+                print(detail, file=sys.stderr)
+            ok = False
+
+    messages = [{'role': 'user', 'content': 'Summarize the Q3 variance memo.'}]
+    response = 'Revenue was 4% under plan, driven by delayed renewals.'
+    calls = [{'id': 'call_1', 'name': 'lookup', 'input': {'account': 'acct-1'}}]
+    content = dict(
+        capture_policy='full',
+        prompt_sha256_jcs=sha256_jcs(messages),
+        response_sha256=hashlib.sha256(response.encode('utf-8')).hexdigest(),
+        stored_prompt_sha256_jcs=sha256_jcs(messages),
+        stored_response_sha256=hashlib.sha256(response.encode('utf-8')).hexdigest(),
+        findings_sha256_jcs=sha256_jcs([]),
+        tool_calls_sha256_jcs=sha256_jcs(calls),
+        stored_tool_calls_sha256_jcs=sha256_jcs(calls),
+    )
+    trace = {'outcomes_sha256_jcs': V1_16_OUTCOMES_DIGEST_FIXTURE,
+             'outcomes': json.loads(json.dumps(_V1_16_OUTCOMES_FIXTURE))}
+
+    def sealed(version):
+        record = dict(
+            schema_version=version, event_kind='llm_request', sequence_number=0,
+            timestamp_utc='2026-10-09T16:21:00Z', event_id='evt-0', request_id='req-0',
+            model_requested='gpt-6-luna', action='allow', input_tokens=12, output_tokens=14,
+            estimated_cost_usd=None, previous_hash=genesis_hash(),
+            messages=json.loads(json.dumps(messages)), response_text=response, findings=[],
+            tool_calls=json.loads(json.dumps(calls)), content=dict(content),
+            evaluation_trace=json.loads(json.dumps(trace)),
+        )
+        if version == 'v1.18':
+            record['customer'] = dict(_V1_18_CUSTOMER_NONE_FIXTURE)
+        record['event_hash'] = recompute_event_hash(record, 0, genesis_hash())
+        return record
+
+    def walk(record, manifest_hash):
+        manifest = {'hash_version': 'v1', 'prefix': 'audit/self-test/',
+                    'events': [{'sequence': 0, 'recomputed_event_hash': manifest_hash}]}
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            records = Path(tmp) / 'records'
+            records.mkdir()
+            (records / record_file_name(0)).write_bytes(json.dumps(record).encode('utf-8'))
+            try:
+                with contextlib.redirect_stdout(out):
+                    passed = verify_manifest_with(local_fetcher(records), manifest)
+            except Exception as exc:  # the assertion is that nothing escapes the walk
+                return None, [f'{type(exc).__name__}: {exc}']
+        return passed, out.getvalue().splitlines()
+
+    # 35a / 35b — intact passes; an edited prompt, response or tool call still
+    # hash-verifies (outside the preimage) and fails the content check; no
+    # content block means no capture policy, as on v1.12.
+    for label, version in (('35a', 'v1.16'), ('35b', 'v1.18')):
+        record = sealed(version)
+        intact, intact_lines = walk(record, record['event_hash'])
+        caught = []
+        for field, edit in (('messages', lambda r: r['messages'][0].update(content='Wire the bonus pool.')),
+                            ('response_text', lambda r: r.update(response_text='Revenue was on plan.')),
+                            ('tool_calls', lambda r: r['tool_calls'][0]['input'].update(account='acct-2'))):
+            edited = json.loads(json.dumps(record))
+            edit(edited)
+            still_hashes = recompute_event_hash(edited, 0, genesis_hash()) == record['event_hash']
+            passed, lines = walk(edited, record['event_hash'])
+            caught.append(still_hashes and passed is False
+                          and any(l.startswith('FAIL seq=0:') and field in l for l in lines))
+        bare = json.loads(json.dumps(record))
+        del bare['content']
+        check(label, intact is True and all(caught) and check_llm_content(bare) == [],
+              f'a {version} record is content-checked as v1.12: intact passes, an edited prompt, response '
+              f'or tool call fails, no content block is not checked',
+              f'intact {intact} {intact_lines}, caught {caught}, bare {check_llm_content(bare)}')
+
+    # 35c — a content-stripped axis is not re-derived on any of the three, and
+    # the kept findings axis is still checked.
+    stripped = frozenset(STRIPPED_FIELDS)
+    verdicts = {}
+    for version in ('v1.12', 'v1.16', 'v1.18'):
+        record = sealed('v1.16')
+        record['schema_version'] = version
+        for field in ('messages', 'response_text', 'tool_calls'):
+            record.pop(field, None)
+        edited_findings = dict(record, findings=[{'validator': 'added-after-sealing'}])
+        verdicts[version] = (check_llm_content(record, stripped), len(check_llm_content(edited_findings, stripped)))
+    check('35c', len(set(map(repr, verdicts.values()))) == 1 and verdicts['v1.12'] == ([], 1),
+          'a content-stripped axis reads the same on v1.12, v1.16 and v1.18; the findings axis is still checked',
+          f'{verdicts}')
+
+    # 35d — a v1.18 MCP record carrying a content block is refused (the MCP
+    # preimage never reads it); a v1.12 MCP record keeps its behaviour.
+    mcp_118 = dict(
+        schema_version='v1.18', event_kind='mcp_tool_call', event_id='evt-tool-call', request_id='req-tool-7',
+        timestamp_utc='2026-10-10T12:00:01Z', model_requested='', action='allow', input_tokens=0, output_tokens=0,
+        mcp_event=dict(_V1_5_MCP_TOOL_CALL_FIXTURE_PAYLOAD), customer=dict(_V1_18_CUSTOMER_NONE_FIXTURE),
+    )
+    mcp_118['event_hash'] = recompute_event_hash(mcp_118, 0, genesis_hash())
+    mcp_118['previous_hash'] = genesis_hash()
+    carrying = dict(mcp_118, content=dict(content), messages=json.loads(json.dumps(messages)))
+    passed, lines = walk(carrying, mcp_118['event_hash'])
+    mcp_112 = dict(
+        schema_version='v1.12', event_kind='mcp_tool_call', event_id='evt-mcp', request_id='req-mcp',
+        timestamp_utc='2026-10-10T12:00:01Z', model_requested='', action='allow', input_tokens=0, output_tokens=0,
+        mcp_event=dict(_V1_12_MCP_TOOL_CALL_FIXTURE_PAYLOAD), identity=dict(_V1_12_IDENTITY_T2_FIXTURE_PAYLOAD),
+    )
+    v112_hash = recompute_event_hash(mcp_112, 0, genesis_hash())
+    v112_admitted = recompute_event_hash(dict(mcp_112, content=dict(content)), 0, genesis_hash()) == v112_hash
+    check('35d', passed is False and v112_admitted
+          and any(l.startswith('FAIL seq=0:') and 'hashed only on the llm_request lane' in l for l in lines),
+          'a content block on a v1.18 MCP record fails as unattested; v1.12 MCP is unchanged',
+          f'passed {passed}, lines {lines}, v1.12 admitted {v112_admitted}')
+
+    # 35e — a trace with no sealed digest, or a content block with no capture
+    # policy, fails by name instead of raising.
+    cases = []
+    record = sealed('v1.16')
+    no_digest = json.loads(json.dumps(record))
+    del no_digest['evaluation_trace']['outcomes_sha256_jcs']
+    cases.append(('outcomes_sha256_jcs', no_digest))
+    cases.append(('outcomes_sha256_jcs', dict(record, evaluation_trace='not a trace')))
+    no_policy = json.loads(json.dumps(record))
+    del no_policy['content']['capture_policy']
+    cases.append(('capture_policy', no_policy))
+    results = []
+    for needle, case in cases:
+        passed, lines = walk(case, record['event_hash'])
+        results.append(passed is False and any(l.startswith('FAIL seq=0:') and needle in l for l in lines))
+    check('35e', all(results),
+          'a trace with no outcomes_sha256_jcs, or a content block with no capture_policy, is a named FAIL',
+          f'{results}')
+
+    # 35f — a control-plane sequence_number outside the signed 64-bit range
+    # the preimage encodes is a named FAIL on the control-plane walk.
+    results = []
+    for seq in ('9223372036854775808', '-9223372036854775809', '18446744073709551616'):
+        text = (_CONTROL_PLANE_V1_VECTORS[0][0]
+                .replace('"sequence_number":0', f'"sequence_number":{seq}', 1))
+        record = load_control_plane_record(text.encode('utf-8'))
+        manifest = {'schema_version': '1.3', 'control_plane': {
+            'chain_family': 'control-plane', 'prefix': 'control-plane/', 'hash_algorithm': 'SHA-256',
+            'hash_version': 'v1', 'genesis_hash': genesis_hash(), 'verified': True, 'records_checked': 1,
+            'events': [{'sequence': 0, 'event_id': record['event_id'], 'stored_event_hash': record['event_hash'],
+                        'recomputed_event_hash': record['event_hash']}]}}
+        lines = []
+        try:
+            passed, _ = verify_control_plane_chain(lambda _seq, text=text: text.encode('utf-8'), manifest, lines.append)
+        except Exception as exc:  # the assertion is that nothing escapes the walk
+            passed, lines = None, [f'{type(exc).__name__}: {exc}']
+        results.append(passed is False and '"sequence_number":0' in _CONTROL_PLANE_V1_VECTORS[0][0]
+                       and any(l.startswith('FAIL control-plane seq=0:') and '64-bit' in l for l in lines))
+    check('35f', all(results),
+          'a control-plane sequence_number outside the signed 64-bit range is a named FAIL', f'{results}')
+    return ok
+
+
 def exchange_self_test():
     """MEI-3081 — the content-stripped Exchange pack (manifest 1.5): the
     content claim and the stub list are read only where 1.5 puts them and only
@@ -10182,7 +10393,7 @@ def conditions_self_test():
     lines = []
     status = conditions_verdict(CONDITIONS_SELFTEST_SET, {}, stripped, cp_records, report=lines.append)
     check('33c', status == PASSED and lines[-1] == expected and 'messages' not in stripped[0],
-          'the same verdict on the records stripped for an Exchange pack')
+          'the same verdict on the records of a content-stripped pack')
 
     lines = []
     status = conditions_verdict(CONDITIONS_SELFTEST_SET, {}, by_seq, {}, report=lines.append)
@@ -12055,12 +12266,12 @@ def _ec_mul(c, k, point):
 def ocsf_export_self_test():
     """ADR-0090 D6 (MEI-3116) — the export check end to end on a synthetic
     two-record chain and a synthetic export: a clean signed export verifies
-    (31a); an edited line fails naming the line and the field (31b); a
-    deleted object fails naming the object (31c); a manifest missing between
-    two others is WARN export_gap and still verifies (31d); an unsigned
-    manifest lands at UNSIGNED (31e); the wrong key fails (31f); a mapping
-    version this verifier does not read is CANNOT EVALUATE (31g); an event
-    on a sequence the pack does not hold is a WARN, not a failure (31h)."""
+    (34a); an edited line fails naming the line and the field (34b); a
+    deleted object fails naming the object (34c); a manifest missing between
+    two others is WARN export_gap and still verifies (34d); an unsigned
+    manifest lands at UNSIGNED (34e); the wrong key fails (34f); a mapping
+    version this verifier does not read is CANNOT EVALUATE (34g); an event
+    on a sequence the pack does not hold is a WARN, not a failure (34h)."""
     import gzip
     import io
     import tempfile
@@ -12156,7 +12367,7 @@ def ocsf_export_self_test():
         day, name_a = write_export(root, [first, second], 0, 1)
         entries = load_ocsf_export(day / f'{name_a}.manifest.json')
         content, sig = verify_ocsf_export(entries, chain, records, public_point=jwk_point, quiet=True)
-        ok = check('31a', (content, sig) == (PASSED, PASSED), "a clean signed export verifies against the pack") and ok
+        ok = check('34a', (content, sig) == (PASSED, PASSED), "a clean signed export verifies against the pack") and ok
 
         # 29b: an edited line names the line and the field.
         tampered_lines = [json.dumps(ocsf_event(first)), json.dumps(ocsf_event(second)).replace(second['event_hash'], 'f' * 64)]
@@ -12181,7 +12392,7 @@ def ocsf_export_self_test():
         finally:
             builtins.print = real_print
         named = any('line 2' in c and 'meilynx.chain.event_hash' in c and c.startswith('FAIL') for c in captured)
-        ok = check('31b', content == FAILED and sig == PASSED and named,
+        ok = check('34b', content == FAILED and sig == PASSED and named,
                    "an edited exported line fails, naming the line and the field") and ok
 
         # 29c: a deleted object names the object.
@@ -12192,7 +12403,7 @@ def ocsf_export_self_test():
             content, _ = verify_ocsf_export(load_ocsf_export(day / f'{name_a}.manifest.json'), chain, records, public_point=jwk_point)
         finally:
             builtins.print = real_print
-        ok = check('31c', content == FAILED and any(c.startswith('FAIL') and name_a in c and 'missing' in c for c in captured),
+        ok = check('34c', content == FAILED and any(c.startswith('FAIL') and name_a in c and 'missing' in c for c in captured),
                    "a deleted export object fails, naming the object") and ok
 
         # 29d: a gap between manifests is a WARN and still verifies; 29h: a
@@ -12208,9 +12419,9 @@ def ocsf_export_self_test():
             content, sig = verify_ocsf_export(load_ocsf_export(gap_root), chain, records, public_point=jwk_point)
         finally:
             builtins.print = real_print
-        ok = check('31d', content == PASSED and any('WARN export_gap' in c and '1..1' in c for c in captured),
+        ok = check('34d', content == PASSED and any('WARN export_gap' in c and '1..1' in c for c in captured),
                    "a manifest missing between two others is WARN export_gap and still verifies") and ok
-        ok = check('31h', any('WARN export_record_outside_pack: 1' in c for c in captured),
+        ok = check('34h', any('WARN export_record_outside_pack: 1' in c for c in captured),
                    "an exported event on a sequence the pack does not hold is a WARN, not a failure") and ok
 
         # 29e: unsigned lands at UNSIGNED; 29f: the wrong key fails.
@@ -12218,25 +12429,25 @@ def ocsf_export_self_test():
         uroot.mkdir()
         uday, uname = write_export(uroot, [first, second], 0, 1, signed=False)
         content, sig = verify_ocsf_export(load_ocsf_export(uday / f'{uname}.manifest.json'), chain, records, public_point=jwk_point, quiet=True)
-        ok = check('31e', (content, sig) == (PASSED, UNSIGNED), "an unsigned manifest verifies its content and lands at UNSIGNED") and ok
+        ok = check('34e', (content, sig) == (PASSED, UNSIGNED), "an unsigned manifest verifies its content and lands at UNSIGNED") and ok
         wrong = _ec_mul(P256, d + 1, P256.g)
         content, sig = verify_ocsf_export(load_ocsf_export(gday / f'{gday.name and sorted(p.name for p in gday.glob("*.manifest.json"))[0]}'), chain, records, public_point=wrong, quiet=True)
-        ok = check('31f', sig == FAILED, "a manifest signed with another key fails") and ok
+        ok = check('34f', sig == FAILED, "a manifest signed with another key fails") and ok
         content, sig = verify_ocsf_export(load_ocsf_export(gap_root), chain, records, public_point=None, quiet=True)
-        ok = check('31i', sig == UNSIGNED and content == PASSED, "a signed manifest with no public key given is not verified, and says so") and ok
+        ok = check('34i', sig == UNSIGNED and content == PASSED, "a signed manifest with no public key given is not verified, and says so") and ok
 
         # 29g: a mapping version this verifier does not read.
         vroot = root / 'version'
         vroot.mkdir()
         vday, vname = write_export(vroot, [first], 0, 0, mapping_version='9')
         content, _ = verify_ocsf_export(load_ocsf_export(vday / f'{vname}.manifest.json'), chain, records, public_point=jwk_point, quiet=True)
-        ok = check('31g', content == CANNOT_EVALUATE, "an unknown ocsf mapping_version is CANNOT EVALUATE, never a pass") and ok
+        ok = check('34g', content == CANNOT_EVALUATE, "an unknown ocsf mapping_version is CANNOT EVALUATE, never a pass") and ok
 
         # The index.json route resolves sink-relative keys.
         index = gday / 'index.json'
         index.write_text(json.dumps({'manifests': [f'ocsf/v1/pxy_selftest/{chain}/2026/01/01/{p.name}' for p in sorted(gday.glob('*.manifest.json'))]}), encoding='utf-8')
-        ok = check('31j', len(load_ocsf_export(index)) == 2, "a day's index.json resolves its manifests against the sink root") and ok
-    ok = check('31k', 'ocsf-export-v1' in VERIFIER_CAPABILITIES, "VERIFIER_CAPABILITIES advertises ocsf-export-v1 (ADR-0090 D6)") and ok
+        ok = check('34j', len(load_ocsf_export(index)) == 2, "a day's index.json resolves its manifests against the sink root") and ok
+    ok = check('34k', 'ocsf-export-v1' in VERIFIER_CAPABILITIES, "VERIFIER_CAPABILITIES advertises ocsf-export-v1") and ok
     return ok
 
 
@@ -12318,7 +12529,7 @@ def main():
         '--ocsf-export',
         metavar='PATH',
         help=(
-            'Also check an OCSF evidence export (ADR-0090) against this pack: a .manifest.json, '
+            'Also check an OCSF evidence export against this pack: a .manifest.json, '
             'a day\'s index.json, or a directory of manifests, with objects and .manifest.sig files '
             'beside them. Object digests, manifest signatures (with --ocsf-public-key), and every '
             'exported event\'s chain coordinates and digests against the pack record.'
@@ -12333,7 +12544,7 @@ def main():
         '--conditions-sha256',
         metavar='HEX',
         help=(
-            'Also give the customer-conditions verdict (ADR-0095 D7) for the condition set whose SHA-256 you '
+            'Also give the customer-conditions verdict for the condition set whose SHA-256 you '
             'hold: its acceptance on the holder\'s control-plane chain, the records after it sealed under a '
             'governance version carrying it, and the exceptions its instances recorded.'
         ),
@@ -12367,6 +12578,7 @@ def main():
         ok = receipt_self_test() and ok
         ok = control_plane_self_test() and ok
         ok = tool_calls_self_test() and ok
+        ok = content_carry_forward_self_test() and ok
         ok = exchange_self_test() and ok
         ok = conditions_self_test() and ok
         ok = signature_self_test() and ok
