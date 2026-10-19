@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Check verify-pack.py against the segment-object fixtures (MEI-2863,
-ADR-0081 D6, D7, D9).
+"""Check verify-pack.py against the segment-object fixtures.
 
     python3 fixtures/run-segment-cases.py
 

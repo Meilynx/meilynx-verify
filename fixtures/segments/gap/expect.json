@@ -1,5 +1,5 @@
 {
-  "about": "No object holds seq 2 and later objects exist (ADR-0081 D7). The manifest lists the records present; seq 3 does not link to seq 1, so the chain fails there.",
+  "about": "No object holds seq 2 and later objects exist. The manifest lists the records present; seq 3 does not link to seq 1, so the chain fails there.",
   "runs": [
     {
       "absent": [

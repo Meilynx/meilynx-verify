@@ -39,7 +39,7 @@ Exit codes, the same online and offline:
 |---|---|
 | `0` | Every record verified, and on a signed pack the signature too. An unsigned pack reaches `0` only with `--allow-unsigned`, and the output still says authenticity is not established. |
 | `1` | Verification failed. The output names the first record that failed and why (hash mismatch, chain break, missing record, unknown record kind, two stored copies of one record that differ), why the signature failed, or which chain-head anchor failed and why. |
-| `2` | This verifier cannot evaluate the pack: an unsupported hash version, manifest version, storage layout, signature method or bundle format (use a newer release), an unusable `--trusted-root`, or an anchor from a witness with no trust root (pass `--tsa-root`). |
+| `2` | This verifier cannot evaluate the pack: an unsupported hash version, manifest version, storage layout, evidence class, content claim, signature method or bundle format (use a newer release), an unusable `--trusted-root`, an anchor from a witness with no trust root (pass `--tsa-root`), a pack signed by a per-tenant signer checked without `--certificate-identity`, or a content-stripped pack read with `--bucket` or still carrying a removed field. |
 | `3` | The records verified, but the pack is unsigned, so nothing shows who produced the manifest. |
 
 When more than one applies, `1` outranks `2`, and `2` outranks `3`.
@@ -77,6 +77,7 @@ A **pack** is what a Meilynx proxy's `integrity-pack` command produces:
 | `records/<seq>.bin` | The chain records themselves, one JSON document per file, named by 20-digit zero-padded sequence number. This is the per-record layout of the write-once bucket; a chain the bucket stores in segment objects is exported in the same form (see "Segment objects" below). |
 | `manifest.json.sigstore.json` | Present on a signed pack: a Sigstore bundle holding a keyless cosign signature over `manifest.json`, the signing certificate, and the Rekor transparency-log proof |
 | `records/anchors/<seq>.json` and `records/anchors/<seq>.<witness>.tsr` | Present on an anchored chain: the chain-head statement the proxy timestamped, and one RFC 3161 token per witness |
+| `records/control-plane/<seq>.json` | Present on a pack whose manifest (1.3 and later) carries the control-plane chain: the control plane's own record of the human actions a decision involved, one JSON object per record, verified from its genesis and checked against each decision receipt in the pack that cites one of its records ([SPEC.md](SPEC.md) §6.3) |
 
 Records are exported alongside the manifest with
 `verify-pack.py --bucket … --export-records DIR` by someone who has read
@@ -114,6 +115,14 @@ confirms all of the following:
 A pack whose manifest says it is signed, and whose signature is missing or
 fails any of these checks, exits `1` with the reason. A signed pack that has
 had its signature removed and been relabelled as unsigned exits `3`, not `0`.
+
+A pack exported from a customer project is signed instead by that project's
+own signer, a service account whose certificate names it by email with the
+issuer `https://accounts.google.com`. Nothing in the pack can say whose
+signer it is, so pass the exact email the evidence holder published for the
+project with `--certificate-identity <email>`; the issuer follows. Without
+it such a pack exits `2`, not `0`, even though the signature itself checks
+out. There is no pattern match ([SPEC.md](SPEC.md) §7.2).
 
 The trust anchors (the Fulcio certificates and the Rekor log key) are the
 Sigstore public-good values, written out in `verify-pack.py` as
@@ -217,6 +226,40 @@ produce. `fixtures/run-segment-cases.py` runs each one offline and against a
 stand-in bucket, and checks that the exported records are byte-identical to
 the anchored sample's per-record objects.
 
+## Further checks
+
+Each of these runs with the chain check and ranks its verdict against it by
+the same exit-code precedence.
+
+- **Decision receipts and the control-plane chain** (no flag). A
+  `decision_receipt` record's evidence digest, clock arithmetic and evidence
+  entries are checked against the pack, the manifest's `decision_receipts`
+  index against the receipts, and, on a manifest 1.3 or later pack that
+  carries one, the control-plane chain from its genesis, with each receipt's
+  anchor checked against it ([SPEC.md](SPEC.md) §4.3, §6.3, §6.4).
+- **Evidence class and content-stripped packs** (no flag). A 1.4 manifest's
+  `evidence_class` is printed on every verdict line; a 1.5 manifest's
+  content-stripped pack is verified from its sealed digests, linked through
+  its hash-only stubs, and refused if a record still carries a removed field
+  ([SPEC.md](SPEC.md) §6.5, §6.6).
+- `--ocsf-export PATH`, with `--ocsf-public-key JWK`: check an OCSF export
+  of the chain (a `.manifest.json`, a day's `index.json`, or a directory)
+  against the pack: each object's digest, each manifest's signature, and
+  every exported event's chain coordinates and digests against the pack
+  record at that sequence ([SPEC.md](SPEC.md) §9).
+- `--conditions-sha256 HEX`, with `--conditions-acceptance FILE` for a pack
+  that does not carry the control-plane chain: the customer-conditions
+  verdict for the condition set whose digest you hold, counting the records
+  in the window sealed under it, its gaps and its exceptions
+  ([SPEC.md](SPEC.md) §10).
+- `--certificate-identity` and `--certificate-oidc-issuer`: the signer a
+  signed pack must carry (see "Signed packs").
+- `--tsa-root ID=FILE`: a customer witness's root for chain-head anchors
+  (see "Chain-head anchors").
+- `--export-records DIR`: write every record read, including control-plane
+  records and anchors, as per-record files for a reviewer without bucket
+  access.
+
 ## What a passing verdict means, and what it does not
 
 A pass proves that, for every record in the window:
@@ -248,10 +291,17 @@ It does **not** prove:
 ## Versions
 
 The verifier understands chain records with `schema_version` v1 through
-v1.14, stored per record or in segment objects, and pack manifests 1.0, 1.1
-and 1.2 (1.1 adds chain-head anchors, 1.2 the storage layout). A record of an
-unknown version or kind fails verification rather than being skipped; a
-manifest of an unknown version or storage layout is cannot evaluate (exit
+v1.18, stored per record or in segment objects, and pack manifests 1.0
+through 1.5 (1.1 adds chain-head anchors, 1.2 the storage layout, 1.3 the
+control-plane chain, 1.4 the evidence class label, 1.5 the content-stripped
+pack with its hash-only stubs). It declares the pack features it checks in
+`VERIFIER_CAPABILITIES`: `chain-anchors-v1`, `segmented-records-v1`,
+`decision-receipts-v1`, `evaluation-trace-v1`, `data-reach-evidence-v1`,
+`control-plane-chain-v1`, `ocsf-export-v1`, `customer-scope-v1`,
+`per-tenant-signer-v1`, `evidence-class-v1`, `content-stripped-v1` and
+`customer-conditions-v1`. A record of an unknown version or kind fails
+verification rather than being skipped; a manifest of an unknown version,
+storage layout, evidence class or content claim is cannot evaluate (exit
 `2`). Changes to the verifier are listed in
 [CHANGELOG.md](CHANGELOG.md). The canonical source of this file is the
 `meilynx-integrity-pack` crate in the proxy; releases here are byte-identical

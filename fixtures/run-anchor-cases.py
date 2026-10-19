@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Check verify-pack.py's chain-anchor verification against the proxy's
-verifier and against OpenSSL (MEI-2758, ADR-0075).
+verifier and against OpenSSL.
 
     python3 fixtures/run-anchor-cases.py
 
@@ -36,7 +36,7 @@ spec = importlib.util.spec_from_file_location("verify_pack", VERIFIER)
 vp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(vp)
 
-# verify-pack.py, like the proxy's verifier, applies ADR-0075 D9 policy that
+# verify-pack.py, like the proxy's verifier, applies anchor policy that
 # `openssl ts -verify` does not. Only this direction is tolerated:
 # verify-pack.py refusing what OpenSSL accepts, never the reverse.
 STRICTER_THAN_OPENSSL = {

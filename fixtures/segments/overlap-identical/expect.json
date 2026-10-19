@@ -1,5 +1,5 @@
 {
-  "about": "Seq 2 is held by two segments with byte-identical records (ADR-0081 D7): a WARN segment_overlap, not a failure.",
+  "about": "Seq 2 is held by two segments with byte-identical records: a WARN segment_overlap, not a failure.",
   "export_matches_legacy": true,
   "runs": [
     {

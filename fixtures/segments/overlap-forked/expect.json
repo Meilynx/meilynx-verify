@@ -1,5 +1,5 @@
 {
-  "about": "Seq 2 is held by two segments with different bytes (ADR-0081 D7): a fork, FAIL.",
+  "about": "Seq 2 is held by two segments with different bytes: a fork, FAIL.",
   "runs": [
     {
       "absent": [

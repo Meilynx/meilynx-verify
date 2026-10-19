@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Run verify-pack.py, as a reviewer would, against every signed-pack case
-from generate-signature-vectors.py and check its exit code and reason (MEI-922).
+from generate-signature-vectors.py and check its exit code and reason.
 
     python3 fixtures/run-signature-cases.py
     python3 fixtures/run-signature-cases.py --cosign cosign   # also ask cosign

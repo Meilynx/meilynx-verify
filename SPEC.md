@@ -5,12 +5,13 @@ enough that a verifier can be written from it without reading Meilynx code.
 `verify-pack.py` in this repository is one such verifier; its `--self-test`
 pins the values below against fixture hashes.
 
-Status: describes chain records with `schema_version` v1 through v1.13, the
-per-record and segment storage layouts, and pack manifest `schema_version`
-1.0, 1.1 and 1.2, as read by `verify-pack.py` from meilynx-proxy commit
-`ed2bc9f` (2026-10-04). The segment layout and manifest 1.2 are specified
-ahead of the proxy release that writes them; a chain written before that
-release is per-record, and its packs carry manifest 1.0 or 1.1.
+Status: describes chain records with `schema_version` v1 through v1.18, the
+per-record and segment storage layouts, pack manifest `schema_version` 1.0
+through 1.5, the control-plane chain a 1.3 manifest carries, the per-tenant
+pack signature, the export copy a pack can be checked against (§9) and the
+customer-conditions verdict (§10), as read by `verify-pack.py` from
+meilynx-proxy commit `647bb71` (2026-10-19). A chain written before the
+segment rollout is per-record, and its packs carry manifest 1.0 or 1.1.
 
 ## 1. Records
 
@@ -92,8 +93,8 @@ Every record carries at least these fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.14"`). Absent means `"v1"`. |
-| `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`). Absent means `llm_request`. |
+| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.18"`). Absent means `"v1"`. |
+| `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`, `decision_receipt`). Absent means `llm_request`. |
 | `sequence_number` | integer | Position in the chain, starting at 0. |
 | `timestamp_utc` | string | RFC 3339 UTC timestamp, nanosecond precision, `Z` suffix. |
 | `event_id` | string | Unique id of this record. |
@@ -107,8 +108,9 @@ Every record carries at least these fields:
 | `event_hash` | string | Hex SHA-256 of this record's preimage (§3). |
 
 Kind-specific payloads live under `admin_action`, `auth_session`,
-`mcp_event`, `coverage`, `coverage_key_inventory`, `join_context`, `content`
-and `identity`. LLM records also carry
+`mcp_event`, `coverage`, `coverage_key_inventory`, `decision_receipt`,
+`join_context`, `content`, `identity`, `evaluation_trace` and `customer`.
+LLM records also carry
 `messages`, `response_text`, `findings`, `policy_version`,
 `raw_request`/`raw_response` and routing metadata; **only the fields listed
 in the preimage tables (§4) are covered by `event_hash`**. From v1.10 the
@@ -145,10 +147,13 @@ no separators and no length prefixes.
 | i64 | 8 bytes little-endian, two's complement. |
 | optional u64 | one byte `0x00` if absent/null; otherwise `0x01` followed by 8 bytes little-endian. |
 | optional i64 | one byte `0x00` if absent/null; otherwise `0x01` followed by 8 bytes little-endian. |
+| optional bool | one byte `0x00` if absent/null; otherwise `0x01` followed by one byte, `0x01` for true or `0x00` for false. |
 | f64 | 8 bytes little-endian IEEE 754; `null` is fed as `0.0` with **no** presence byte. |
 | principal | a tag byte then the principal's fields: `0x01` + `subject` (string) + `issuer` (optional string) for `{"kind":"human_user"}`; `0x02` + `agent_ref` (string) for `{"kind":"agent"}`. |
 | principal chain | `authenticated` (principal) then `0x00` if `on_behalf_of` is absent, else `0x01` + `on_behalf_of` (principal). |
 | sealed identity | `agent_id` (optional string), `tier` (string), `credential_kind` (string), `credential_kid` (optional string), then `0x00` if `delegated_human` is absent, else `0x01` + `subject` (string) + `issuer` (string), then `asserted_digest` (string). See §4.5. |
+| sealed customer | one byte `0x01`, then `label_sha256` (optional string), `source` (string), `credential_kid` (optional string). See §4.6. |
+| data reach | `binding_id` (string), `access` (optional string), `outcome` (string), `schema_known` (one byte, `0x01` for true or `0x00` for false), `arg_keys` (u32 count, then for each name a u32 byte length followed by its UTF-8 bytes), `arg_keys_omitted` (u32). See §4.7. |
 
 Two normalizations apply before hashing:
 
@@ -202,6 +207,7 @@ wire names differ from the serde `event_kind` values stored in the JSON:
 | `mcp_catalog_drift` | `mcp.catalog_drift` |
 | `coverage_computed` | `coverage.computed` |
 | `coverage_key_inventory` | `coverage.key_inventory` |
+| `decision_receipt` | `decision.receipt` |
 
 ### 4.3 Per-version suffixes
 
@@ -316,6 +322,117 @@ a v1.14 record without one, is invalid and fails verification, as is v1.14
 on any kind other than the MCP kinds. A v1.14 record's identity, when
 present, is checked as in §4.5.
 
+**v1.15 `decision.receipt`** — from `decision_receipt`, after the kind
+attestation: `receipt_id`, `receipt_type`, `receipt_type_version`,
+`registry_digest`, `source_kind`, `source_ref` (strings),
+`subject_ref_sha256` (optional string), `evidence_set_sha256` (string),
+`policy_version` (optional string), `outcome` (string),
+`outcome_reason_code`, `outcome_reason_sha256`, `decider_user_id`,
+`decider_role`, `decider_identity_provenance` (optional strings),
+`credential_status` (string), `credential_class`, `credential_registry`
+(optional strings), `credential_verified_at` (optional i64),
+`procedure_status` (string), `procedure_id`, `procedure_version`,
+`procedure_document_sha256` (optional strings), `procedure_effective_at`
+(optional i64), `clock_rule`, `clock_start_basis` (strings),
+`clock_started_at`, `clock_deadline_at` (i64, Unix seconds),
+`clock_decided_at`, `clock_elapsed_seconds` (optional i64), `clock_status`
+(string), `held_before_use` (optional bool), `supersedes_receipt_id`
+(optional string), `cp_anchor_event_id`, `cp_anchor_event_hash` (strings),
+`issued_at` (i64). 52 fields. A required string that is absent is fed as
+the empty string. The stored `evidence` list is outside the preimage; the
+verifier recomputes its RFC 8785 digest (an absent list is the empty list)
+and requires it to equal `evidence_set_sha256`. It also requires:
+
+- when `outcome` is `lapsed`: no `decider_user_id`, no `clock_decided_at`,
+  no `clock_elapsed_seconds`, and `clock_status` `lapsed`;
+- otherwise: a `decider_user_id`, all three of `clock_started_at`,
+  `clock_deadline_at` and `clock_decided_at`, `clock_elapsed_seconds` equal
+  to `clock_decided_at − clock_started_at`, and `clock_status` `within` when
+  `clock_decided_at ≤ clock_deadline_at`, else `breached`;
+- when `outcome` or `clock_status` is `lapsed`: `issued_at` and
+  `clock_deadline_at` present, with `issued_at ≥ clock_deadline_at`;
+- `credential_class`, `credential_registry` and `credential_verified_at`
+  when `credential_status` is `verified`; `procedure_id` and
+  `procedure_version` when `procedure_status` is `recorded`;
+- `outcome` one of `approved`, `escalated`, `rejected`, `lapsed`, and the
+  base `action` its projection (`approved` → `allow`, `escalated` → `hold`,
+  `rejected` and `lapsed` → `block`).
+
+Each `evidence` entry names a record by `chain_id`, `sequence_number`,
+`event_id` and `event_hash`. An entry that names this pack's chain (the chain
+the manifest `prefix` identifies; a chain under the flat `audit/` prefix is
+named by a tenant-scoped id of the form `chain_tnt_<proxy>_proxy`) at a
+sequence the pack holds must carry
+that record's `event_hash` and, when it carries an `event_id`, that record's
+`event_id`; a disagreement fails verification, naming the receipt and the
+field. An entry with no `chain_id`, or an internal id (`proxy`, `shadow`),
+names no chain; it is matched to the pack record at that sequence only when
+its `event_hash` is that record's, and an `event_id` it carries must then
+also be that record's. Any entry the pack cannot match prints `WARN
+receipt_evidence_outside_pack` with its coordinates and verifies. An entry
+that cites a hash-only stub (§6.6) is checked on its hash alone. The
+receipt's `cp_anchor_event_id` and `cp_anchor_event_hash` are checked against
+the control-plane chain when the pack carries one (§6.3), and the manifest's
+`decision_receipts` index against the receipts in the pack (§6.4).
+`decision.receipt` on any other version, v1.15 on any other kind, a v1.15
+record without the payload, or a decider on a lapsed receipt (or none on a
+decided one), is invalid and fails verification.
+
+**v1.16 `llm_request`** — the v1.12 `llm_request` layout with the
+`identity` block presence-tagged as in the v1.14 MCP kinds (`0x00` when the
+record carries none, else `0x01` followed by the sealed identity, §4.5),
+then `evaluation_trace.outcomes_sha256_jcs` (string). 36 entries counting
+the two presence bytes, when `content` and `identity` are present. A record
+is v1.16 when it carries an `evaluation_trace` and no `customer` block (a
+record with both is v1.18): the per-rule
+outcomes of the governance evaluation and the request's delivery outcome,
+stored as an object under `evaluation_trace.outcomes` and bound by that
+digest, which the verifier recomputes (RFC 8785). The trace's timing fields
+are stored but not hashed. A trace on any version other than v1.16 or v1.18,
+a v1.16 record without one, a trace whose `outcomes_sha256_jcs` is not a
+string, or v1.16 on any kind other than `llm_request`, is invalid and fails
+verification. A v1.16 record's `content` block, when present, is checked as
+in §4.4. Its identity, when present, is hashed as §4.5 gives; this release
+does not re-derive a v1.16 identity's asserted-label digest (§4.5).
+
+**v1.17 `mcp.policy_decision`** — the v1.14 MCP fields (identity
+presence-tagged, then `stage`), then the data reach (§3, §4.7) from
+`mcp_event.data_reach`: `binding_id` (string), `access` (optional string),
+`outcome` (string), `schema_known` (one byte), `arg_keys` (u32 count, then
+each name as a u32 byte length and its UTF-8 bytes), `arg_keys_omitted`
+(u32). 52 entries counting the presence byte, when `identity` is present.
+v1.17 is defined only for an `mcp.policy_decision` whose `stage` is
+`tool_call` and which carries a `data_reach` block; a record sealed without
+one stays in its earlier bucket. v1.17 on any other kind, a `data_reach`
+block on any version other than v1.17 or v1.18, on any other kind or stage,
+or one whose shape is not as §4.7 gives, is invalid and fails verification.
+The identity, when present, is checked as in §4.5.
+
+**v1.18 `llm_request`** — the v1.16 layout with the trace presence-tagged:
+`0x00` when the record carries no `evaluation_trace` (a request refused
+before evaluation), else `0x01` followed by `outcomes_sha256_jcs`. Then the
+sealed customer (§3, §4.6). 41 entries counting the three presence bytes and
+the customer block's leading tag byte, when `content`, `identity` and
+`evaluation_trace` are all present. The trace,
+when present, is checked as for v1.16; the content as in §4.4; the identity
+as in §4.5.
+
+**v1.18 MCP kinds** — the v1.14 MCP fields (identity presence-tagged, then
+`stage`, an optional string that only `mcp.policy_decision` records carry),
+then one presence byte for `mcp_event.data_reach`: `0x00` if the record
+carries none, else `0x01` followed by the six v1.17 data-reach fields in
+their v1.17 order. Then the sealed customer (§3, §4.6). 57 entries counting
+the presence bytes and the customer block's leading tag byte, when
+`identity` and `data_reach` are present. A
+`data_reach` block is allowed only on a `tool_call`-stage
+`mcp.policy_decision`, as in v1.17. A `content` block on a v1.18 MCP record
+is invalid and fails verification: the MCP preimage never reads one.
+
+A record is v1.18 exactly when it carries a `customer` block, on either
+lane. A `customer` block on any other version, a v1.18 record without one,
+a block whose shape is not as §4.6 gives, or v1.18 on any kind other than
+`llm_request` and the MCP kinds, is invalid and fails verification.
+
 MCP kinds are: `mcp.tool_call`, `mcp.policy_decision`, `mcp.tool_result`,
 `mcp.tools_list.served`, `mcp.error`, `mcp.catalog_drift`. Any MCP hasher
 called with a non-MCP kind is an error.
@@ -324,11 +441,15 @@ called with a non-MCP kind is an error.
 Scheme (RFC 8785) serialization of the payload in question. For MCP records
 the verifier checks that the digest string is what the record hashed; it does
 not recompute the digest from a payload, because the payload is not part of
-the record. For LLM records with a `content` block (v1.10, v1.11, v1.12) it
-also recomputes the stored-content digests (§4.4), and for v1.12 records the
-asserted-claims digest (§4.5).
+the record. For LLM records with a `content` block (v1.10, v1.11, v1.12,
+v1.16, v1.18) it also recomputes the stored-content digests (§4.4), for
+v1.12, v1.14, v1.17 and v1.18 records with an identity the asserted-claims
+digest (§4.5), for v1.16 and
+v1.18 records the evaluation outcome digest, for v1.15 records the
+evidence-set digest (§4.3), and for v1.18 records the customer label digest
+(§4.6).
 
-### 4.4 LLM content attestation (v1.10, v1.11, v1.12)
+### 4.4 LLM content attestation (v1.10, v1.11, v1.12, v1.16, v1.18)
 
 `capture_policy` names what the record retains:
 
@@ -353,7 +474,7 @@ The six `content` fields:
 
 Because the digests are in the preimage and the content they describe is in
 the record, a verifier checks, for every v1.10 and v1.11 record and every
-v1.12 record that carries a `content` block:
+v1.12, v1.16 or v1.18 record that carries a `content` block:
 
 1. `stored_prompt_sha256_jcs`, when present, equals SHA-256(JCS(`messages`));
    when absent, `messages` is empty.
@@ -369,19 +490,26 @@ content is outside the preimage) and fails these checks. `prompt_sha256_jcs`
 and `response_sha256` cover content the record may no longer hold: whoever
 holds the original can show it is what the record was sealed over.
 
-A v1.12 record with no `content` block was sealed with no capture policy.
-Its prompt and response are stored but not bound, as before v1.10, and are
-not checked.
+A v1.12, v1.16 or v1.18 record with no `content` block was sealed with no
+capture policy. Its prompt and response are stored but not bound, as before
+v1.10, and are not checked.
+
+In a content-stripped pack (§6.6) `messages`, `response_text` and
+`tool_calls` are removed from every record. Checks 1, 2 and 4 are then not
+made: the sealed digests are inside the hash, which the chain walk
+recomputes, and that is all a stripped pack can show of them. Check 3 is
+still made, because `findings` are kept.
 
 JCS follows RFC 8785: object keys sorted by UTF-16 code units, no
 whitespace, strings escaped as in RFC 8785 §3.2.2.2, numbers in ECMAScript
 form (`1.0` → `1`, `1e-7` → `1e-7`, `1e21` → `1e+21`). A plain sorted-keys
 JSON dump differs on numbers and must not be used.
 
-### 4.5 Sealed identity (v1.12, v1.14)
+### 4.5 Sealed identity (v1.12, v1.14, v1.16, v1.17, v1.18)
 
 A v1.12 record carries an `identity` block naming who called the proxy (a
-v1.14 MCP record carries it too, when the proxy resolved one):
+v1.14, v1.16, v1.17 or v1.18 record carries it too, when the proxy resolved
+one):
 
 | Field | Hashed | Meaning |
 |---|---|---|
@@ -395,12 +523,60 @@ v1.14 MCP record carries it too, when the proxy resolved one):
 
 The asserted labels are stored beside their digest rather than hashed, so a
 reader sees the values and the digest proves they are the ones the proxy
-saw. A verifier therefore checks, for every v1.12 record and every v1.14
-record that carries an identity, that
+saw. A verifier therefore checks, for every v1.12 record and every v1.14,
+v1.17 or v1.18 record that carries an identity, that
 `asserted_digest` equals SHA-256(JCS(`asserted`)). A label rewritten after
 sealing leaves the chain hash intact and fails this check. The labels are
 claims a caller made, never evidence of who it was; only the hashed fields
-record what the proxy verified.
+record what the proxy verified. In a content-stripped pack (§6.6)
+`identity.asserted` is removed and this check is not made; the digest stays
+inside the hash. On a v1.16 record the identity is hashed but its
+asserted-label digest is not re-derived by this release; a v1.16 label
+rewritten after sealing is not caught until the record is checked by a
+release that does.
+
+### 4.6 Sealed customer (v1.18)
+
+A v1.18 record carries a `customer` block naming which of the proxy
+operator's customers the call was made for:
+
+| Field | Hashed | Meaning |
+|---|---|---|
+| `source` | yes | How the customer was established: `credential`, from a credential the proxy verified; `asserted`, from a label the caller supplied; `none`, no customer |
+| `label_sha256` | yes (optional string) | Hex SHA-256 over the UTF-8 bytes of the customer label; 64 lowercase hex characters |
+| `credential_kid` | yes (optional string) | The key id of the credential that established the customer |
+| `customer_id` | no, bound through `label_sha256` | The plain label, stored at the top level of the record beside the block |
+
+The block's shape follows from `source`: `none` carries neither a digest
+nor a kid; `asserted` carries a digest and no kid; `credential` carries a
+digest and a non-blank kid. A block of any other shape, or a `source` not
+listed, is invalid and fails verification.
+
+A verifier checks, for every v1.18 record whose `source` is `asserted` and
+which stores a non-empty `customer_id`, that `label_sha256` equals
+SHA-256(UTF-8(`customer_id`)). A label rewritten after sealing leaves the
+chain hash intact and fails this check. A missing `customer_id` is not a
+problem: a pack produced for one customer carries other customers' records
+without their label (as hash-only stubs, §6.6), and a content-stripped pack
+removes `customer_id` from every record.
+
+### 4.7 Data-reach block (v1.17, v1.18)
+
+A `tool_call`-stage `mcp.policy_decision` may carry `mcp_event.data_reach`:
+which declared data binding, if any, the tool call's arguments matched. Every
+member is hashed (§3). The shape a verifier requires, and fails the record
+without:
+
+- `outcome` is one of `matched`, `no_match`, `error`;
+- `binding_id` is `rb_` followed by 16 lowercase hex characters exactly when
+  `outcome` is `matched`, and the string `unbound` otherwise;
+- `access` is `read` or `write` exactly when `outcome` is `matched`, and
+  absent otherwise;
+- `schema_known` is a boolean;
+- `arg_keys` is a list of at most 32 strings, each non-empty and at most 64
+  characters, strictly ascending in UTF-8 byte order; it holds argument
+  names, never values;
+- `arg_keys_omitted` is an integer from 0 to 2³² − 1.
 
 ## 5. Reference values
 
@@ -414,12 +590,12 @@ useful for a from-scratch implementation:
 
 ## 6. Pack manifest
 
-`manifest.json` (schema_version `"1.0"`, `"1.1"` or `"1.2"`) describes one
+`manifest.json` (schema_version `"1.0"` through `"1.5"`) describes one
 verification window of one chain:
 
 ```json
 {
-  "schema_version": "1.0" | "1.1" | "1.2",
+  "schema_version": "1.0" | "1.1" | "1.2" | "1.3" | "1.4" | "1.5",
   "pack_id": "<uuid>",
   "window": "A" | "B",
   "signing_deferred": true | false,
@@ -441,8 +617,14 @@ verification window of one chain:
   "violation_kind": null,
   "error": null,
   "signature": { … present on window B only … },
-  "anchoring": { … present on 1.1 and 1.2, §6.1 … },
-  "storage_layout": "per-record" | "segmented-v1",   … present on 1.2 only, §6.2 …
+  "anchoring": { … present on 1.1 and later, §6.1 … },
+  "storage_layout": "per-record" | "segmented-v1",   … present on 1.2; on 1.3 and later when the chain is segmented, §6.2 …
+  "control_plane": { … present on 1.3; on 1.4 and 1.5 when the pack carries that chain, §6.3 … },
+  "decision_receipts": [ … present when the pack holds decision receipts, §6.4 … ],
+  "evidence_class": "<label>",                        … present on 1.4; optional on 1.5, §6.5 …
+  "content": "stripped",                              … present on 1.5 only, §6.6 …
+  "removed_fields": [ … ],                            … present on 1.5 only, §6.6 …
+  "stubs": [ … ],                                     … optional on 1.5 only, §6.6 …
   "events": [
     {
       "sequence": 0,
@@ -456,7 +638,7 @@ verification window of one chain:
       "recomputed_event_hash": "<hex>",
       "hash_match": true,
       "previous_hash_match": true,
-      "object": {"name": "<object name>", "index": 0}   … present on 1.2 only, §6.2 …
+      "object": {"name": "<object name>", "index": 0}   … present with storage_layout, §6.2 …
     }
   ]
 }
@@ -619,6 +801,148 @@ the 1.2 manifest's exact bytes as before (§7).
 a bucket with a 1.1 manifest, it finds no `{seq}.bin` object and reports
 every record missing (exit 1). It never passes such a chain.
 
+On 1.3, 1.4 and 1.5, `storage_layout` and `events[].object` are present
+exactly when the chain is segmented, and are read as on 1.2; a per-record
+chain carries neither.
+
+### 6.3 Control-plane chain (manifest 1.3)
+
+A manifest with `schema_version` 1.3 carries a `control_plane` section
+describing a second chain in the same bucket: the control plane's record of
+the human actions a governance decision involved (a held call released,
+denied or expired; a review disposition; a condition set accepted). A 1.4 or
+1.5 manifest carries the section when the pack holds that chain; a 1.0, 1.1
+or 1.2 manifest that carries one fails verification, as does a 1.3 manifest
+without one.
+
+```json
+"control_plane": {
+  "chain_family": "control-plane",
+  "prefix": "control-plane/",
+  "hash_algorithm": "SHA-256",
+  "hash_version": "v1",
+  "genesis_hash": "<hex>",
+  "verified": true,
+  "records_checked": 3,
+  "events": [
+    {"sequence": 0, "event_id": "…", "stored_event_hash": "<hex>", "recomputed_event_hash": "<hex>"}
+  ]
+}
+```
+
+Records are one JSON object each, at `control-plane/{seq:020d}.json` in the
+bucket; in an exported pack they sit under `records/control-plane/`, where
+`--export-records` writes them. Records carry `schema_version` `"v1"`, and
+`event_hash` is SHA-256 over the sequence number (i64 little-endian), the
+UTF-8 text of `previous_hash`, and the canonical JSON of the members
+`actor_user_id`, `correlation_id`, `event_id`, `event_kind`, `occurred_at`,
+`payload`, `project_id`, `schema_version` and `target_resource_id` (absent
+members as `null`). Canonical JSON orders object members by UTF-16 code
+units, has no whitespace, escapes only `"`, `\` and control characters
+(`\b`, `\f`, `\n`, `\r`, `\t`, else `\u00xx` in lowercase hex), writes every
+other character as UTF-8, and copies number tokens exactly as the stored
+record spells them: a verifier must keep the record's number text rather
+than re-format a parsed value. A record with a duplicate key, a `NaN` or
+`Infinity` token, or one that is not an object, is unreadable. Sequence 0
+links to the genesis hash of §2.
+
+**What a verifier checks** (`verify-pack.py` does all of these):
+
+| Finding | Verdict |
+|---|---|
+| `chain_family` is not `control-plane`, `prefix` is not `control-plane/`, `hash_version` is not `v1`, `genesis_hash` is not the §2 value, or `events[].sequence` is not `0, 1, …` in order | Fail (exit 1) |
+| A record that cannot be read, parsed, or whose `schema_version` is not `v1` | Fail (exit 1) at that sequence; the walk continues |
+| The record's `sequence_number` is not the entry's; its recomputed hash differs from its stored `event_hash` or from the entry's `recomputed_event_hash`; the entry's `event_id` is not the record's | Fail (exit 1) at that sequence |
+| `previous_hash` is not the hash of the record before it (genesis for sequence 0) | Fail (exit 1): chain break |
+| A record after one that failed, whose link could not be checked | Not verified: a `WARN` names it, and the chain's verdict is already Fail |
+
+A pass prints `CONTROL-PLANE OK` with the record count. Each decision
+receipt (§4.3) whose `cp_anchor_event_id` is the `event_id` of a verified
+control-plane record must carry that record's `event_hash` as
+`cp_anchor_event_hash`; a disagreement fails verification. A receipt naming
+a record that failed is not checked (`WARN`), and one naming no record in
+the pack prints `WARN receipt_anchor_outside_pack` and verifies.
+
+### 6.4 Decision receipts index
+
+A pack that holds decision receipts lists them in `decision_receipts`, on
+any manifest version:
+
+```json
+"decision_receipts": [
+  {"sequence": 7, "receipt_id": "…", "receipt_type": "…", "clock_status": "within"}
+]
+```
+
+A verifier checks that each entry carries exactly those four keys, that no
+sequence repeats, that each listed sequence is a `decision_receipt` record in
+the pack whose sealed `receipt_id`, `receipt_type` and `clock_status` equal
+the entry's, and that every decision receipt in the pack is listed. Any
+disagreement fails verification. A manifest without the key, from a generator
+that predates the index, is accepted; when the pack holds receipts, a NOTE
+says they were checked as records only. A pass prints one `RECEIPT` line per
+entry and `RECEIPTS INDEX OK`.
+
+### 6.5 Evidence class (manifest 1.4)
+
+A 1.4 manifest is a 1.3 manifest with a required `evidence_class` label
+inside the signed bytes, saying what kind of evidence the pack holds; a 1.5
+manifest carries it when it has one. The label must be one the verifier
+reads: `sandbox-non-production`, evidence sealed on a self-serve evaluation
+tenant, not production evidence. The verifier prints the label before the
+records and on every verdict line. An unknown label, a 1.4 manifest without
+one, or a label on a 1.0 to 1.3 manifest, is cannot evaluate (exit 2): a
+label is never ignored.
+
+### 6.6 Content-stripped packs (manifest 1.5)
+
+A 1.5 manifest describes a pack whose records carry no captured content and
+no personal data, for a reader who is entitled to the evidence but not to
+the content. Inside the signed bytes it says `content: "stripped"` and lists
+`removed_fields`, which must be exactly this set (a dotted name is a member
+of a nested object):
+
+`customer_id`, `end_user_id`, `identity.asserted`, `messages`,
+`raw_request`, `raw_response`, `response_text`, `tags_json`, `tool_calls`.
+
+None of these fields is in any record version's preimage, so every record
+still recomputes to its stored hash; a record that sealed its content is
+checked against the digests it sealed (§4.4, §4.5, §4.6), not against the
+removed content. A record that cannot be stripped and still verify, because
+its hash or a sealed digest covers a personal identifier
+(`auth_session.user_email`), ships as a **hash-only stub**: a JSON object
+holding exactly `sequence_number`, `event_hash`, `previous_hash` and
+`schema_version`, nothing of the body, listed in the manifest:
+
+```json
+"stubs": [
+  {"sequence": 3, "reason": "sealed_personal_identifier", "field": "auth_session.user_email"}
+]
+```
+
+`reason` is one of `sealed_personal_identifier`, `email_address` or
+`unreadable_record`; `field` names the field that forced the stub. The list,
+when present, is non-empty, in ascending sequence order with no repeat, and
+names only sequences in `events[]`.
+
+**What a verifier checks** (`verify-pack.py` does all of these):
+
+| Finding | Verdict |
+|---|---|
+| `content` is not `stripped`, `removed_fields` is not exactly the set above, `stubs` is malformed or names an unknown reason, or any of the three keys appears on a 1.0 to 1.4 manifest | Cannot evaluate (exit 2) |
+| The pack is read with `--bucket` | Cannot evaluate (exit 2): the bucket holds the full records, which are not what the manifest describes |
+| A record (or stub) still carries a removed field, or a non-null `auth_session.user_email` | Cannot evaluate (exit 2) at that sequence, after the walk; a chain failure outranks it |
+| A stub holds a member other than the four, lacks one, names another sequence, or its `event_hash` differs from the entry's `stored_event_hash` or `recomputed_event_hash` (on a signed pack the entry must carry `recomputed_event_hash`) | Fail (exit 1) at that sequence |
+| A stub's `previous_hash` does not link to the record before it, or the record after it does not link to the stub's `event_hash` | Fail (exit 1): chain break |
+| A stub whose `reason` is `unreadable_record` | Fail (exit 1): the stub stands for a record that does not parse, and nothing attests its hash |
+
+A stub's hash is never recomputed; the chain is linked through it, and it
+prints its own `STUB` line. The verdict line counts the stubs linked through
+and carries `[content: stripped]`. A receipt evidence entry (§4.3) or a
+chain-head anchor (§6.1) that cites a stub is checked on the stub's
+`event_hash`. Read as a full pack, the same records fail their content
+checks: the signed claim is what lets them verify.
+
 ## 7. Signed packs (window B)
 
 ### 7.1 Descriptor and bundle
@@ -678,11 +1002,35 @@ A verifier accepts the bundle only if every check below holds:
    codeSigning extended key usage, must not be a CA, and must have no unknown
    critical extensions.
 8. `integratedTime` falls within the signing certificate's validity.
-9. The certificate's subjectAltName equals the expected identity, and its
+9. The certificate's subjectAltName holds the expected identity, and its
    Fulcio issuer extension (OID `1.3.6.1.4.1.57264.1.8`, falling back to
-   `.1.1`) equals the expected issuer. For Meilynx packs these are:
+   `.1.1`) equals the expected issuer. For packs signed by the Meilynx
+   signing workflow these are:
    - identity `https://github.com/Meilynx/meilynx-proxy/.github/workflows/integrity-pack-signed.yml@refs/heads/main`
    - OIDC issuer `https://token.actions.githubusercontent.com`
+
+**Per-tenant signers.** A pack exported from a customer project is signed
+instead by that project's own signer: a service account whose certificate
+carries the issuer `https://accounts.google.com` and names the signer by an
+email subjectAltName. Nothing in the pack can say whose signer it is, so the
+reader supplies the exact email the evidence holder published for the
+project with `--certificate-identity`. The verifier then:
+
+- reads the issuer from the certificate; when it is `https://accounts.google.com`
+  the signer is per-tenant, and the identity is matched against the
+  certificate's email names only (a URI name never matches);
+- refuses to evaluate a per-tenant pack checked without
+  `--certificate-identity` (exit 2), even though the signature itself
+  checks out;
+- takes the expected issuer from `--certificate-oidc-issuer` when given;
+  otherwise `https://accounts.google.com` when the supplied identity
+  contains `@` and no `://`, and the workflow issuer above in every other
+  case, including when no identity is supplied. The issuer is still compared
+  exactly with the certificate's.
+
+There is no pattern match on the identity: a per-tenant pack verifies only
+against the one email the reader names, and the output says it is the
+identity the reader supplied.
 
 Trust anchors (Fulcio CA chains and the Rekor log key, each with its
 validity window) come from the Sigstore public-good `trusted_root.json`,
@@ -698,11 +1046,13 @@ as unsupported, never as a pass.
 |---|---|
 | 0 | Records verified, and for a signed pack the signature. An unsigned pack reaches 0 only when the reader passes `--allow-unsigned`. |
 | 1 | A record or the signature failed. The reason is one of: signature required by manifest but missing; manifest bytes changed since signing; untrusted certificate chain; signer identity mismatch; OIDC issuer mismatch; invalid transparency-log proof; transparency-log entry does not match this signature; signed outside certificate validity; malformed signature material. |
-| 2 | Cannot evaluate: unsupported hash version, signature method or bundle format, or unusable trust anchors. |
+| 2 | Cannot evaluate: unsupported hash version, manifest version, storage layout, evidence class, content claim, signature method or bundle format; unusable trust anchors; a per-tenant signer checked without `--certificate-identity`; a content-stripped pack read with `--bucket` or still carrying a removed field. |
 | 3 | Unsigned pack: records verified, authenticity not established. |
 
 1 outranks 2, which outranks 3. The codes are the same whether the records
-are read from the bucket or from an exported record set.
+are read from the bucket or from an exported record set. The export check
+(§9) and the customer-conditions verdict (§10) each produce a code by the
+same rule, and the highest-ranking code is the exit code.
 
 ### 7.4 When this section changes
 
@@ -743,7 +1093,19 @@ since; the chain hashes attest the records.
   On v1.12 records the caller's asserted labels are bound through
   `asserted_digest` (§4.5), and the principal chain's
   `on_behalf_of_attestation` marker is stored but not hashed; the hashed
-  `delegated_human` must agree with it.
+  `delegated_human` must agree with it. On v1.15 records the `evidence`
+  list is stored but not hashed; `evidence_set_sha256` binds it (§4.3). On
+  v1.16 and v1.18 records the evaluation trace's timing is stored but not
+  hashed; its outcomes are bound by `outcomes_sha256_jcs` (§4.3). On v1.18
+  records the plain `customer_id` is stored but not hashed; `label_sha256`
+  binds it only when `source` is `asserted` (§4.6). On every LLM record
+  `policy_version` is stored but not hashed, and on every MCP record
+  `mcp_event.finding_summary` is; the customer-conditions verdict (§10) says
+  which of its findings rest on them.
+- **Export copies.** An export of the chain to another format (§9) is a
+  copy; the chain is the record. The verifier checks a copy against the
+  pack, never the pack against a copy, and cannot recompute a record's hash
+  from the copy.
 - **Whether a detector missed something.** Under `redacted`, only spans a
   detector located are masked. The stored copy can still contain sensitive
   text no detector recognized.
@@ -754,4 +1116,117 @@ since; the chain hashes attest the records.
   chain-head anchor (§6.1) shows that a record existed no later than the
   witness's `genTime`, and the verifier flags a record clock that runs ahead
   of its anchor. A pack without anchors shows nothing about time, and says
-  so with an `UNANCHORED` notice.
+  so with an `UNANCHORED` notice. The same holds for a decision receipt's
+  clock fields and a control-plane record's `occurred_at`: the sealed
+  arithmetic is checked (§4.3), the clock behind it is not.
+
+## 9. Export copies
+
+A proxy may write its sealed records to a sink in OCSF form: gzip-compressed
+NDJSON objects named by chain coordinates, each beside a `.manifest.json`
+(RFC 8785 bytes) and, when the proxy holds an export signing key, a detached
+`.manifest.sig`. The export is a copy of the chain, not the chain; content
+fields are excluded from it by design, so a record's hash cannot be
+recomputed from the export. `verify-pack.py --ocsf-export PATH` checks the
+copy against the pack it is run with. `PATH` is one `.manifest.json`, a day's
+`index.json` (whose `manifests` keys are resolved against the sink root that
+holds it), or a directory searched for `*.manifest.json`; the object and the
+signature are read beside each manifest.
+
+An export manifest carries `mapping_version` (this verifier reads `"1"`),
+`chain_id`, `first_sequence`, `last_sequence`, `record_count`,
+`event_count`, `object` (the object's sink-relative key), `object_sha256`,
+`signed` and `public_key_id`. Each line of the object is one event carrying
+`meilynx.chain` (`chain_id`, `sequence_number`, `event_id`, `event_hash`,
+`previous_hash`) and `meilynx.digests`, whose members are the digest fields
+of §4.3 and §4.4 (`prompt_sha256_jcs`, `response_sha256`,
+`stored_prompt_sha256_jcs`, `stored_response_sha256`, `findings_sha256_jcs`,
+`tool_calls_sha256_jcs`, `stored_tool_calls_sha256_jcs` from `content`;
+`payload_sha256_jcs`, `redacted_payload_sha256_jcs`,
+`redaction_pre_sha256_jcs`, `redaction_post_sha256_jcs`, `mcp_bundle_sha256`
+from `mcp_event`; `evidence_set_sha256` and `registry_digest` from
+`decision_receipt`; `outcomes_sha256_jcs` from `evaluation_trace`;
+`asserted_digest` from `identity`), each `null` when the record has none.
+
+**What a verifier checks** (`verify-pack.py` does all of these):
+
+| Finding | Verdict |
+|---|---|
+| `mapping_version` is not one the verifier reads | Cannot evaluate (exit 2) for that manifest, never a pass |
+| `PATH` cannot be read or holds no manifest, or the `--ocsf-public-key` file is not a usable JWK | Cannot evaluate (exit 2) |
+| `first_sequence` or `last_sequence` is not an integer; the object is missing beside its manifest; SHA-256 of the object differs from `object_sha256`; the object is not gzip NDJSON | Fail (exit 1), naming the object |
+| The number of lines differs from `event_count`; the number of distinct sequences differs from `record_count`; the sequences do not span exactly `first_sequence`..`last_sequence` | Fail (exit 1), naming the object |
+| A line that is not JSON, whose `chain_id` is not the manifest's, or whose `sequence_number` is outside the manifest's range | Fail (exit 1), naming the object and the line |
+| An event on the pack's chain at a sequence the pack holds whose `event_id` or `event_hash` differs from the pack record's, whose `previous_hash` (when present) differs, or whose non-null digest is not the value the pack record holds in `content` or `mcp_event`, or names a digest the verifier does not know | Fail (exit 1), naming the object, the line and the field |
+| An event on another chain, or at a sequence the pack does not hold | Pass, counted in one `WARN export_record_outside_pack`; not checked |
+| Consecutive manifests of one chain that leave sequences uncovered, or overlap | Pass, with `WARN export_gap` or `WARN export_overlap` |
+| A manifest that says it is `signed` and has no `.manifest.sig` | Signature fail (exit 1) |
+| A signed manifest checked with `--ocsf-public-key JWK` (a P-256 EC JWK): the signature is 64 raw bytes `r ‖ s` in standard base64, verified as ECDSA P-256 over SHA-256 of the manifest's exact bytes | Pass when it verifies; signature fail (exit 1) when it does not |
+| A signed manifest with no key given, or a manifest that is not signed | Unsigned (exit 3 without `--allow-unsigned`): the copy matches, authenticity not established |
+
+The export's content and signature verdicts combine like a pack's (§7.3),
+and the result ranks against the pack's code. An export is not checked
+against a pack the verifier cannot evaluate.
+
+## 10. Customer-conditions verdict
+
+An evidence holder's control plane can accept a set of conditions another
+party proposed, compile it into the holder's governance and MCP bundles as
+rule instances `<family>@cust_<12 hex>` (the first 12 hex digits of the
+relationship id), and seal the acceptance on its control-plane chain (§6.3)
+as a record of `event_kind` `exchange.conditions_accepted` whose `payload`
+carries `conditions_sha256` (the digest of the set the proposer holds),
+`relationship_id`, and the compiled `compiled_governance_sha256` and
+`compiled_mcp_sha256`. `verify-pack.py --conditions-sha256 HEX` adds one
+verdict for that set, from the pack alone:
+
+**The acceptance.** The last `exchange.conditions_accepted` record in the
+pack's control-plane chain whose `payload.conditions_sha256` is `HEX`,
+whether or not it verified; an earlier acceptance of the same digest is
+never used in its place. Its `payload` must name a `relationship_id` that is a UUID, an
+`occurred_at` that is a timestamp, and at least one 64-hex compiled bundle
+digest; otherwise the verdict cannot be evaluated (a record supplied from
+outside the pack that is not usable fails it). An acceptance that did not
+verify in §6.3 fails the verdict. A pack that carries no control-plane
+chain ("acceptance not in this pack"), or whose chain holds no acceptance
+of the set ("this pack's control-plane chain holds no acceptance of the
+set"), cannot evaluate the verdict (exit 2), unless the stored record
+(`control-plane/{seq:020d}.json`) is given with `--conditions-acceptance
+FILE`: its hash is then recomputed as in §6.3 and must equal its
+`event_hash` (and, when the pack's chain holds a record with its
+`event_id`, equal that record's), and the verdict says its link into the
+holder's chain is not in the pack. Without an acceptance, only the records
+that name a customer-condition instance are listed.
+
+**The window.** The `llm_request` and MCP records of the pack whose
+`timestamp_utc` is at or after the acceptance's `occurred_at` and, when a
+later control-plane record released the set (`exchange.conditions_released`
+of the same digest) or superseded it (an acceptance of another digest for
+the same relationship), before that record's `occurred_at`. A hash-only stub
+(§6.6) has no timestamp and is named apart, never placed in the window.
+
+**Sealed under the set.** A record counts only by sealed evidence: an MCP
+record whose hashed `mcp_event.mcp_bundle_sha256` equals
+`compiled_mcp_sha256`, or an `llm_request` (v1.16 or v1.18) whose
+digest-bound `evaluation_trace.outcomes.rules[].rule_id` includes one ending
+in `@cust_<12 hex>` for this relationship. Every other record in the window
+is a `GAP` line with its sequence and hash. An `llm_request` whose unhashed
+`policy_version` equals `compiled_governance_sha256` is counted in a
+separate NOTE, never as sealed.
+
+**Exceptions.** Each record in the window that names one of the set's
+instances prints an `EXCEPTION` line saying what named it and whether a
+sealed digest binds it: a `findings[].validator` (bound by
+`content.findings_sha256_jcs` when the record carries one, else stored, not
+hashed); the trace's `outcomes.deciding_rule_id` (bound by
+`outcomes_sha256_jcs`); an `mcp_event.finding_summary[]` `rule_id` or
+`detector` (stored, not hashed). A compiled MCP matrix row (`cust_<12
+hex>.…`) is not an instance: a hold it raised that a person released is the
+condition working.
+
+The verdict line is `conditions: set <HEX> accepted at seq N; M of T records
+in the window sealed under a governance version carrying it; E exceptions;
+compiled by the holder's control plane`. The last clause is what the pack
+cannot show: the compile runs in the holder's control plane, and the pack
+carries bundle digests, not bundles. The verdict's code ranks against the
+pack's as in §7.3; the verdict never changes the chain's own verdict.
