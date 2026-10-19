@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Write the segment-object fixtures (MEI-2863, ADR-0081 D7) under
+"""Write the segment-object fixtures under
 fixtures/segments/, from the per-record legacy pack
 fixtures/anchors/packs/fully-anchored/.
 
     python3 fixtures/gen-segment-fixtures.py [OUT_DIR]
 
 Every case stores the legacy chain's records, byte for byte, in the segment
-layout of ADR-0081 D2 (`{first:020}-{last:020}.seg`: each record followed by
+layout (`{first:020}-{last:020}.seg`: each record followed by
 one 0x0A), with a manifest 1.2 (`storage_layout`, a per-entry `object`
 reference) derived from the legacy manifest. Each case's expect.json holds
 the exit code and lines verify-pack.py must print; fixtures/run-segment-cases.py
 checks them in --records and --bucket mode and checks that this script still
 writes exactly the committed bytes.
 
-The cases, one per ADR-0081 D7 row:
+The cases:
 
   segmented          the whole chain in two segments                    exit 0
   mixed              per-record and segment objects in one chain        exit 0
@@ -100,7 +100,7 @@ CASES = [
     },
     {
         "name": "overlap-identical",
-        "about": "Seq 2 is held by two segments with byte-identical records (ADR-0081 D7): a WARN "
+        "about": "Seq 2 is held by two segments with byte-identical records: a WARN "
                  "segment_overlap, not a failure.",
         "objects": [seg(0, 2), seg(2, 4)],
         "anchored": True,
@@ -112,7 +112,7 @@ CASES = [
     },
     {
         "name": "overlap-forked",
-        "about": "Seq 2 is held by two segments with different bytes (ADR-0081 D7): a fork, FAIL.",
+        "about": "Seq 2 is held by two segments with different bytes: a fork, FAIL.",
         "objects": [seg(0, 2), seg(2, 4)],
         "forked": (seg(2, 4), 2),
         "anchored": False,
@@ -124,7 +124,7 @@ CASES = [
     },
     {
         "name": "gap",
-        "about": "No object holds seq 2 and later objects exist (ADR-0081 D7). The manifest lists the "
+        "about": "No object holds seq 2 and later objects exist. The manifest lists the "
                  "records present; seq 3 does not link to seq 1, so the chain fails there.",
         "objects": [seg(0, 1), seg(3, 4)],
         "events": [0, 1, 3, 4],
@@ -137,7 +137,7 @@ CASES = [
     {
         "name": "truncated",
         "about": "The chain was finalized at final_next_sequence=5, but its objects stop at seq 3: the "
-                 "segment holding seq 4 was never written (ADR-0081 D7). The records present verify; "
+                 "segment holding seq 4 was never written. The records present verify; "
                  "the shortfall is a completeness verdict (the reconciler's finalized_mismatch), not an "
                  "integrity one.",
         "objects": [seg(0, 1), seg(2, 3)],

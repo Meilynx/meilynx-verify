@@ -1,5 +1,5 @@
 {
-  "about": "MEI-2758 anchor token cases; written by examples/gen_anchor_fixtures.rs. `rust` is the proxy verifier's verdict (ok or AnchorVerifyError::code) for this token, imprint, nonce and genTime against the listed roots.",
+  "about": "Anchor token cases; written by examples/gen_anchor_fixtures.rs. `rust` is the proxy verifier's verdict (ok or AnchorVerifyError::code) for this token, imprint, nonce and genTime against the listed roots.",
   "cases": [
     {
       "gen_time": "2026-05-01T00:10:00Z",

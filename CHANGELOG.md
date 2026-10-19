@@ -1,5 +1,124 @@
 # Changelog
 
+## 0.9.0 (2026-10-19)
+
+- `verify-pack.py` from meilynx-proxy `647bb71`.
+- **Upgrade before verifying chains or packs written after this release.**
+  A verifier older than 0.9.0 stops at the first `decision_receipt` record
+  with `unknown schema_version 'v1.15'` (and likewise at the first v1.16,
+  v1.17 or v1.18 record), and exits 2 on a 1.3, 1.4 or 1.5 manifest. It
+  never reports such a chain as a pass.
+- Chain v1.15 (SPEC §4.3): a new record kind, `decision_receipt`, sealed
+  when a decision on a held call or a reviewed item is recorded. The v1.2
+  prefix, the kind attestation `decision.receipt`, then 36 receipt fields in
+  the order §4.3 lists (52 fields). The stored `evidence` list is outside the
+  preimage and bound by `evidence_set_sha256`, which the verifier recomputes
+  (RFC 8785). The verifier also checks the sealed clock arithmetic against
+  the timestamps, that a lapse was issued no earlier than its deadline, the
+  decider rule, the completeness of a `verified` credential and a `recorded`
+  procedure, and that the base `action` is the outcome's projection.
+  Each evidence entry that cites a record in the pack must carry that
+  record's `event_id` and `event_hash`; one outside the pack is `WARN
+  receipt_evidence_outside_pack`. The manifest's `decision_receipts` index
+  (SPEC §6.4) must list every receipt in the pack, nothing else, field for
+  field. `decision_receipt` on any other version, or v1.15 on any
+  other kind, fails verification.
+- Chain v1.16 (SPEC §4.3): an `llm_request` record the governance pipeline
+  evaluated carries an `evaluation_trace`: which rules ran, what each
+  decided, and how the response reached the caller. The preimage is the
+  v1.12 layout with the identity block presence-tagged, then
+  `outcomes_sha256_jcs`; the stored outcomes are bound by that digest, which
+  the verifier recomputes (RFC 8785). Timing is stored but not hashed. A
+  trace on any other version (v1.18 aside), or v1.16 without one, fails
+  verification. A v1.16 record's stored prompt, response, findings
+  and tool calls are re-derived from its content digests as on v1.12.
+- Chain v1.17 (SPEC §4.3, §4.7): a `tool_call`-stage `mcp_policy_decision`
+  that classified the call's arguments against declared data bindings
+  carries `mcp_event.data_reach`. The preimage is the v1.14 layout, then the
+  block's six members (binding id, access, outcome, schema flag, argument
+  names with length prefixes, omitted count). The verifier requires the
+  block's shape: a minted binding id and an access exactly when a binding
+  matched, at most 32 argument names, each non-empty, at most 64 characters
+  and strictly ascending in byte order. v1.17 on any other kind or stage, or
+  a block elsewhere, fails verification.
+- Chain v1.18 (SPEC §4.3, §4.6): a record sealed with a `customer` block,
+  on both lanes. `llm_request`: the v1.16 layout with the trace
+  presence-tagged, then the customer block; MCP kinds: the v1.14 layout with
+  the data-reach block presence-tagged, then the customer block. The block
+  is `source` (`credential`, `asserted`, `none`), `label_sha256` and
+  `credential_kid`, whose shape follows from the source; on an asserted
+  customer the verifier recomputes `label_sha256` from the stored
+  `customer_id`. A block on any other version, or v1.18 without one, fails
+  verification. A v1.18 `llm_request` keeps the content
+  attestation and its stored content is re-derived; a content block on a
+  v1.18 MCP record fails as unattested.
+- Pack manifest 1.3 (SPEC §6.3): a `control_plane` section carrying the
+  bucket's control-plane chain, one JSON object per record at
+  `control-plane/<seq>.json` (`records/control-plane/` in an exported pack,
+  which `--export-records` writes). Every record from sequence 0 is
+  recomputed under the control-plane-v1 recipe (sequence, `previous_hash`
+  text, canonical JSON of nine members with number tokens copied verbatim)
+  and linked from the genesis hash. A decision receipt whose
+  `cp_anchor_event_id` names a verified control-plane record must carry its
+  `event_hash`; one naming no record in the pack is `WARN
+  receipt_anchor_outside_pack`.
+- Pack manifest 1.4 (SPEC §6.5): a required `evidence_class` label inside
+  the signed bytes, printed before the records and on every verdict line.
+  The one label this release reads is `sandbox-non-production`. An unknown
+  or missing label, or one on an earlier manifest, exits 2.
+- Pack manifest 1.5 (SPEC §6.6): a content-stripped pack. `content:
+  stripped` and `removed_fields` (nine fields, none of them hashed) inside
+  the signed bytes; records that cannot be stripped and still verify ship as
+  hash-only stubs listed in `stubs`. Every record is verified from its
+  sealed digests; the content checks skip the removed axes and keep the
+  findings axis; the chain is linked through each stub without recomputing
+  its hash, with a `STUB` line each and a count on the verdict. A stripped
+  pack read with `--bucket`, or a record that still carries a removed field,
+  exits 2; a stub whose hashes break the link, or that carries more than its
+  four coordinates, exits 1.
+- Per-tenant signatures (SPEC §7.2): a pack signed by a customer project's
+  own signer (issuer `https://accounts.google.com`, named by an email
+  subjectAltName) verifies only against the exact email passed with
+  `--certificate-identity`; the issuer follows from an email identity unless
+  `--certificate-oidc-issuer` is given. Such a pack checked without an
+  identity exits 2, not 0. The Meilynx signing workflow stays the default.
+- OCSF export check (SPEC §9): `--ocsf-export PATH`, with
+  `--ocsf-public-key JWK`, checks an export of the chain against the pack:
+  each object's SHA-256 against its manifest, each manifest's detached ECDSA
+  P-256 signature, and every exported event's chain coordinates and digests
+  against the pack record at that sequence. A mismatch fails naming the
+  object, the line and the field; an event outside the pack is a WARN; a
+  gap between manifests is `WARN export_gap`; an unsigned manifest, or one
+  checked without a key, lands at exit 3; an unknown `mapping_version` is
+  exit 2.
+- Customer-conditions verdict (SPEC §10): `--conditions-sha256 HEX` reads
+  the set's acceptance from the pack's control-plane chain (or from
+  `--conditions-acceptance FILE`, whose hash is recomputed and whose link
+  the verdict says is not in the pack), then counts the window's model and
+  MCP records sealed under the compiled set by hashed evidence only, prints
+  a `GAP` line for every other record, an `EXCEPTION` line for every record
+  whose findings or decisions name one of the set's instances, and one
+  verdict line. A pack without the acceptance exits 2.
+- `VERIFIER_CAPABILITIES` declares `decision-receipts-v1`,
+  `evaluation-trace-v1`, `data-reach-evidence-v1`, `control-plane-chain-v1`,
+  `ocsf-export-v1`, `customer-scope-v1`, `per-tenant-signer-v1`,
+  `evidence-class-v1`, `content-stripped-v1` and `customer-conditions-v1`,
+  beside `chain-anchors-v1` and `segmented-records-v1`.
+- Self-test: 20s-20y pin the per-tenant signer cases and a 1.4 manifest;
+  cp1.0-cp1.4 the control-plane chain vectors; 28a-28n (with 28n2) the
+  v1.15 fixtures, the fail-closed cases, the evidence cross-check and the
+  receipts index; 29a-29d the v1.16 outcome digest and fixtures; 30a-30d
+  the v1.17 fixtures and 27 rejected data-reach shapes; 31a-31e the v1.18
+  fixtures on both lanes, a rewritten label and 10 rejected customer shapes;
+  32a-32i the content-stripped pack, its stubs and the refusals; 33a-33g the
+  customer-conditions verdict; 34a-34k the OCSF export check; 35a-35f the
+  content re-derivation on v1.16 and v1.18 and the named failures for a
+  trace without its digest, a content block without a capture policy and a
+  control-plane sequence outside the signed 64-bit range.
+- Known gap: a v1.16 record's asserted-label digest (`identity.asserted_digest`)
+  is not re-derived by this release; v1.12, v1.14, v1.17 and v1.18 are. SPEC
+  §4.5 says so. The next release closes it.
+
 ## 0.8.0 (2026-10-05)
 
 - `verify-pack.py` from meilynx-proxy `b44e24c`.

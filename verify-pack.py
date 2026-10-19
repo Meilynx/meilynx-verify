@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Meilynx Integrity Pack verifier (MEI-422; signed packs MEI-922).
+Meilynx Integrity Pack verifier.
 
 Independently re-fetches each audit event from GCS and recomputes its
 SHA-256 chain hash using the same 15-field encoding as the Rust substrate
@@ -37,7 +37,7 @@ Usage (offline — the records were handed to you with the manifest):
     client library, no credentials — the verdict is computed entirely from
     the bytes on your disk.
 
-Segment objects (ADR-0081):
+Segment objects:
     A managed proxy's run chain may store records as segment objects,
     `<first:020d>-<last:020d>.seg`, each holding up to 1,024 consecutive
     records separated by line feeds. --bucket and a --records directory read
@@ -46,6 +46,96 @@ Segment objects (ADR-0081):
     from either source. A sequence held by two objects with identical bytes
     prints `WARN ... segment_overlap` and still verifies; with different
     bytes it fails (`segment_fork`).
+
+Control-plane chain (manifest 1.3):
+    A pack may also carry the bucket's control-plane chain: the control
+    plane's attributed record of human compliance actions (a held call
+    released, denied or expired; a review disposition), one JSON object per
+    record at control-plane/<seq:020d>.json. --bucket reads them from the
+    bucket; --records reads them from <records>/control-plane/; and
+    --export-records writes them there. Every record from sequence 0 to the
+    last listed is recomputed (recipe control-plane-v1, see
+    control_plane_event_hash_v1) and linked from genesis. A decision receipt
+    whose cp_anchor_event_id names a control-plane event in the pack must
+    carry that event's event_hash as cp_anchor_event_hash; one naming no
+    event in the pack prints WARN receipt_anchor_outside_pack and verifies.
+
+OCSF evidence export:
+    A proxy configured with [audit.ocsf] writes its sealed records to a
+    customer sink as OCSF events: gzip NDJSON objects named by chain
+    coordinates, each with a `.manifest.json` (RFC 8785 bytes) and, when the
+    proxy holds a signing key, a detached `.manifest.sig` (ECDSA P-256,
+    r || s, standard base64, the identity-bundle format). The export is a
+    copy; the chain is the record. Pass `--ocsf-export PATH` with the pack
+    (PATH is a `.manifest.json`, a day's `index.json`, or a directory that
+    is searched for manifests; objects and signatures are read beside each
+    manifest) and the verifier checks the copy against the pack: each
+    object's SHA-256 against its manifest; the manifest signature when
+    `--ocsf-public-key JWK` names the proxy's export key (a manifest that
+    says it is signed but has no `.sig` fails; one with no key given, or an
+    unsigned one, lands at exit 3); every event's chain coordinates
+    (event_id, event_hash) and every digest it carries against the pack
+    record at that sequence (a mismatch fails, naming the object, the line
+    and the field); an event on a chain or a sequence the pack does not
+    hold prints WARN export_record_outside_pack and verifies; a gap between
+    consecutive manifests of one chain prints WARN export_gap. The verifier
+    cannot recompute an event hash from the export alone (content fields
+    are excluded by design); it checks the export against the pack.
+        python verify-pack.py --records ./records --manifest manifest.json \\
+            --ocsf-export ./export/ocsf/v1/<proxy>/<chain>/2026/10/11/index.json \\
+            --ocsf-public-key ocsf-export-key.jwk
+
+Evidence class (manifest 1.4):
+    A 1.4 manifest labels what kind of evidence the pack holds
+    (`evidence_class`, inside the signed bytes). `sandbox-non-production`
+    marks evidence sealed on a self-serve sandbox project. The verifier
+    prints the label before the records and on every verdict line; an
+    unknown label, or a 1.4 manifest without one, cannot be evaluated.
+
+Content-stripped Exchange pack (manifest 1.5):
+    A pack an Evidence Exchange subscriber receives carries no captured
+    content and no personal data. Its 1.5 manifest says `content: stripped`
+    and lists `removed_fields` (STRIPPED_FIELDS below), inside the signed
+    bytes. None of those fields is in any record version's hash, so every
+    record still recomputes to its stored hash, and a record that sealed its
+    content (v1.10 onward) is checked against the digests it sealed, not
+    against the removed content. The verifier prints the content line before
+    the records and on every verdict line, and cannot evaluate (exit 2) a
+    stripped pack that still carries a removed field or a personal identifier
+    the profile withholds (WITHHELD_FIELDS). A record that cannot be stripped
+    and still verify ships as a hash-only stub: its
+    STUB_FIELDS and nothing of its body, listed with the reason in the
+    manifest's `stubs`. The verifier checks that a stub's event_hash is the
+    one the manifest signs and that the chain links through it, without
+    recomputing its hash; it prints a STUB line for each, counts them on the
+    verdict, and fails (exit 1) a stub whose hashes break the link or that
+    carries more than its coordinates. A stripped pack is verified from its
+    own records (--records); --bucket would read the holder's full records
+    and is refused (exit 2).
+
+Customer conditions verdict:
+    A bank that proposed conditions a vendor accepted holds the SHA-256 of
+    its condition set. `--conditions-sha256 HEX` adds one verdict line:
+        conditions: set <HEX> accepted at seq N; M of T records in the
+        window sealed under a governance version carrying it; E exceptions;
+        compiled by the holder's control plane
+    The acceptance (`exchange.conditions_accepted`, control-plane seq N) is
+    read from the pack's control-plane chain. A pack that does not carry it
+    (a per-tenant export, an Exchange pack) cannot evaluate the verdict
+    (exit 2, "acceptance not in this pack") unless the stored record is
+    given with `--conditions-acceptance FILE`: its hash is recomputed, and
+    the verdict says its link into the holder's chain is not in the pack.
+    The window is the model-request and MCP records sealed at or after the
+    acceptance. A record counts toward M only by sealed evidence: an MCP
+    record's hashed mcp_bundle_sha256 equal to the compiled MCP bundle, or a
+    model request whose digest-bound evaluation trace ran one of the set's
+    instances (<family>@cust_<12 hex>). Every other record is a GAP line
+    with its coordinates; a model request whose unhashed policy_version
+    names the compiled governance version is noted apart. EXCEPTION lines
+    name each record whose findings or decisions name one of the set's
+    instances, and whether a sealed digest binds them. The line's last
+    clause is what the pack cannot show: the compile runs in the holder's
+    control plane, and the pack carries bundle digests, not bundles.
 
 Prerequisites (online mode only):
     pip install google-cloud-storage
@@ -63,9 +153,17 @@ Signed packs (window B):
     A manifest that says it is signed (window "B", or `signing_deferred` not
     true, or a `signature` descriptor) fails without a valid bundle.
 
-    The signer must be the Meilynx signing workflow, dispatched from main:
+    By default the signer must be the Meilynx signing workflow, dispatched
+    from main:
         --certificate-identity     (default: PINNED_SIGNER_IDENTITY below)
         --certificate-oidc-issuer  (default: PINNED_OIDC_ISSUER below)
+    A pack exported from a customer project is signed instead by that
+    project's own signer, a Google service account that can read only that
+    project's audit bucket (issuer GOOGLE_OIDC_ISSUER). Pass the exact email
+    the evidence holder published for the project; the issuer follows:
+        --certificate-identity ps-xxxxxxxxxx@<signer project>.iam.gserviceaccount.com
+    Without it such a pack cannot be evaluated (exit 2), because nothing in
+    the pack can say whose signer it is. There is no pattern match.
     The trust anchors (Fulcio CA certificates and the Rekor log key) are
     embedded below as SIGSTORE_PUBLIC_GOOD_TRUST_ROOT, copied from
     github.com/sigstore/root-signing targets/trusted_root.json (commit noted
@@ -96,10 +194,19 @@ Exit codes (the same in --bucket and --records mode; when several apply,
          transparency-log entry does not match this signature
          signed outside certificate validity
          malformed signature material
+       With --conditions-sha256, also: an acceptance record that does not
+       verify, or one given with --conditions-acceptance that does not
+       recompute or is not the acceptance of that set.
     2  cannot evaluate: an unsupported hash_version, manifest
-       schema_version, storage_layout, signature method or bundle format
-       (update this verifier), an unusable --trusted-root, or a
-       command-line usage error.
+       schema_version, storage_layout, evidence_class, signature method or
+       bundle format (update this verifier), a pack signed by a per-tenant
+       signer checked without --certificate-identity, an unusable
+       --trusted-root, a content-stripped pack (manifest 1.5) whose content
+       claim or removed-field list this verifier does not read, whose records
+       still carry a removed field, or that is checked with --bucket, a
+       --conditions-sha256 verdict whose acceptance is not in the pack and
+       was not given with --conditions-acceptance, or a command-line usage
+       error.
     3  unsigned pack: the chain verified, but no signature establishes who
        produced the manifest. Pass --allow-unsigned to accept it. A signed
        pack stripped of its signature and relabelled window A lands here,
@@ -112,7 +219,7 @@ Self-test (encoding drift check):
   Run `python verify-pack.py --self-test` to check the encoding against the
   substrate's reference values. Exercises both the +00:00 fixture and the
   Z-suffix normalization path, the offline --records path, segment
-  objects (ADR-0081), and the signature checks (ECDSA test vectors, a synthetic signed pack with one
+  objects, and the signature checks (ECDSA test vectors, a synthetic signed pack with one
   tampered variant per failure reason, and a real Sigstore public-good
   bundle). Should always pass; if it fails, the verifier has drifted.
 """
@@ -131,16 +238,102 @@ from pathlib import Path
 GENESIS_STRING = "meilynx-genesis-v1"
 SUPPORTED_HASH_VERSIONS = {"v1"}
 # Manifest schema versions this verifier understands. 1.1 adds the
-# `anchoring` section (chain-head anchors, MEI-2758 / ADR-0075). 1.2 adds
+# `anchoring` section (chain-head anchors). 1.2 adds
 # `storage_layout` and a per-entry `object` reference, for a chain stored as
-# segment objects (MEI-2863 / ADR-0081 D9).
-SUPPORTED_MANIFEST_SCHEMA_VERSIONS = ("1.0", "1.1", "1.2")
+# segment objects. 1.3 adds the `control_plane`
+# section, the bucket's control-plane chain; its `storage_layout`
+# and per-entry `object` are as in 1.2 when present, and absent for a
+# per-record chain. 1.4 adds the required `evidence_class` label:
+# what kind of evidence the pack holds, inside the signed
+# bytes; `storage_layout`, `object` and `control_plane` are as in 1.3, each
+# present only when the pack has them. 1.5 is a content-stripped Exchange
+# pack: `content: stripped`, `removed_fields`, and an optional
+# `stubs` list; the 1.4 fields as in 1.4, `evidence_class` optional.
+SUPPORTED_MANIFEST_SCHEMA_VERSIONS = ("1.0", "1.1", "1.2", "1.3", "1.4", "1.5")
+# The manifest 1.4 evidence classes this verifier reads, with the sentence it
+# prints beside every verdict. A class not listed here cannot be evaluated
+# (exit 2): a label this verifier does not know is never ignored.
+EVIDENCE_CLASSES = {
+    "sandbox-non-production": (
+        "evidence sealed on a sandbox project, a self-serve evaluation tenant; "
+        "it is not production evidence"
+    ),
+}
 # Pack features this verifier checks, read by the release-sync gate
 # (check-meilynx-verify-sync.sh --covers) so a generator never ships a
 # feature the public verifier would silently skip. `segmented-records-v1`
 # reads segment objects; the gate requires it of the public release once a
-# proxy build contains crates/meilynx-audit/src/segment_writer.rs (ADR-0081 D9).
-VERIFIER_CAPABILITIES = frozenset({"chain-anchors-v1", "segmented-records-v1"})
+# proxy build contains crates/meilynx-audit/src/segment_writer.rs.
+# `decision-receipts-v1` reads v1.15 decision.receipt
+# records, recomputes their evidence-set digest and clock arithmetic, checks
+# each evidence entry against the pack record it cites, and checks the
+# manifest's `decision_receipts` index against the receipts in the pack.
+# `evaluation-trace-v1` reads v1.16 llm_request records
+# and recomputes their evaluation outcome digest.
+# `data-reach-evidence-v1` reads v1.17
+# mcp.policy_decision records and checks the shape of their data_reach block.
+# `control-plane-chain-v1` reads a manifest 1.3 `control_plane`
+# section: re-reads every control-plane record, recomputes it under the
+# control-plane-v1 recipe, walks the chain from genesis, and checks each
+# decision receipt's cp_anchor_event_hash against the control-plane event its
+# cp_anchor_event_id names when that event is in the pack.
+# `ocsf-export-v1` reads an OCSF export beside the
+# pack (`--ocsf-export`): object digests against their manifests, the
+# detached manifest signatures, and every exported event's chain coordinates
+# and digests against the pack record at that sequence.
+# `customer-scope-v1` reads v1.18 records on
+# both lanes and checks the shape of their customer block.
+# `per-tenant-signer-v1` checks a pack
+# signed by a per-tenant signer (GOOGLE_OIDC_ISSUER) against the exact
+# identity the reader supplies, and refuses to evaluate one without it.
+# `evidence-class-v1` reads manifest 1.4 and
+# prints its evidence_class on every verdict.
+# `content-stripped-v1` reads manifest 1.5: verifies a stripped
+# Exchange pack from the sealed digests, refuses one that still carries a
+# removed field, links the chain through hash-only stubs, and prints the
+# content line and the stub count on every verdict.
+# `customer-conditions-v1` gives the
+# customer-conditions verdict for `--conditions-sha256`: the acceptance on
+# the control-plane chain, the window's records sealed under the compiled
+# set, its gaps and its exceptions.
+VERIFIER_CAPABILITIES = frozenset(
+    {"chain-anchors-v1", "segmented-records-v1", "decision-receipts-v1", "evaluation-trace-v1",
+     "data-reach-evidence-v1", "control-plane-chain-v1", "ocsf-export-v1", "customer-scope-v1",
+     "per-tenant-signer-v1", "evidence-class-v1", "content-stripped-v1", "customer-conditions-v1"}
+)
+# The stripped profile of a manifest 1.5 Exchange pack. Mirror of
+# `exchange::STRIPPED_FIELDS` / `WITHHELD_FIELDS` / `STUB_FIELDS` /
+# `STUB_REASONS` in the meilynx-integrity-pack crate (a drift catcher there
+# pins the four sets and the schema's enums). STRIPPED_FIELDS are removed
+# from every record; a dotted name is a member of a nested object.
+# WITHHELD_FIELDS hold a personal identifier inside a record's hash, so a
+# record with one set ships as a hash-only stub: STUB_FIELDS, nothing else.
+CONTENT_STRIPPED = "stripped"
+STRIPPED_FIELDS = (
+    "customer_id",
+    "end_user_id",
+    "identity.asserted",
+    "messages",
+    "raw_request",
+    "raw_response",
+    "response_text",
+    "tags_json",
+    "tool_calls",
+)
+WITHHELD_FIELDS = ("auth_session.user_email",)
+STUB_FIELDS = (
+    "sequence_number",
+    "event_hash",
+    "previous_hash",
+    "schema_version",
+)
+STUB_REASONS = {
+    "sealed_personal_identifier": "seals a personal identifier inside its hash",
+    "email_address": "keeps an email address in a field its hash or a sealed digest covers",
+    "unreadable_record": "does not parse",
+}
+# OCSF mapping contract versions this verifier reads (contracts/ocsf-mapping.v1.json).
+SUPPORTED_OCSF_MAPPING_VERSIONS = ("1",)
 
 # Exit codes (listed in the module docstring).
 EXIT_OK = 0
@@ -239,7 +432,7 @@ def genesis_hash():
 
 
 # ---------------------------------------------------------------------------
-# MEI-639 — v1.2 hash path (schema_version-versioned dispatch).
+# v1.2 hash path (schema_version-versioned dispatch).
 #
 # MUST mirror compute_event_hash_v1_2_* in
 # meilynx-proxy/crates/meilynx-audit/src/sqlite.rs exactly. Drift between
@@ -258,26 +451,28 @@ def genesis_hash():
 # meilynx-core/src/types/audit.rs.
 EVENT_KIND_LLM_REQUEST = 'llm_request'
 EVENT_KIND_AUTH_SESSION_STARTED = 'auth.session_started'
-# MEI-1048 — admin.action wire-name (the hash-preimage form). The exported
+# admin.action wire-name (the hash-preimage form). The exported
 # WORM JSON carries event_kind in its serde snake_case form ('admin_action',
 # 'auth_session_started') or omits it for the default LlmRequest; the hash
 # preimage feeds EventKind::wire_name() ('admin.action', 'auth.session_started').
 # recompute_event_hash maps the JSON form to the wire name before dispatch.
 EVENT_KIND_ADMIN_ACTION = 'admin.action'
-# MEI-925 — the five v1.4 MCP gateway kinds (hash-preimage wire names).
+# The five v1.4 MCP gateway kinds (hash-preimage wire names).
 EVENT_KIND_MCP_TOOL_CALL = 'mcp.tool_call'
 EVENT_KIND_MCP_POLICY_DECISION = 'mcp.policy_decision'
 EVENT_KIND_MCP_TOOL_RESULT = 'mcp.tool_result'
 EVENT_KIND_MCP_TOOLS_LIST_SERVED = 'mcp.tools_list.served'
 EVENT_KIND_MCP_ERROR = 'mcp.error'
-# MEI-1064 — the catalog-drift adjudication kind; shares the MCP payload +
+# The catalog-drift adjudication kind; shares the MCP payload +
 # v1.4/v1.5 hash path (the wire-name in the preimage disambiguates it).
 EVENT_KIND_MCP_CATALOG_DRIFT = 'mcp.catalog_drift'
-# MEI-1955 (ADR-0052) — the coverage-reconciliation kind (v1.8 bucket).
+# The coverage-reconciliation kind (v1.8 bucket).
 EVENT_KIND_COVERAGE_COMPUTED = 'coverage.computed'
-# MEI-2641 (ADR-0052 dated edit 2026-10-01) — the provider-key inventory kind
+# The provider-key inventory kind
 # (v1.13 bucket).
 EVENT_KIND_COVERAGE_KEY_INVENTORY = 'coverage.key_inventory'
+# The decision receipt kind (v1.15 bucket).
+EVENT_KIND_DECISION_RECEIPT = 'decision.receipt'
 
 MCP_EVENT_KINDS = {
     EVENT_KIND_MCP_TOOL_CALL,
@@ -293,17 +488,19 @@ SERDE_EVENT_KIND_TO_WIRE = {
     'llm_request': EVENT_KIND_LLM_REQUEST,
     'auth_session_started': EVENT_KIND_AUTH_SESSION_STARTED,
     'admin_action': EVENT_KIND_ADMIN_ACTION,
-    # MEI-925 — serde snake_case forms of the v1.4 kinds.
+    # Serde snake_case forms of the v1.4 kinds.
     'mcp_tool_call': EVENT_KIND_MCP_TOOL_CALL,
     'mcp_policy_decision': EVENT_KIND_MCP_POLICY_DECISION,
     'mcp_tool_result': EVENT_KIND_MCP_TOOL_RESULT,
     'mcp_tools_list_served': EVENT_KIND_MCP_TOOLS_LIST_SERVED,
     'mcp_error': EVENT_KIND_MCP_ERROR,
     'mcp_catalog_drift': EVENT_KIND_MCP_CATALOG_DRIFT,
-    # MEI-1955 — serde snake_case form of the v1.8 kind.
+    # Serde snake_case form of the v1.8 kind.
     'coverage_computed': EVENT_KIND_COVERAGE_COMPUTED,
-    # MEI-2641 — serde snake_case form of the v1.13 kind.
+    # Serde snake_case form of the v1.13 kind.
     'coverage_key_inventory': EVENT_KIND_COVERAGE_KEY_INVENTORY,
+    # Serde snake_case form of the v1.15 kind.
+    'decision_receipt': EVENT_KIND_DECISION_RECEIPT,
 }
 
 
@@ -393,7 +590,7 @@ def compute_event_hash_v1_3_admin_action(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     admin_action,
 ):
-    """MEI-1048 — v1.3 admin.action hash. admin_action is a dict matching
+    """v1.3 admin.action hash. admin_action is a dict matching
     `AdminActionFields`. Mirror of `compute_event_hash_v1_3_admin_action` in
     sqlite.rs: the SAME v1.2 prefix (Rust reuses `v1_2_prefix_hasher` for v1.3),
     then the event_kind wire-name, then the 4 admin payload fields. Reusing
@@ -429,7 +626,7 @@ def compute_event_hash_v1_4_mcp(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     mcp_event,
 ):
-    """MEI-925 — v1.4 mcp.* hash, shared by all five MCP kinds. mcp_event is
+    """v1.4 mcp.* hash, shared by all five MCP kinds. mcp_event is
     a dict matching `McpEventFields`. Mirror of `compute_event_hash_v1_4_mcp`
     in sqlite.rs: the SAME v1.2 prefix, then the specific kind's wire-name
     (the preimage's kind attestation — two identical payloads of different
@@ -438,7 +635,7 @@ def compute_event_hash_v1_4_mcp(
     tag + little-endian i64."""
     if event_kind not in MCP_EVENT_KINDS:
         raise ValueError(
-            f"MEI-925: compute_event_hash_v1_4_mcp called with non-MCP kind {event_kind!r}"
+            f"compute_event_hash_v1_4_mcp called with non-MCP kind {event_kind!r}"
         )
     h = _v1_2_prefix_hash(
         sequence_number, timestamp_utc, event_id, request_id,
@@ -464,7 +661,7 @@ def compute_event_hash_v1_4_mcp(
 
 
 def encode_principal(p):
-    """MEI-804 — 1-byte shape tag then the shape's string fields. Mirror of
+    """1-byte shape tag then the shape's string fields. Mirror of
     `feed_principal` in sqlite.rs. `p` is a dict matching the serde-tagged
     `Principal` (`{"kind": "human_user", "subject", "issuer"?}` or
     `{"kind": "agent", "agent_ref"}`). The tag pins the variant so a human and
@@ -476,11 +673,11 @@ def encode_principal(p):
     if kind == 'agent':
         # tag 2, then agent_ref.
         return b'\x02' + p['agent_ref'].encode('utf-8')
-    raise ValueError(f"MEI-804: unknown principal kind {kind!r}")
+    raise ValueError(f"unknown principal kind {kind!r}")
 
 
 def encode_principal_chain(chain):
-    """MEI-804 — the authenticated principal, then a 1-byte presence tag for
+    """The authenticated principal, then a 1-byte presence tag for
     on_behalf_of (0=bare agent, 1=on-behalf-of chain) plus the acted-for
     principal when present. Mirror of `feed_principal_chain` in sqlite.rs."""
     out = encode_principal(chain['authenticated'])
@@ -498,7 +695,7 @@ def compute_event_hash_v1_5_mcp(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     mcp_event,
 ):
-    """MEI-804 — v1.5 mcp.* hash: the v1.4 preimage plus the trailing principal
+    """v1.5 mcp.* hash: the v1.4 preimage plus the trailing principal
     chain (design §5.6). Mirror of `compute_event_hash_v1_5_mcp` in sqlite.rs.
     The 13 McpEventFields feeds are DUPLICATED from
     `compute_event_hash_v1_4_mcp`, not shared — same structural seam as the Rust
@@ -507,7 +704,7 @@ def compute_event_hash_v1_5_mcp(
     shared 13-field feed into a helper the v1.4 function also calls."""
     if event_kind not in MCP_EVENT_KINDS:
         raise ValueError(
-            f"MEI-804: compute_event_hash_v1_5_mcp called with non-MCP kind {event_kind!r}"
+            f"compute_event_hash_v1_5_mcp called with non-MCP kind {event_kind!r}"
         )
     h = _v1_2_prefix_hash(
         sequence_number, timestamp_utc, event_id, request_id,
@@ -529,7 +726,7 @@ def compute_event_hash_v1_5_mcp(
     h.update(encode_optional_str(mcp_event.get('correlated_event_id')))
     h.update(encode_optional_i64(mcp_event.get('error_code')))
     h.update(mcp_event['traceparent'].encode('utf-8'))
-    # MEI-804 — the v1.5 addition: the full principal chain.
+    # The v1.5 addition: the full principal chain.
     h.update(encode_principal_chain(mcp_event['principal_chain']))
     return h.hexdigest()
 
@@ -542,16 +739,16 @@ def compute_event_hash_v1_6_mcp(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     mcp_event,
 ):
-    """MEI-1189 — v1.6 mcp.* hash: the v1.5 preimage plus one trailing feed, the
+    """v1.6 mcp.* hash: the v1.5 preimage plus one trailing feed, the
     redacted-payload content address (`redacted_payload_sha256_jcs`). Mirror of
     `compute_event_hash_v1_6_mcp` in sqlite.rs. `payload_sha256_jcs` still carries
     the ORIGINAL (pre-redaction) hash, so the preimage binds both digests (two-hash
-    binding, ADR-0037 D2 amendment). The field feeds are DUPLICATED from
+    binding). The field feeds are DUPLICATED from
     `compute_event_hash_v1_5_mcp`, not shared — same structural seam as the Rust
     side: a v1.6-only encoding change must never be able to alter v1.5/v1.4 output."""
     if event_kind not in MCP_EVENT_KINDS:
         raise ValueError(
-            f"MEI-1189: compute_event_hash_v1_6_mcp called with non-MCP kind {event_kind!r}"
+            f"compute_event_hash_v1_6_mcp called with non-MCP kind {event_kind!r}"
         )
     h = _v1_2_prefix_hash(
         sequence_number, timestamp_utc, event_id, request_id,
@@ -573,9 +770,9 @@ def compute_event_hash_v1_6_mcp(
     h.update(encode_optional_str(mcp_event.get('correlated_event_id')))
     h.update(encode_optional_i64(mcp_event.get('error_code')))
     h.update(mcp_event['traceparent'].encode('utf-8'))
-    # MEI-804 — the v1.5 principal chain (carried forward into v1.6).
+    # The v1.5 principal chain (carried forward into v1.6).
     h.update(encode_principal_chain(mcp_event['principal_chain']))
-    # MEI-1189 — the v1.6 addition: the redacted-payload content address.
+    # The v1.6 addition: the redacted-payload content address.
     h.update(encode_optional_str(mcp_event.get('redacted_payload_sha256_jcs')))
     return h.hexdigest()
 
@@ -588,7 +785,7 @@ def compute_event_hash_v1_7_mcp(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     mcp_event,
 ):
-    """MEI-1063 — v1.7 mcp.* hash: the v1.6 preimage plus the two trailing
+    """v1.7 mcp.* hash: the v1.6 preimage plus the two trailing
     ENFORCEMENT-axis redaction hashes (`redaction_pre_sha256_jcs`,
     `redaction_post_sha256_jcs`) — the digests of the payload before/after the
     redact transform the gateway applied to the FORWARDED content. Mirror of
@@ -600,7 +797,7 @@ def compute_event_hash_v1_7_mcp(
     side: a v1.7-only encoding change must never alter v1.4/v1.5/v1.6 output."""
     if event_kind not in MCP_EVENT_KINDS:
         raise ValueError(
-            f"MEI-1063: compute_event_hash_v1_7_mcp called with non-MCP kind {event_kind!r}"
+            f"compute_event_hash_v1_7_mcp called with non-MCP kind {event_kind!r}"
         )
     h = _v1_2_prefix_hash(
         sequence_number, timestamp_utc, event_id, request_id,
@@ -622,13 +819,13 @@ def compute_event_hash_v1_7_mcp(
     h.update(encode_optional_str(mcp_event.get('correlated_event_id')))
     h.update(encode_optional_i64(mcp_event.get('error_code')))
     h.update(mcp_event['traceparent'].encode('utf-8'))
-    # MEI-804 — the v1.5 principal chain (carried forward into v1.7).
+    # The v1.5 principal chain (carried forward into v1.7).
     h.update(encode_principal_chain(mcp_event['principal_chain']))
-    # MEI-1189 — the v1.6 capture-axis redacted-payload content address
+    # The v1.6 capture-axis redacted-payload content address
     # (carried forward; None on enforcement records but fed for byte-position
     # stability with v1.6).
     h.update(encode_optional_str(mcp_event.get('redacted_payload_sha256_jcs')))
-    # MEI-1063 — the v1.7 addition: the enforcement-axis fields, in order. The
+    # The v1.7 addition: the enforcement-axis fields, in order. The
     # two redaction hashes (redact verdict) and the hold_id (hold verdict) are
     # the three mutually-scoped enforcement-axis discriminators; a redact record
     # feeds hold_id=None and a hold record feeds both redaction hashes=None.
@@ -645,7 +842,7 @@ def compute_event_hash_v1_8_coverage(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     coverage,
 ):
-    """MEI-1955 (ADR-0052) — v1.8 coverage.computed hash. `coverage` is a dict
+    """v1.8 coverage.computed hash. `coverage` is a dict
     matching `CoverageComputedFields`. Mirror of
     `compute_event_hash_v1_8_coverage` in sqlite.rs: the SAME v1.2 prefix, then
     the event_kind wire-name, then the 13 coverage payload fields in
@@ -683,7 +880,7 @@ def compute_event_hash_v1_13_coverage_key_inventory(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     inventory,
 ):
-    """MEI-2641 (ADR-0052 dated edit 2026-10-01) — v1.13 coverage.key_inventory
+    """v1.13 coverage.key_inventory
     hash. `inventory` is a dict matching `CoverageKeyInventoryFields`. Mirror of
     `compute_event_hash_v1_13_coverage_key_inventory` in sqlite.rs: the SAME
     v1.2 prefix, then the event_kind wire-name, then the 11 payload fields in
@@ -711,6 +908,1027 @@ def compute_event_hash_v1_13_coverage_key_inventory(
     return h.hexdigest()
 
 
+# The 36 receipt fields in preimage order, with how
+# each feeds: required utf-8 string, optional string (presence tag), required
+# i64 LE, optional i64 (presence tag + LE), optional bool (presence tag + byte).
+DECISION_RECEIPT_FEED = (
+    ('receipt_id', 'str'), ('receipt_type', 'str'), ('receipt_type_version', 'str'),
+    ('registry_digest', 'str'), ('source_kind', 'str'), ('source_ref', 'str'),
+    ('subject_ref_sha256', 'opt_str'), ('evidence_set_sha256', 'str'),
+    ('policy_version', 'opt_str'), ('outcome', 'str'),
+    ('outcome_reason_code', 'opt_str'), ('outcome_reason_sha256', 'opt_str'),
+    ('decider_user_id', 'opt_str'), ('decider_role', 'opt_str'),
+    ('decider_identity_provenance', 'opt_str'), ('credential_status', 'str'),
+    ('credential_class', 'opt_str'), ('credential_registry', 'opt_str'),
+    ('credential_verified_at', 'opt_i64'), ('procedure_status', 'str'),
+    ('procedure_id', 'opt_str'), ('procedure_version', 'opt_str'),
+    ('procedure_document_sha256', 'opt_str'), ('procedure_effective_at', 'opt_i64'),
+    ('clock_rule', 'str'), ('clock_start_basis', 'str'),
+    ('clock_started_at', 'i64'), ('clock_deadline_at', 'i64'),
+    ('clock_decided_at', 'opt_i64'), ('clock_elapsed_seconds', 'opt_i64'),
+    ('clock_status', 'str'), ('held_before_use', 'opt_bool'),
+    ('supersedes_receipt_id', 'opt_str'), ('cp_anchor_event_id', 'str'),
+    ('cp_anchor_event_hash', 'str'), ('issued_at', 'i64'),
+)
+
+
+def compute_event_hash_v1_15_decision_receipt(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    receipt,
+):
+    """v1.15 decision.receipt hash. `receipt` is a
+    dict matching `DecisionReceiptFields`. Mirror of
+    `compute_event_hash_v1_15_decision_receipt` in sqlite.rs and
+    `DecisionReceiptChainHasher.ComputeV115` on the control plane: the SAME
+    v1.2 prefix, then the event_kind wire-name, then the 36 receipt fields in
+    `DECISION_RECEIPT_FEED` order. The stored `evidence` list is outside the
+    preimage; `evidence_set_sha256` binds it (see `check_decision_receipt`)."""
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_DECISION_RECEIPT.encode('utf-8'))
+    for name, kind in DECISION_RECEIPT_FEED:
+        value = receipt.get(name)
+        if kind == 'str':
+            h.update(str(value if value is not None else '').encode('utf-8'))
+        elif kind == 'opt_str':
+            h.update(encode_optional_str(value))
+        elif kind == 'i64':
+            h.update(struct.pack('<q', int(value)))
+        elif kind == 'opt_i64':
+            if value is None:
+                h.update(b'\x00')
+            else:
+                h.update(b'\x01' + struct.pack('<q', int(value)))
+        elif kind == 'opt_bool':
+            if value is None:
+                h.update(b'\x00')
+            else:
+                h.update(b'\x01' + (b'\x01' if bool(value) else b'\x00'))
+    return h.hexdigest()
+
+
+RECEIPT_OUTCOME_TO_ACTION = {'approved': 'allow', 'escalated': 'hold', 'rejected': 'block', 'lapsed': 'block'}
+
+
+def check_decision_receipt(event):
+    """For a v1.15 record, check what the hash alone
+    cannot: the stored `evidence` list hashes to `evidence_set_sha256`; the
+    sealed clock arithmetic (`clock_elapsed_seconds`, `clock_status`) follows
+    from the three timestamps; a `verified` credential carries its class,
+    registry and verification time; a `recorded` procedure carries its id and
+    version; a decider is present exactly when someone decided; a lapse was
+    issued no earlier than its deadline; and the base `action` is the
+    outcome's projection. Returns a list of problems; empty means the receipt
+    checks out. Records on any other schema version carry no receipt and
+    return no problems."""
+    if (event.get('schema_version') or 'v1') != 'v1.15':
+        return []
+    receipt = event.get('decision_receipt')
+    if not isinstance(receipt, dict):
+        return ['v1.15 record carries no decision_receipt payload']
+    problems = []
+    rid = receipt.get('receipt_id', '?')
+
+    evidence = receipt.get('evidence')
+    if evidence is None:
+        evidence = []
+    recomputed = sha256_jcs(evidence)
+    if recomputed != receipt.get('evidence_set_sha256'):
+        problems.append(
+            f"decision receipt {rid}: stored evidence list hashes to {recomputed}, "
+            f"not the sealed evidence_set_sha256 {receipt.get('evidence_set_sha256')}"
+        )
+
+    outcome = receipt.get('outcome')
+    decided = receipt.get('clock_decided_at')
+    started = receipt.get('clock_started_at')
+    deadline = receipt.get('clock_deadline_at')
+    status = receipt.get('clock_status')
+    if outcome == 'lapsed':
+        if receipt.get('decider_user_id') is not None:
+            problems.append(f"decision receipt {rid}: a lapsed receipt names a decider")
+        if decided is not None or receipt.get('clock_elapsed_seconds') is not None:
+            problems.append(f"decision receipt {rid}: a lapsed receipt carries a decision time")
+        if status != 'lapsed':
+            problems.append(f"decision receipt {rid}: outcome lapsed but clock_status {status!r}")
+    else:
+        if receipt.get('decider_user_id') is None:
+            problems.append(f"decision receipt {rid}: a decided receipt names no decider")
+        if decided is None or started is None or deadline is None:
+            problems.append(f"decision receipt {rid}: a decided receipt is missing a clock timestamp")
+        else:
+            elapsed = int(decided) - int(started)
+            if receipt.get('clock_elapsed_seconds') != elapsed:
+                problems.append(
+                    f"decision receipt {rid}: sealed clock_elapsed_seconds "
+                    f"{receipt.get('clock_elapsed_seconds')} but the timestamps give {elapsed}"
+                )
+            expected = 'within' if int(decided) <= int(deadline) else 'breached'
+            if status != expected:
+                problems.append(
+                    f"decision receipt {rid}: sealed clock_status {status!r} but the timestamps give {expected!r}"
+                )
+
+    # A lapse is "no decision was made and the deadline has
+    # passed", so a receipt that says it lapsed must have been issued no
+    # earlier than its deadline.
+    if outcome == 'lapsed' or status == 'lapsed':
+        issued = receipt.get('issued_at')
+        if issued is None or deadline is None:
+            problems.append(f"decision receipt {rid}: a lapsed receipt is missing issued_at or clock_deadline_at")
+        elif int(issued) < int(deadline):
+            problems.append(
+                f"decision receipt {rid}: lapsed before its deadline "
+                f"(issued_at {int(issued)} < clock_deadline_at {int(deadline)})"
+            )
+
+    if receipt.get('credential_status') == 'verified' and (
+        receipt.get('credential_class') is None or receipt.get('credential_registry') is None
+        or receipt.get('credential_verified_at') is None
+    ):
+        problems.append(f"decision receipt {rid}: credential_status verified without class, registry and verification time")
+    if receipt.get('procedure_status') == 'recorded' and (
+        receipt.get('procedure_id') is None or receipt.get('procedure_version') is None
+    ):
+        problems.append(f"decision receipt {rid}: procedure_status recorded without id and version")
+
+    expected_action = RECEIPT_OUTCOME_TO_ACTION.get(outcome)
+    if expected_action is None:
+        problems.append(f"decision receipt {rid}: unknown outcome {outcome!r}")
+    elif action_str(event) != expected_action:
+        problems.append(
+            f"decision receipt {rid}: base action {action_str(event)!r} is not the projection of outcome {outcome!r} ({expected_action!r})"
+        )
+    return problems
+
+
+# The internal chain ids a proxy uses inside one boot.
+# An evidence entry carrying one of them names no chain an examiner can find.
+INTERNAL_CHAIN_IDS = frozenset({'proxy', 'shadow'})
+
+
+def evidence_chain_relation(chain_id, pack_chain):
+    """How a receipt evidence entry's
+    `chain_id` relates to the chain this pack covers, which the verifier knows
+    only from the manifest prefix (`chain_for_prefix`): records carry no chain
+    id of their own.
+
+    'same': the entry names this pack's chain. A run-scoped pack
+    (`audit/chain_tnt_{proxy}_proxy_run_{run}/`) is named by that externalized
+    id, the one the proxy stamps on the evidence it pushes. The flat `audit/`
+    chain (legacy-flat) belongs to a proxy without run-scoped chains, which
+    pushes its evidence under the tenant-scoped id `chain_tnt_{proxy}_proxy`.
+
+    'unnamed': the entry names no chain (a review disposition cites its LLM
+    record by sequence and hash only), or an internal id that means nothing
+    outside one proxy boot. Such an entry is in the pack only when the pack
+    holds a record at its sequence with its event_hash: a SHA-256 chain hash
+    identifies the record it was computed over.
+
+    'other': any other chain."""
+    if not isinstance(chain_id, str) or not chain_id or chain_id in INTERNAL_CHAIN_IDS:
+        return 'unnamed'
+    if pack_chain is not None and chain_id == pack_chain:
+        return 'same'
+    if (pack_chain == LEGACY_FLAT_CHAIN
+            and re.fullmatch(r'chain_tnt_[A-Za-z0-9_.\-]+_proxy', chain_id)
+            and '_proxy_run_' not in chain_id):
+        return 'same'
+    return 'other'
+
+
+def receipt_evidence_findings(receipt_seq, receipt, pack_chain, pack_records, window_seqs):
+    """Cross-check a decision receipt's stored
+    `evidence` list against the records in this pack.
+
+    For each entry whose record is in the pack, the pack record's `event_id`
+    and `event_hash` must equal the entry's (an entry that carries no
+    `event_id` is checked on its hash alone). A disagreement means the receipt
+    cites a record other than the one the chain holds: a failure naming the
+    receipt record and the field. An entry whose record is not in the pack is
+    a `WARN receipt_evidence_outside_pack` with its coordinates, and verifies:
+    an examiner can fetch the cited chain.
+
+    `pack_records` maps each sequence read in this pack to its record's
+    (event_id, event_hash); `window_seqs` is every sequence the manifest lists,
+    read or not. Returns (failures, warnings), lists of strings."""
+    failures, warnings = [], []
+    rid = receipt.get('receipt_id', '?')
+    evidence = receipt.get('evidence')
+    if evidence is None:
+        evidence = []
+    if not isinstance(evidence, list):
+        return [f"decision receipt {rid}: stored evidence is not a list"], []
+    for i, entry in enumerate(evidence):
+        if not isinstance(entry, dict):
+            failures.append(f"decision receipt {rid}: evidence[{i}] is not an object")
+            continue
+        chain = entry.get('chain_id')
+        seq = entry.get('sequence_number')
+        event_id = entry.get('event_id')
+        event_hash = entry.get('event_hash')
+        relation = evidence_chain_relation(chain, pack_chain)
+        held = pack_records.get(seq) if type(seq) is int else None
+        if relation == 'same' and held is None and seq in window_seqs:
+            # The cited record is in this pack's window but could not be read;
+            # the walk has already failed it.
+            warnings.append(
+                f"WARN seq={receipt_seq}: decision receipt {rid} evidence[{i}] (sequence={seq}) "
+                f"was not checked, because that record failed above."
+            )
+            continue
+        in_pack = held is not None and (relation == 'same' or (relation == 'unnamed' and held[1] == event_hash))
+        if not in_pack:
+            warnings.append(
+                f"WARN receipt_evidence_outside_pack seq={receipt_seq} receipt={rid} evidence[{i}] "
+                f"chain={chain or '(not recorded)'} sequence={seq} event_id={event_id or '(not recorded)'}: "
+                f"the cited record is not in this pack; verify that chain to check it."
+            )
+            continue
+        held_id, held_hash = held
+        # A hash-only stub: its hash is checked, its event_id is
+        # not in the pack.
+        if held_id is STUB_EVENT_ID:
+            if event_hash != held_hash:
+                failures.append(
+                    f"decision receipt {rid}: evidence[{i}] (sequence={seq}) event_hash {str(event_hash)[:16]}... "
+                    f"is not the event_hash {str(held_hash)[:16]}... of that record's hash-only stub"
+                )
+            else:
+                warnings.append(
+                    f"NOTE seq={receipt_seq}: decision receipt {rid} evidence[{i}] (sequence={seq}) cites a hash-only "
+                    f"stub: its event_hash matches; its event_id is not in this pack."
+                )
+            continue
+        if event_id is not None and event_id != held_id:
+            failures.append(
+                f"decision receipt {rid}: evidence[{i}] (sequence={seq}) event_id {event_id!r} "
+                f"is not the pack record's event_id {held_id!r}"
+            )
+        if event_hash != held_hash:
+            failures.append(
+                f"decision receipt {rid}: evidence[{i}] (sequence={seq}) event_hash {str(event_hash)[:16]}... "
+                f"is not the pack record's event_hash {str(held_hash)[:16]}..."
+            )
+    return failures, warnings
+
+
+# The fields of one manifest `decision_receipts` index
+# entry, each equal to the sealed record's (`sequence` locates it).
+RECEIPT_INDEX_FIELDS = ('sequence', 'receipt_id', 'receipt_type', 'clock_status')
+
+
+def receipt_index_findings(manifest, receipts, window_seqs, read_seqs):
+    """Check the manifest's `decision_receipts` index
+    against the decision receipts actually in the pack: every receipt listed,
+    nothing extra, and each entry's fields equal to the sealed record's.
+
+    A manifest without the key comes from a generator that predates the index
+    and is accepted with a note; a receipt-free pack carries no key, so its
+    manifest is byte-identical to one from an older generator. `receipts` maps
+    each receipt record's sequence to its sealed `decision_receipt` payload.
+    Returns (failures, lines), the lines to print when nothing failed."""
+    if 'decision_receipts' not in manifest:
+        if not receipts:
+            return [], []
+        return [], [
+            f"NOTE: the manifest has no decision_receipts index (its generator predates it); "
+            f"{len(receipts)} decision receipt(s) in this pack were checked as records."
+        ]
+    index = manifest['decision_receipts']
+    if not isinstance(index, list):
+        return ["manifest decision_receipts is not a list"], []
+    failures = []
+    listed = {}
+    for i, entry in enumerate(index):
+        if not isinstance(entry, dict) or set(entry) != set(RECEIPT_INDEX_FIELDS):
+            failures.append(
+                f"manifest decision_receipts[{i}] must carry exactly {', '.join(RECEIPT_INDEX_FIELDS)}"
+            )
+            continue
+        seq = entry['sequence']
+        if type(seq) is not int:
+            failures.append(f"manifest decision_receipts[{i}] sequence {seq!r} is not an integer")
+            continue
+        if seq in listed:
+            failures.append(f"manifest decision_receipts lists seq={seq} twice")
+            continue
+        listed[seq] = entry
+    for seq, entry in sorted(listed.items()):
+        receipt = receipts.get(seq)
+        if receipt is None:
+            if seq in window_seqs and seq not in read_seqs:
+                continue  # the record could not be read; the walk has failed it
+            failures.append(
+                f"manifest decision_receipts lists seq={seq}, which is not a decision receipt record in this pack"
+            )
+            continue
+        for field in RECEIPT_INDEX_FIELDS[1:]:
+            if entry[field] != receipt.get(field):
+                failures.append(
+                    f"manifest decision_receipts entry seq={seq} has {field} {entry[field]!r}, "
+                    f"but the sealed record says {receipt.get(field)!r}"
+                )
+    for seq, receipt in sorted(receipts.items()):
+        if seq not in listed:
+            failures.append(
+                f"decision receipt at seq={seq} ({receipt.get('receipt_id', '?')}) is not listed in the "
+                f"manifest's decision_receipts index"
+            )
+    if failures:
+        return failures, []
+    lines = [f"RECEIPT seq={seq} type={e['receipt_type']} clock_status={e['clock_status']} receipt_id={e['receipt_id']}"
+             for seq, e in sorted(listed.items())]
+    lines.append(f"RECEIPTS INDEX OK: {len(listed)} decision receipt(s) listed, each matching its sealed record")
+    return [], lines
+
+
+# ---------------------------------------------------------------------------
+# The control-plane chain (manifest 1.3 `control_plane` section).
+#
+# The control plane records the human half of governance decisions (a held
+# tool call released, denied or expired; a supervisory review disposition; an
+# examination package generated) on its own chain, one JSON object per record
+# at control-plane/<seq:020d>.json in the same bucket. Recipe control-plane-v1
+# (records with schema_version "v1"), written by the control plane's
+# ControlPlaneAuditChain and mirrored by the generator's control_plane.rs:
+#
+#   event_hash = hex(SHA-256( i64 LE sequence_number
+#                           || UTF-8 bytes of previous_hash (the hex text)
+#                           || canonical(H) ))
+#   H = {actor_user_id, correlation_id, event_id, event_kind, occurred_at,
+#        payload, project_id, schema_version, target_resource_id},
+#       each read from the stored record, JSON null when absent.
+#
+# canonical(): object members ordered by key compared as UTF-16 code units, no
+# whitespace, strings escaping only '"', '\' and U+0000..U+001F ('\b' '\f'
+# '\n' '\r' '\t', else '\u00xx' lowercase) with every other character as
+# UTF-8, null/true/false literally, arrays in order. Numbers are copied
+# VERBATIM from the record: the record is written by the same canonicalizer
+# as the hash input, so its number tokens are the hashed bytes ('1E-05',
+# '0.00001', '42'); re-formatting a parsed float would not reproduce them.
+# The genesis is the proxy chain's (meilynx-genesis-v1).
+# ---------------------------------------------------------------------------
+
+CONTROL_PLANE_PREFIX = 'control-plane/'
+CONTROL_PLANE_CHAIN_FAMILY = 'control-plane'
+CONTROL_PLANE_SCHEMA_V1 = 'v1'
+CONTROL_PLANE_HASHED_FIELDS = (
+    'actor_user_id', 'correlation_id', 'event_id', 'event_kind', 'occurred_at',
+    'payload', 'project_id', 'schema_version', 'target_resource_id',
+)
+
+
+class ControlPlaneNumber(str):
+    """A JSON number token kept exactly as it appears in a control-plane record."""
+
+
+def _cp_reject_constant(name):
+    raise ValueError(f"{name} is not a JSON number")
+
+
+def _cp_object(pairs):
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            raise ValueError(f"duplicate key {key!r}")
+        obj[key] = value
+    return obj
+
+
+def load_control_plane_record(raw):
+    """Parse a stored control-plane record (bytes), keeping number tokens
+    verbatim. Refuses duplicate keys, NaN/Infinity and a non-object."""
+    if isinstance(raw, (bytes, bytearray)):
+        raw = bytes(raw).decode('utf-8')
+    record = json.loads(raw, parse_float=ControlPlaneNumber, parse_int=ControlPlaneNumber,
+                        parse_constant=_cp_reject_constant, object_pairs_hook=_cp_object)
+    if not isinstance(record, dict):
+        raise ValueError("a control-plane record is a JSON object")
+    return record
+
+
+def _cp_emit_str(s):
+    out = ['"']
+    for c in s:
+        if c == '\\':
+            out.append('\\\\')
+        elif c == '"':
+            out.append('\\"')
+        elif c == '\b':
+            out.append('\\b')
+        elif c == '\f':
+            out.append('\\f')
+        elif c == '\n':
+            out.append('\\n')
+        elif c == '\r':
+            out.append('\\r')
+        elif c == '\t':
+            out.append('\\t')
+        elif ord(c) < 0x20:
+            out.append(f'\\u{ord(c):04x}')
+        else:
+            out.append(c)
+    out.append('"')
+    return ''.join(out)
+
+
+def control_plane_canonical(value):
+    """The control plane's canonical JSON text for a value parsed by
+    load_control_plane_record (see the section comment)."""
+    if value is None:
+        return 'null'
+    if value is True:
+        return 'true'
+    if value is False:
+        return 'false'
+    if isinstance(value, ControlPlaneNumber):
+        return str.__str__(value)
+    if isinstance(value, str):
+        return _cp_emit_str(value)
+    if isinstance(value, list):
+        return '[' + ','.join(control_plane_canonical(v) for v in value) + ']'
+    if isinstance(value, dict):
+        members = sorted(value.items(), key=lambda kv: kv[0].encode('utf-16-be', 'surrogatepass'))
+        return '{' + ','.join(f"{_cp_emit_str(k)}:{control_plane_canonical(v)}" for k, v in members) + '}'
+    raise ValueError(f"a control-plane record cannot hold a {type(value).__name__}")
+
+
+def control_plane_sequence(record):
+    """The record's sequence_number as an int, or None when it is not a plain
+    integer token."""
+    seq = record.get('sequence_number')
+    if isinstance(seq, ControlPlaneNumber) and re.fullmatch(r'-?[0-9]+', seq):
+        return int(seq)
+    return None
+
+
+def control_plane_event_hash_v1(record):
+    """Recompute a control-plane record's event_hash (recipe control-plane-v1).
+    Raises ValueError naming why it cannot: an unpublished schema_version, a
+    missing chain field, or text that does not encode."""
+    version = record.get('schema_version')
+    if version != CONTROL_PLANE_SCHEMA_V1:
+        raise ValueError(f"schema_version {version!r} is not a published control-plane preimage "
+                         f"(only {CONTROL_PLANE_SCHEMA_V1!r})")
+    seq = control_plane_sequence(record)
+    if seq is None:
+        raise ValueError("sequence_number is not an integer")
+    if not -2**63 <= seq < 2**63:
+        raise ValueError(f"sequence_number {seq} is outside the signed 64-bit range the preimage encodes")
+    prev = record.get('previous_hash')
+    if not isinstance(prev, str) or isinstance(prev, ControlPlaneNumber):
+        raise ValueError("previous_hash is not a string")
+    preimage = control_plane_canonical({k: record.get(k) for k in CONTROL_PLANE_HASHED_FIELDS})
+    try:
+        preimage_bytes = preimage.encode('utf-8')
+    except UnicodeEncodeError as exc:
+        raise ValueError(f"the record holds text that is not valid Unicode: {exc}") from exc
+    h = hashlib.sha256()
+    h.update(struct.pack('<q', seq))
+    h.update(prev.encode('utf-8'))
+    h.update(preimage_bytes)
+    return h.hexdigest()
+
+
+def control_plane_record_name(seq):
+    return f"{seq:020d}.json"
+
+
+def control_plane_gcs_fetcher(bucket_name, storage_client):
+    """fetch(seq) -> bytes of control-plane/<seq:020d>.json in the bucket."""
+    bucket = storage_client.bucket(bucket_name)
+
+    def fetch(seq):
+        return bucket.blob(f"{CONTROL_PLANE_PREFIX}{control_plane_record_name(seq)}").download_as_bytes()
+
+    return fetch
+
+
+def control_plane_local_fetcher(records_path):
+    """fetch(seq) -> bytes of <records>/control-plane/<seq:020d>.json. A
+    records path that is not a directory holds no control-plane records."""
+    base = Path(records_path) / 'control-plane'
+
+    def fetch(seq):
+        if not Path(records_path).is_dir():
+            raise FileNotFoundError(
+                f"--records {records_path} is a file; control-plane records are read from a records "
+                f"directory, under control-plane/")
+        return (base / control_plane_record_name(seq)).read_bytes()
+
+    return fetch
+
+
+def control_plane_exporting_fetcher(fetch, export_dir):
+    """Wrap `fetch` so every control-plane record read is also written to
+    export_dir/control-plane/<seq:020d>.json."""
+    out = Path(export_dir) / 'control-plane'
+
+    def fetch_and_export(seq):
+        raw = fetch(seq)
+        # Created on first write, so a pack without the control-plane chain
+        # exports exactly what it did before 1.3.
+        out.mkdir(parents=True, exist_ok=True)
+        (out / control_plane_record_name(seq)).write_bytes(raw)
+        return raw
+
+    return fetch_and_export
+
+
+def control_plane_manifest_problem(manifest):
+    """None when the manifest's control_plane section is where its version
+    says (exactly in 1.3) and names the chain this verifier reads, else the
+    problem (a verification failure)."""
+    version = manifest.get('schema_version', '1.0')
+    section = manifest.get('control_plane')
+    if version not in ('1.3', '1.4', '1.5'):
+        if section is not None:
+            return f"manifest {version} carries a control_plane section, which only 1.3, 1.4 and 1.5 define"
+        return None
+    if version in ('1.4', '1.5') and section is None:
+        return None
+    if section is None:
+        return f"manifest {version} has no control_plane section"
+    if not isinstance(section, dict):
+        return f"manifest {version} control_plane section is not an object"
+    if section.get('chain_family') != CONTROL_PLANE_CHAIN_FAMILY or section.get('prefix') != CONTROL_PLANE_PREFIX:
+        return (f"control_plane section names chain_family {section.get('chain_family')!r} at prefix "
+                f"{section.get('prefix')!r}; this verifier reads {CONTROL_PLANE_CHAIN_FAMILY!r} at "
+                f"{CONTROL_PLANE_PREFIX!r}")
+    if section.get('hash_version') != CONTROL_PLANE_SCHEMA_V1:
+        return f"control_plane hash_version {section.get('hash_version')!r} is not {CONTROL_PLANE_SCHEMA_V1!r}"
+    if section.get('genesis_hash') != genesis_hash():
+        return "control_plane genesis_hash is not SHA-256 of meilynx-genesis-v1"
+    entries = section.get('events')
+    if not isinstance(entries, list):
+        return "control_plane events is not a list"
+    seqs = [e.get('sequence') if isinstance(e, dict) else None for e in entries]
+    if seqs != list(range(len(entries))):
+        return "control_plane events must list every sequence from 0, in order"
+    return None
+
+
+def verify_control_plane_chain(fetch, manifest, report=print, records_out=None):
+    """Walk the manifest's control_plane entries from genesis: fetch each
+    record, recompute its hash, check it against the stored event_hash and the
+    manifest entry, and check the link to the record before it. Returns
+    (passed, records), where records maps each readable record's event_id to
+    (sequence, event_hash, verified) for the receipt anchor check.
+    `records_out`, when given, is filled with sequence -> (record, verified)
+    for every readable record (the customer-conditions verdict)."""
+    problem = control_plane_manifest_problem(manifest)
+    if problem:
+        report(f"FAIL control_plane: {problem}")
+        return False, {}
+    section = manifest.get('control_plane')
+    if section is None:
+        return True, {}
+    entries = section['events']
+    if not entries:
+        report("CONTROL-PLANE: the control-plane chain holds no records.")
+        return True, {}
+
+    passed = True
+    records = {}
+    next_link = {genesis_hash()}
+    for entry in entries:
+        seq = entry['sequence']
+        link_targets = next_link
+        next_link = {h for h in (entry.get('stored_event_hash'), entry.get('recomputed_event_hash'))
+                     if isinstance(h, str) and h}
+        try:
+            record = load_control_plane_record(fetch(seq))
+        except Exception as exc:  # Propagate loud — the record fails, the walk goes on
+            report(f"FAIL control-plane seq={seq}: record unreadable: {exc}")
+            passed = False
+            continue
+        stored_hash = record.get('event_hash') if isinstance(record.get('event_hash'), str) else ''
+        stored_prev = record.get('previous_hash') if isinstance(record.get('previous_hash'), str) else ''
+        event_id = record.get('event_id') if isinstance(record.get('event_id'), str) else ''
+        next_link = next_link | ({stored_hash} if stored_hash else set())
+        if records_out is not None:
+            records_out[seq] = (record, False)
+        try:
+            recomputed = control_plane_event_hash_v1(record)
+        except ValueError as exc:
+            report(f"FAIL control-plane seq={seq}: {exc}")
+            passed = False
+            records.setdefault(event_id, (seq, stored_hash, False))
+            continue
+        # One FAIL line per record, naming every problem with it (as the
+        # proxy chain walk reports one tampered record once).
+        problems = []
+        if control_plane_sequence(record) != seq:
+            problems.append(f"the record says sequence_number {record.get('sequence_number')!r}")
+        if recomputed != stored_hash:
+            problems.append(f"hash mismatch. stored={stored_hash[:16]}... recomputed={recomputed[:16]}...")
+        manifest_recomputed = entry.get('recomputed_event_hash', '')
+        if manifest_recomputed and recomputed != manifest_recomputed:
+            problems.append(f"hash recomputation disagrees with manifest. "
+                            f"Our: {recomputed[:16]}... Manifest: {str(manifest_recomputed)[:16]}...")
+        if entry.get('event_id') and entry.get('event_id') != event_id:
+            problems.append(f"manifest names event_id {entry.get('event_id')!r}, the record {event_id!r}")
+        if link_targets and stored_prev not in link_targets:
+            expected = ' or '.join(f"{h[:16]}..." for h in sorted(link_targets))
+            problems.append(f"chain break. previous_hash={stored_prev[:16]}... expected={expected}")
+        if problems:
+            report(f"FAIL control-plane seq={seq}: {'; '.join(problems)}")
+        elif not link_targets:
+            report(f"WARN control-plane seq={seq}: hash={stored_hash[:16]}... verified, but its chain link "
+                   f"was not checked, because the record before it failed and nothing in the pack attests "
+                   f"its hash.")
+        ok = not problems
+        if ok and link_targets:
+            report(f"PASS control-plane seq={seq} {record.get('event_kind')} hash={stored_hash[:16]}... chain_ok")
+            next_link = {stored_hash}
+        else:
+            passed = False
+        records[event_id] = (seq, stored_hash, ok and bool(link_targets))
+        if records_out is not None:
+            records_out[seq] = (record, ok and bool(link_targets))
+    if passed:
+        report(f"CONTROL-PLANE OK: {len(entries)} control-plane record(s) verified from genesis")
+    return passed, records
+
+
+def receipt_anchor_findings(receipts, control_plane_records):
+    """Each decision receipt's cp_anchor_event_id
+    and cp_anchor_event_hash against the pack's control-plane chain. A receipt
+    whose anchor id names a verified control-plane record must carry that
+    record's event_hash (else a failure naming the receipt and both hashes);
+    one naming a record that failed above is not checked (WARN); one naming no
+    record in the pack is WARN receipt_anchor_outside_pack (a receipt anchored
+    to the control plane's Postgres chain, or an event after the pack's last).
+    `receipts` maps each receipt record's sequence to its payload. Returns
+    (failures, warnings, lines)."""
+    failures, warnings, lines = [], [], []
+    for seq, receipt in sorted(receipts.items()):
+        rid = receipt.get('receipt_id', '?')
+        anchor_id = receipt.get('cp_anchor_event_id')
+        anchor_hash = receipt.get('cp_anchor_event_hash')
+        held = control_plane_records.get(anchor_id) if isinstance(anchor_id, str) and anchor_id else None
+        if held is None:
+            warnings.append(
+                f"WARN receipt_anchor_outside_pack seq={seq} receipt={rid} cp_anchor_event_id={anchor_id}: "
+                f"no record in this pack's control-plane chain has that event id.")
+            continue
+        cp_seq, cp_hash, cp_ok = held
+        if not cp_ok:
+            warnings.append(
+                f"WARN seq={seq}: decision receipt {rid} cites control-plane seq={cp_seq}, which failed "
+                f"above, so its anchor was not checked.")
+            continue
+        if anchor_hash != cp_hash:
+            failures.append(
+                f"decision receipt {rid}: cp_anchor_event_hash {str(anchor_hash)[:16]}... is not the "
+                f"event_hash {cp_hash[:16]}... of control-plane seq={cp_seq} ({anchor_id})")
+            continue
+        lines.append(f"RECEIPT ANCHOR OK seq={seq} receipt={rid} control-plane seq={cp_seq}")
+    return failures, warnings, lines
+
+
+def verify_control_plane_section(manifest, receipts, fetch, report=print, records_out=None):
+    """The control-plane chain a 1.3 manifest carries, then each decision
+    receipt's anchor against it. True when both pass. `records_out` as in
+    verify_control_plane_chain."""
+    passed, records = verify_control_plane_chain(fetch, manifest, report, records_out)
+    if manifest.get('control_plane') is None or control_plane_manifest_problem(manifest):
+        return passed
+    failures, warnings, lines = receipt_anchor_findings(receipts, records)
+    for line in warnings:
+        report(line)
+    for problem in failures:
+        report(f"FAIL receipt anchor: {problem}")
+    if failures:
+        return False
+    for line in lines:
+        report(line)
+    return passed
+
+
+# ---------------------------------------------------------------------------
+# Customer conditions verdict
+#
+# A bank subscribed to a vendor's evidence can propose conditions
+# the vendor's proxy enforces. An accepted set compiles into the holder's
+# governance and MCP bundles as rule instances `<family>@cust_<12 hex>` and
+# matrix rows `cust_<12 hex>.…` (the first 12 hex digits of the relationship
+# id), and the acceptance is sealed on the holder's control-plane chain as
+# `exchange.conditions_accepted`, with `conditions_sha256` (the digest the
+# bank holds of its own set) and the compiled `compiled_governance_sha256` /
+# `compiled_mcp_sha256`. `--conditions-sha256` asks this verifier to check,
+# from the pack alone:
+#
+#   1. the acceptance: a verified `exchange.conditions_accepted` record of
+#      that digest in the pack's control-plane chain. A pack without the
+#      control-plane chain (every per-tenant export, Exchange packs included)
+#      does not carry it; `--conditions-acceptance FILE` then takes the stored
+#      record (`control-plane/<seq:020d>.json`) from outside the pack, whose
+#      hash is recomputed but whose link into the chain the pack cannot show.
+#      With neither, the verdict says "acceptance not in this pack" and cannot
+#      be evaluated (exit 2), and only the instances the pack names are
+#      counted.
+#   2. the window: proxy records sealed at or after the acceptance (and
+#      before a release of the set, when the pack shows one). Each model
+#      request and MCP record in it either carries the compiled set by sealed
+#      evidence (an MCP record's hashed `mcp_bundle_sha256` equal to the
+#      compiled MCP bundle; a model request whose digest-bound evaluation
+#      trace ran an instance with the set's suffix) or is a gap, printed with
+#      its coordinates. A model request's `policy_version` is stored outside
+#      the record's hash, so a match there alone is counted apart, never as
+#      sealed.
+#   3. the exceptions: records in the window whose findings, evaluation-trace
+#      decision or MCP finding summary name one of the set's rule instances,
+#      each printed with whether a sealed digest binds it. A hold a human
+#      released is the condition working, not an exception; a hold that
+#      lapsed is (D7), but no sealed field ties a lapsed decision receipt to
+#      the set, so it is not counted here.
+#
+# What it cannot check, stated on the verdict: that the compiled bundles are
+# what the set says. The compile runs in the holder's control plane, and the
+# pack carries bundle digests, not bundles.
+# ---------------------------------------------------------------------------
+
+CONDITIONS_ACCEPTED_KIND = 'exchange.conditions_accepted'
+CONDITIONS_RELEASED_KIND = 'exchange.conditions_released'
+CONDITIONS_INSTANCE_PREFIX = 'cust_'
+_SHA256_HEX = re.compile(r'[0-9a-f]{64}')
+_UTC_TEXT = re.compile(r'(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.(\d+))?(Z|[+-]\d\d:\d\d)?')
+
+
+def conditions_instance_suffix(relationship_id):
+    """`cust_<12 hex>`: the instance suffix the holder's control plane compiles
+    a relationship's set under (the first 12 hex digits of its id), or None
+    when the id is not a UUID."""
+    if not isinstance(relationship_id, str):
+        return None
+    hexed = relationship_id.replace('-', '').lower()
+    if not re.fullmatch(r'[0-9a-f]{32}', hexed):
+        return None
+    return CONDITIONS_INSTANCE_PREFIX + hexed[:12]
+
+
+def utc_microseconds(text):
+    """An RFC 3339 timestamp as integer microseconds since the epoch (a
+    fraction past six digits is truncated), or None."""
+    m = _UTC_TEXT.fullmatch(text.strip()) if isinstance(text, str) else None
+    if not m:
+        return None
+    year, month, day, hour, minute, second, fraction, zone = m.groups()
+    try:
+        moment = datetime.datetime(int(year), int(month), int(day), int(hour), int(minute), int(second),
+                                   tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+    micros = int(((fraction or '') + '000000')[:6])
+    offset = 0
+    if zone and zone != 'Z':
+        sign = 1 if zone[0] == '+' else -1
+        offset = sign * (int(zone[1:3]) * 3600 + int(zone[4:6]) * 60)
+    return (int((moment - datetime.datetime(1970, 1, 1, tzinfo=datetime.timezone.utc)).total_seconds())
+            - offset) * 1_000_000 + micros
+
+
+def _payload_str(record, key):
+    payload = record.get('payload')
+    value = payload.get(key) if isinstance(payload, dict) else None
+    return str.__str__(value) if isinstance(value, str) else None
+
+
+def acceptance_problem(record, digest):
+    """None when a control-plane record is an acceptance of `digest` that
+    names what the verdict needs, else why not."""
+    if record.get('event_kind') != CONDITIONS_ACCEPTED_KIND:
+        return f"it is {record.get('event_kind')!r}, not {CONDITIONS_ACCEPTED_KIND!r}"
+    if _payload_str(record, 'conditions_sha256') != digest:
+        return f"it accepts set {_payload_str(record, 'conditions_sha256')!r}, not {digest}"
+    if conditions_instance_suffix(_payload_str(record, 'relationship_id')) is None:
+        return "its payload names no relationship_id"
+    if utc_microseconds(record.get('occurred_at')) is None:
+        return "its occurred_at is not a timestamp"
+    if not any(_SHA256_HEX.fullmatch(_payload_str(record, k) or '')
+               for k in ('compiled_governance_sha256', 'compiled_mcp_sha256')):
+        return "its payload names no compiled governance or MCP bundle digest"
+    return None
+
+
+def find_acceptance(cp_records, digest):
+    """The last verified acceptance of `digest` in a control-plane chain
+    (sequence -> (record, verified)), as (seq, record, verified, end_us) where
+    end_us is when a later record released or superseded it, or None; None
+    when the chain holds no acceptance of the digest."""
+    found = None
+    for seq in sorted(cp_records):
+        record, verified = cp_records[seq]
+        if record.get('event_kind') == CONDITIONS_ACCEPTED_KIND and \
+                _payload_str(record, 'conditions_sha256') == digest:
+            found = (seq, record, verified)
+    if found is None:
+        return None
+    seq, record, verified = found
+    relationship = _payload_str(record, 'relationship_id')
+    end_us = None
+    for later in sorted(s for s in cp_records if s > seq):
+        other, _ = cp_records[later]
+        kind = other.get('event_kind')
+        same_set = _payload_str(other, 'conditions_sha256') == digest
+        superseded = (kind == CONDITIONS_ACCEPTED_KIND and not same_set
+                      and _payload_str(other, 'relationship_id') == relationship)
+        if (kind == CONDITIONS_RELEASED_KIND and same_set) or superseded:
+            end_us = utc_microseconds(other.get('occurred_at'))
+            break
+    return seq, record, verified, end_us
+
+
+def _record_kind(record):
+    kind = record.get('event_kind')
+    if kind in (None, 'llm_request'):
+        return 'llm'
+    if isinstance(kind, str) and kind.startswith('mcp_'):
+        return 'mcp'
+    return None
+
+
+def _trace_rules(record):
+    """(rule ids, deciding rule id) of a sealed evaluation trace, else ((), None)."""
+    trace = record.get('evaluation_trace')
+    outcomes = trace.get('outcomes') if isinstance(trace, dict) else None
+    if record.get('schema_version') not in ('v1.16', 'v1.18') or not isinstance(outcomes, dict):
+        return (), None
+    rules = outcomes.get('rules')
+    ids = tuple(r.get('rule_id') for r in rules if isinstance(r, dict)) if isinstance(rules, list) else ()
+    return ids, outcomes.get('deciding_rule_id')
+
+
+def _names_instance(rule_id, suffix):
+    """Whether a rule id is one of the set's rule instances
+    (`<family>@cust_<12 hex>`); with suffix None, any customer-condition
+    instance. A compiled MCP matrix row (`cust_<12 hex>.…`) is not one: a hold
+    it raises and a human releases is the condition working, not an
+    exception."""
+    if not isinstance(rule_id, str):
+        return False
+    if suffix is None:
+        return f'@{CONDITIONS_INSTANCE_PREFIX}' in rule_id
+    return rule_id.endswith('@' + suffix)
+
+
+def condition_exceptions(record, suffix):
+    """What in a record names one of the set's instances (any customer-condition
+    instance with suffix None): a list of (description, sealing)."""
+    found = []
+    findings = record.get('findings')
+    bound = isinstance(record.get('content'), dict) and record['content'].get('findings_sha256_jcs') is not None
+    for finding in findings if isinstance(findings, list) else ():
+        if isinstance(finding, dict) and _names_instance(finding.get('validator'), suffix):
+            found.append((f"finding {finding.get('validator')} {finding.get('code', '')}".rstrip(),
+                          'bound by content.findings_sha256_jcs' if bound else 'stored, not hashed'))
+    _, deciding = _trace_rules(record)
+    if _names_instance(deciding, suffix):
+        found.append((f"decision by {deciding}", 'bound by evaluation_trace.outcomes_sha256_jcs'))
+    mcp = record.get('mcp_event') if isinstance(record.get('mcp_event'), dict) else {}
+    summary = mcp.get('finding_summary')
+    for item in summary if isinstance(summary, list) else ():
+        if isinstance(item, dict) and (_names_instance(item.get('rule_id'), suffix)
+                                       or _names_instance(item.get('detector'), suffix)):
+            found.append((f"MCP finding {item.get('rule_id') or item.get('detector')} {item.get('code', '')}".rstrip(),
+                          'stored, not hashed'))
+    return found
+
+
+def conditions_verdict(digest, manifest, records, cp_records, supplied=None, report=print, label=''):
+    """The customer-conditions verdict for the set
+    whose digest is `digest`, over the proxy records the walk read (`records`:
+    sequence -> record) and the pack's control-plane chain (`cp_records`:
+    sequence -> (record, verified), empty when the pack has none). `supplied`
+    is (record, path) of an acceptance given outside the pack. Prints the
+    lines and the verdict line; returns PASSED, FAILED or CANNOT_EVALUATE."""
+    report(f"CONDITIONS: set {digest}")
+    # A hash-only stub has no timestamp, kind or findings: it cannot
+    # be placed in the window or read for an instance, so it is named here and
+    # counted nowhere else.
+    stubbed = sorted(manifest_stubs(manifest))
+    if stubbed:
+        shown = ', '.join(map(str, stubbed[:20])) + (', ...' if len(stubbed) > 20 else '')
+        report(f"NOTE: {len(stubbed)} hash-only stub(s) (seq {shown}) carry no timestamp, kind or findings, so the "
+               f"conditions verdict does not place them in the window or count them.")
+    in_pack = find_acceptance(cp_records, digest) if cp_records else None
+    status = PASSED
+    where = None
+    if in_pack is not None:
+        seq, acceptance, verified, end_us = in_pack
+        if supplied is not None:
+            report("NOTE: the pack's control-plane chain holds the acceptance; --conditions-acceptance is not used.")
+        if not verified:
+            report(f"FAIL conditions: the acceptance at control-plane seq={seq} did not verify (see above).")
+            status = FAILED
+        where = f"seq {seq}"
+    elif supplied is not None:
+        acceptance, path = supplied
+        end_us = None
+        seq = control_plane_sequence(acceptance)
+        try:
+            recomputed = control_plane_event_hash_v1(acceptance)
+        except ValueError as exc:
+            recomputed = None
+            report(f"FAIL conditions: the acceptance in {path} cannot be recomputed: {exc}")
+            status = FAILED
+        if recomputed is not None and recomputed != acceptance.get('event_hash'):
+            report(f"FAIL conditions: the acceptance in {path} does not recompute to its event_hash "
+                   f"(stored={str(acceptance.get('event_hash'))[:16]}... recomputed={recomputed[:16]}...)")
+            status = FAILED
+        held = [r for r, _ in cp_records.values() if r.get('event_id') == acceptance.get('event_id')]
+        if held and held[0].get('event_hash') != acceptance.get('event_hash'):
+            report(f"FAIL conditions: the acceptance in {path} is not the record this pack's control-plane "
+                   f"chain holds for event {acceptance.get('event_id')}")
+            status = FAILED
+        where = (f"seq {seq} (supplied outside this pack: its hash recomputes, its link into the holder's "
+                 f"control-plane chain is not in this pack)")
+    else:
+        acceptance = None
+    if acceptance is not None:
+        problem = acceptance_problem(acceptance, digest)
+        if problem:
+            report(f"FAIL conditions: the acceptance at control-plane {where} is not usable: {problem}")
+            return FAILED if status == FAILED or in_pack is None else CANNOT_EVALUATE
+
+    governed = {s: r for s, r in records.items() if _record_kind(r)}
+    if acceptance is None:
+        why = ("this pack's control-plane chain holds no acceptance of the set" if cp_records
+               else "acceptance not in this pack")
+        report(f"CANNOT EVALUATE conditions: {why}. The compiled versions and the set's instance suffix are in "
+               f"the acceptance, so no record is checked against them. Pass the acceptance record with "
+               f"--conditions-acceptance FILE, or verify a pack that carries the holder's control-plane chain.")
+        named = {}
+        for s in sorted(governed):
+            for what, sealing in condition_exceptions(governed[s], None):
+                named[s] = named.get(s, []) + [f"{what} ({sealing})"]
+        for s, whats in named.items():
+            report(f"INSTANCE seq={s}: {'; '.join(whats)}")
+        report(f"conditions: set {digest} {why}; {len(governed)} records in the pack not checked against a "
+               f"compiled version; {len(named)} records name a customer-condition instance; compiled by the "
+               f"holder's control plane{label}")
+        return CANNOT_EVALUATE
+
+    suffix = conditions_instance_suffix(_payload_str(acceptance, 'relationship_id'))
+    start_us = utc_microseconds(acceptance.get('occurred_at'))
+    governance = _payload_str(acceptance, 'compiled_governance_sha256')
+    mcp_bundle = _payload_str(acceptance, 'compiled_mcp_sha256')
+    report(f"CONDITIONS: accepted at control-plane {where}, {acceptance.get('occurred_at')}: relationship "
+           f"{_payload_str(acceptance, 'relationship_id')}, instances {suffix}, compiled governance "
+           f"{(governance or 'none')[:16]}..., compiled MCP bundle {(mcp_bundle or 'none')[:16]}...")
+    window = {}
+    for s, r in governed.items():
+        at = utc_microseconds(normalize_timestamp(r.get('timestamp_utc', '')))
+        if at is not None and at >= start_us and (end_us is None or at < end_us):
+            window[s] = r
+    if end_us is not None:
+        report("CONDITIONS: the set was released or superseded later in the control-plane chain; the window "
+               "ends there.")
+    carried, unsealed, gaps, exceptions = 0, [], [], []
+    for s in sorted(window):
+        r = window[s]
+        if _record_kind(r) == 'mcp':
+            mcp = r.get('mcp_event') if isinstance(r.get('mcp_event'), dict) else {}
+            observed = mcp.get('mcp_bundle_sha256')
+            if mcp_bundle and observed == mcp_bundle:
+                carried += 1
+            else:
+                gaps.append((s, r, 'MCP bundle', observed, mcp_bundle))
+        else:
+            rule_ids, _ = _trace_rules(r)
+            if any(_names_instance(i, suffix) for i in rule_ids):
+                carried += 1
+            elif governance and r.get('policy_version') == governance:
+                unsealed.append(s)
+            else:
+                gaps.append((s, r, 'governance', r.get('policy_version'), governance))
+        for what, sealing in condition_exceptions(r, suffix):
+            exceptions.append((s, r, what, sealing))
+    for s, r, lane, observed, compiled in gaps:
+        report(f"GAP seq={s} hash={str(r.get('event_hash', ''))[:16]}...: sealed under {lane} "
+               f"{(observed or 'none')[:16]}..., not the compiled {(compiled or 'none')[:16]}...")
+    if unsealed:
+        report(f"NOTE: {len(unsealed)} model request(s) in the window (seq {', '.join(map(str, unsealed))}) name "
+               f"the compiled governance version only in policy_version, which their hash does not cover; "
+               f"they are not counted as sealed.")
+    for s, r, what, sealing in exceptions:
+        report(f"EXCEPTION seq={s} hash={str(r.get('event_hash', ''))[:16]}...: {what} ({sealing})")
+    excepted = len({s for s, *_ in exceptions})
+    report(f"conditions: set {digest} accepted at {where.split(' (')[0]}; {carried} of {len(window)} records in "
+           f"the window sealed under a governance version carrying it; {excepted} exceptions; compiled by the "
+           f"holder's control plane{label}")
+    return status
+
+
 def compute_event_hash_v1_9_llm_request(
     sequence_number, timestamp_utc, event_id, request_id,
     model_requested, action, input_tokens, output_tokens,
@@ -718,7 +1936,7 @@ def compute_event_hash_v1_9_llm_request(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     join_context,
 ):
-    """MEI-2151 — v1.9 llm_request hash: the v1.2 LlmRequest preimage (v1.2
+    """v1.9 llm_request hash: the v1.2 LlmRequest preimage (v1.2
     prefix + event_kind wire name) plus the three caller-asserted cross-lane
     join keys, each with the same 1-byte presence tag every other optional
     string uses. Mirror of `compute_event_hash_v1_9_llm_request` in sqlite.rs.
@@ -735,7 +1953,7 @@ def compute_event_hash_v1_9_llm_request(
         cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     )
     h.update(EVENT_KIND_LLM_REQUEST.encode('utf-8'))
-    # MEI-2151 — the v1.9 addition, in CallerJoinContext struct-definition order.
+    # The v1.9 addition, in CallerJoinContext struct-definition order.
     h.update(encode_optional_str(join_context.get('correlation_id')))
     h.update(encode_optional_str(join_context.get('session_id')))
     h.update(encode_optional_str(join_context.get('agent_name')))
@@ -750,7 +1968,7 @@ def compute_event_hash_v1_9_mcp(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     mcp_event, join_context,
 ):
-    """MEI-2151 — v1.9 mcp.* hash: the v1.7 preimage (which carries the v1.5
+    """v1.9 mcp.* hash: the v1.7 preimage (which carries the v1.5
     principal chain and the v1.6 capture-axis address forward, fed even when
     None) plus the three caller-asserted join keys. Mirror of
     `compute_event_hash_v1_9_mcp` in sqlite.rs.
@@ -761,7 +1979,7 @@ def compute_event_hash_v1_9_mcp(
     which would silently invalidate every historical record."""
     if event_kind not in MCP_EVENT_KINDS:
         raise ValueError(
-            f"MEI-2151: compute_event_hash_v1_9_mcp called with non-MCP kind {event_kind!r}"
+            f"compute_event_hash_v1_9_mcp called with non-MCP kind {event_kind!r}"
         )
     h = _v1_2_prefix_hash(
         sequence_number, timestamp_utc, event_id, request_id,
@@ -783,17 +2001,17 @@ def compute_event_hash_v1_9_mcp(
     h.update(encode_optional_str(mcp_event.get('correlated_event_id')))
     h.update(encode_optional_i64(mcp_event.get('error_code')))
     h.update(mcp_event['traceparent'].encode('utf-8'))
-    # MEI-804 — the v1.5 principal chain (carried forward into v1.9).
+    # The v1.5 principal chain (carried forward into v1.9).
     h.update(encode_principal_chain(mcp_event['principal_chain']))
-    # MEI-1189 — the v1.6 capture-axis address (carried forward, fed even when
+    # The v1.6 capture-axis address (carried forward, fed even when
     # None for byte-position stability with v1.6/v1.7).
     h.update(encode_optional_str(mcp_event.get('redacted_payload_sha256_jcs')))
-    # MEI-1063 — the v1.7 enforcement-axis fields (carried forward, fed even
+    # The v1.7 enforcement-axis fields (carried forward, fed even
     # when None for byte-position stability with v1.7).
     h.update(encode_optional_str(mcp_event.get('redaction_pre_sha256_jcs')))
     h.update(encode_optional_str(mcp_event.get('redaction_post_sha256_jcs')))
     h.update(encode_optional_str(mcp_event.get('hold_id')))
-    # MEI-2151 — the v1.9 addition, in CallerJoinContext struct-definition order.
+    # The v1.9 addition, in CallerJoinContext struct-definition order.
     h.update(encode_optional_str(join_context.get('correlation_id')))
     h.update(encode_optional_str(join_context.get('session_id')))
     h.update(encode_optional_str(join_context.get('agent_name')))
@@ -801,7 +2019,7 @@ def compute_event_hash_v1_9_mcp(
 
 
 # ---------------------------------------------------------------------------
-# MEI-2424 — RFC 8785 (JCS) canonical JSON, for the v1.10 content digests.
+# RFC 8785 (JCS) canonical JSON, for the v1.10 content digests.
 #
 # The proxy computes `stored_prompt_sha256_jcs` / `findings_sha256_jcs` with
 # serde_jcs over the record's own `messages` / `findings`. Recomputing them
@@ -879,7 +2097,7 @@ def compute_event_hash_v1_10_llm_request(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     join_context, content,
 ):
-    """MEI-2424 — v1.10 llm_request hash: the v1.9 layout (v1.2 prefix + kind
+    """v1.10 llm_request hash: the v1.9 layout (v1.2 prefix + kind
     + the three join keys, fed with presence tags even when no join key was
     asserted) followed by the six content-attestation fields in
     `LlmContentFields::HASH_FEED_ORDER`. `capture_policy` is a required
@@ -916,7 +2134,7 @@ def compute_event_hash_v1_11_llm_request(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     join_context, content,
 ):
-    """MEI-2456 — v1.11 llm_request hash: the v1.10 layout followed by the two
+    """v1.11 llm_request hash: the v1.10 layout followed by the two
     tool-call digests (`tool_calls_sha256_jcs`, then
     `stored_tool_calls_sha256_jcs`), each an optional string. Mirror of
     `compute_event_hash_v1_11_llm_request` in sqlite.rs.
@@ -955,10 +2173,10 @@ def _has_tool_call_digests(content):
     )
 
 
-def check_llm_content(event):
-    """MEI-2424 — for a v1.10, v1.11 or v1.12 record, check that the content it
+def check_llm_content(event, stripped=frozenset()):
+    """For a v1.10, v1.11 or v1.12 record, check that the content it
     carries is the content it was sealed over: the stored-prompt,
-    stored-response, findings and (MEI-2456) stored-tool-calls digests (all
+    stored-response, findings and stored-tool-calls digests (all
     inside the hash) must match the record's own `messages`, `response_text`,
     `findings` and `tool_calls`. A digest that is absent means nothing was
     retained, so the record must carry no content on that axis; a v1.10
@@ -966,29 +2184,43 @@ def check_llm_content(event):
     Returns a list of problems; empty means the content checks out. Records
     on older schema versions carry no digests and return no problems.
 
-    MEI-2745 — v1.12 carries the v1.11 content block forward, presence-tagged:
+    v1.12 carries the v1.11 content block forward, presence-tagged:
     a v1.12 record with a content block gets the same check, and one sealed
     with no capture policy has none and stores its content unhashed, as before
-    v1.10."""
+    v1.10.
+
+    `stripped` names the fields a content-stripped Exchange pack
+    removed (STRIPPED_FIELDS). An axis whose content was removed is not
+    re-derived: its sealed digest is inside the hash, which the walk
+    recomputes, and that is all a stripped pack can show of it. The findings
+    axis is kept and checked.
+
+    v1.16 and v1.18 carry the same presence-tagged content block
+    forward (CONTENT_ATTESTATION_VERSIONS), so their records get the v1.12
+    check: a block is re-derived, no block means no capture policy."""
     schema_version = event.get('schema_version') or 'v1'
-    if schema_version not in ('v1.10', 'v1.11', 'v1.12'):
+    if schema_version not in CONTENT_ATTESTATION_VERSIONS:
         return []
     content = event.get('content')
-    if schema_version == 'v1.12' and content is None:
+    if schema_version in CONTENT_PRESENCE_TAGGED_VERSIONS and content is None:
         return []
     if not isinstance(content, dict):
         return [f'{schema_version} record has no content payload']
     problems = []
     messages = event.get('messages') or []
     stored_prompt = content.get('stored_prompt_sha256_jcs')
-    if stored_prompt is not None:
+    if 'messages' in stripped:
+        pass
+    elif stored_prompt is not None:
         if sha256_jcs(messages) != stored_prompt:
             problems.append('messages do not match stored_prompt_sha256_jcs (the prompt was changed after sealing)')
     elif messages:
         problems.append('messages present but no stored_prompt_sha256_jcs was sealed')
     response_text = event.get('response_text')
     stored_response = content.get('stored_response_sha256')
-    if stored_response is not None:
+    if 'response_text' in stripped:
+        pass
+    elif stored_response is not None:
         if response_text is None or hashlib.sha256(response_text.encode('utf-8')).hexdigest() != stored_response:
             problems.append('response_text does not match stored_response_sha256 (the response was changed after sealing)')
     elif response_text is not None:
@@ -998,7 +2230,9 @@ def check_llm_content(event):
         problems.append('findings do not match findings_sha256_jcs (the findings were changed after sealing)')
     tool_calls = event.get('tool_calls')
     stored_tool_calls = content.get('stored_tool_calls_sha256_jcs')
-    if stored_tool_calls is not None:
+    if 'tool_calls' in stripped:
+        pass
+    elif stored_tool_calls is not None:
         if tool_calls is None or sha256_jcs(tool_calls) != stored_tool_calls:
             problems.append('tool_calls do not match stored_tool_calls_sha256_jcs (the tool calls were changed after sealing)')
     elif tool_calls is not None:
@@ -1007,7 +2241,7 @@ def check_llm_content(event):
 
 
 def encode_sealed_identity(identity):
-    """MEI-2646 — the sealed identity feed shared by the v1.12 hashers of both
+    """The sealed identity feed shared by the v1.12 hashers of both
     lanes. Mirror of `feed_sealed_identity` in sqlite.rs: `SealedIdentity`
     definition order; optional strings carry the 1-byte presence tag;
     `delegated_human` is a presence tag followed by `subject` then `issuer`.
@@ -1027,29 +2261,33 @@ def encode_sealed_identity(identity):
 
 
 def asserted_claims_digest(asserted):
-    """MEI-2646 — lowercase hex SHA-256 over the RFC 8785 canonical JSON of the
+    """Lowercase hex SHA-256 over the RFC 8785 canonical JSON of the
     stored `identity.asserted` object. Mirror of `asserted_claims_digest` in
     meilynx-core (serde_jcs over the same object the record stores)."""
     return sha256_jcs(asserted)
 
 
-def check_sealed_identity(event):
-    """MEI-2646 — for a v1.12 record, check that the stored asserted labels
+def check_sealed_identity(event, stripped=frozenset()):
+    """For a v1.12 record, check that the stored asserted labels
     are the labels the record was sealed over: recompute `asserted_digest`
     from `identity.asserted`. The labels are stored-not-hashed, so a rewritten
     label leaves the chain hash intact; this check is what catches it. Returns
-    a list of problems; empty means the identity checks out. MEI-2898 — a
+    a list of problems; empty means the identity checks out. A
     v1.14 MCP record carries the identity forward, optionally: checked when
-    present. Records on any other schema version carry no identity and return
-    no problems."""
+    present; so does a v1.17 record. Records on any other schema version carry no identity and return
+    no problems. When a content-stripped Exchange pack removed the
+    labels (`identity.asserted` in `stripped`), their sealed digest is inside
+    the hash and is not re-derived."""
     version = event.get('schema_version') or 'v1'
     identity = event.get('identity')
-    if version == 'v1.14' and identity is None:
+    if version in ('v1.14', 'v1.17', 'v1.18') and identity is None:
         return []
-    if version not in ('v1.12', 'v1.14'):
+    if version not in ('v1.12', 'v1.14', 'v1.17', 'v1.18'):
         return []
     if not isinstance(identity, dict):
         return [f"{version} record has no identity block"]
+    if 'identity.asserted' in stripped:
+        return []
     problems = []
     asserted = identity.get('asserted')
     if not isinstance(asserted, dict):
@@ -1072,7 +2310,7 @@ def compute_event_hash_v1_12_llm_request(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     join_context, content, identity,
 ):
-    """MEI-2646 — v1.12 llm_request hash: the v1.11 layout with the content
+    """v1.12 llm_request hash: the v1.11 layout with the content
     block presence-tagged (`content` may be None: every LLM record is v1.12
     once the resolver produced an identity, whether or not a capture policy is
     in force), followed by the sealed identity block. Mirror of
@@ -1101,9 +2339,224 @@ def compute_event_hash_v1_12_llm_request(
         h.update(encode_optional_str(content.get('findings_sha256_jcs')))
         h.update(encode_optional_str(content.get('tool_calls_sha256_jcs')))
         h.update(encode_optional_str(content.get('stored_tool_calls_sha256_jcs')))
-    # MEI-2646 — the v1.12 addition.
+    # The v1.12 addition.
     h.update(encode_sealed_identity(identity))
     return h.hexdigest()
+
+
+def compute_event_hash_v1_16_llm_request(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    join_context, content, identity, evaluation_trace,
+):
+    """v1.16 llm_request hash: the v1.12 layout with the
+    identity block presence-tagged (an evaluated request can carry no
+    identity), followed by the evaluation outcome digest. The stored outcomes
+    are bound by that digest (`check_evaluation_trace`); the trace's timing is
+    outside the hash. Mirror of `compute_event_hash_v1_16_llm_request` in
+    sqlite.rs. The v1.12 feeds are duplicated, not shared, so a v1.16 change
+    can never move a v1.12 hash."""
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_LLM_REQUEST.encode('utf-8'))
+    join = join_context or {}
+    h.update(encode_optional_str(join.get('correlation_id')))
+    h.update(encode_optional_str(join.get('session_id')))
+    h.update(encode_optional_str(join.get('agent_name')))
+    if content is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(content['capture_policy'].encode('utf-8'))
+        h.update(encode_optional_str(content.get('prompt_sha256_jcs')))
+        h.update(encode_optional_str(content.get('response_sha256')))
+        h.update(encode_optional_str(content.get('stored_prompt_sha256_jcs')))
+        h.update(encode_optional_str(content.get('stored_response_sha256')))
+        h.update(encode_optional_str(content.get('findings_sha256_jcs')))
+        h.update(encode_optional_str(content.get('tool_calls_sha256_jcs')))
+        h.update(encode_optional_str(content.get('stored_tool_calls_sha256_jcs')))
+    if identity is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(encode_sealed_identity(identity))
+    # The v1.16 addition.
+    h.update(evaluation_trace['outcomes_sha256_jcs'].encode('utf-8'))
+    return h.hexdigest()
+
+
+# The customer block vocabulary. Mirror
+# of `CustomerSource::ALL` in meilynx-core/src/types/customer_scope.rs.
+CUSTOMER_SOURCES = ('credential', 'asserted', 'none')
+
+
+def customer_shape_problem(block):
+    """Why a customer block is not one the resolver produces, or
+    None. Mirror of `SealedCustomer::shape_error` in meilynx-core: `none`
+    carries no digest and no kid; `asserted` carries a digest and no kid;
+    `credential` carries a digest and a non-blank kid; a digest is 64
+    lowercase hex."""
+    if not isinstance(block, dict):
+        return 'customer is not an object'
+    source = block.get('source')
+    if source not in CUSTOMER_SOURCES:
+        return f'customer.source {source!r} is not one of {CUSTOMER_SOURCES}'
+    digest = block.get('label_sha256')
+    kid = block.get('credential_kid')
+    if digest is not None and not (
+        isinstance(digest, str) and len(digest) == 64 and all(c in '0123456789abcdef' for c in digest)
+    ):
+        return 'label_sha256 is not 64 lowercase hex'
+    if source == 'none':
+        if digest is not None:
+            return 'source `none` carries a label digest'
+        if kid is not None:
+            return 'source `none` carries a credential kid'
+    elif source == 'asserted':
+        if kid is not None:
+            return 'source `asserted` carries a credential kid'
+        if digest is None:
+            return 'source `asserted` has no label digest'
+    else:
+        if digest is None:
+            return 'source `credential` has no label digest'
+        if kid is None:
+            return 'source `credential` has no credential kid'
+        if not isinstance(kid, str) or not kid.strip():
+            return 'credential kid is empty'
+    return None
+
+
+def customer_label_sha256(label):
+    """Lowercase hex SHA-256 over the UTF-8 bytes of a customer label."""
+    return hashlib.sha256(label.encode('utf-8')).hexdigest()
+
+
+def encode_sealed_customer(customer):
+    """The customer block feed shared by the v1.18 hashers of both
+    lanes. Mirror of `feed_sealed_customer` in sqlite.rs: a 1-byte presence
+    tag (always 1 in a v1.18 preimage), `label_sha256` (presence-tagged),
+    `source` (wire spelling), `credential_kid` (presence-tagged)."""
+    out = b'\x01'
+    out += encode_optional_str(customer.get('label_sha256'))
+    out += customer['source'].encode('utf-8')
+    out += encode_optional_str(customer.get('credential_kid'))
+    return out
+
+
+def check_customer_scope(event):
+    """For a v1.18 record, check the customer block is one the
+    resolver produces and, when the record stores the plain label beside it
+    (`customer_id`, stored-not-hashed), that the sealed digest is that
+    label's. A rewritten label leaves the chain hash intact; this check is
+    what catches it. A pack produced for one customer carries other
+    customers' records as hash-only stubs with no label, so a missing
+    `customer_id` is not a problem. Returns a list of problems."""
+    version = event.get('schema_version') or 'v1'
+    customer = event.get('customer')
+    if version != 'v1.18':
+        if customer is not None:
+            return [f'{version} record carries a customer block; it is hashed only in the v1.18 bucket']
+        return []
+    if customer is None:
+        return ['v1.18 record has no customer block']
+    problem = customer_shape_problem(customer)
+    if problem is not None:
+        return [f'malformed customer block: {problem}']
+    label = event.get('customer_id')
+    if customer['source'] == 'asserted' and isinstance(label, str) and label:
+        expected = customer_label_sha256(label)
+        if customer.get('label_sha256') != expected:
+            return [
+                f"customer.label_sha256 {customer.get('label_sha256')!r} does not match the stored "
+                f"asserted label (recomputed {expected!r}) — the label was rewritten after sealing"
+            ]
+    return []
+
+
+def compute_event_hash_v1_18_llm_request(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    join_context, content, identity, evaluation_trace, customer,
+):
+    """v1.18 llm_request hash: the v1.16
+    layout with the evaluation trace presence-tagged (a request refused
+    before evaluation carries none), then the customer block. Mirror of
+    `compute_event_hash_v1_18_llm_request` in sqlite.rs. The v1.16 feeds are
+    duplicated, not shared, so a v1.18 change can never move a v1.16 hash."""
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_LLM_REQUEST.encode('utf-8'))
+    join = join_context or {}
+    h.update(encode_optional_str(join.get('correlation_id')))
+    h.update(encode_optional_str(join.get('session_id')))
+    h.update(encode_optional_str(join.get('agent_name')))
+    if content is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(content['capture_policy'].encode('utf-8'))
+        h.update(encode_optional_str(content.get('prompt_sha256_jcs')))
+        h.update(encode_optional_str(content.get('response_sha256')))
+        h.update(encode_optional_str(content.get('stored_prompt_sha256_jcs')))
+        h.update(encode_optional_str(content.get('stored_response_sha256')))
+        h.update(encode_optional_str(content.get('findings_sha256_jcs')))
+        h.update(encode_optional_str(content.get('tool_calls_sha256_jcs')))
+        h.update(encode_optional_str(content.get('stored_tool_calls_sha256_jcs')))
+    if identity is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(encode_sealed_identity(identity))
+    # The trace is presence-tagged in v1.18 (v1.16 required it).
+    if evaluation_trace is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(evaluation_trace['outcomes_sha256_jcs'].encode('utf-8'))
+    # The v1.18 addition.
+    h.update(encode_sealed_customer(customer))
+    return h.hexdigest()
+
+
+def check_evaluation_trace(event):
+    """A v1.16 record's hash covers the digest of its
+    evaluation outcomes, not the outcomes themselves. Recompute the digest from
+    the stored outcomes so an edit after sealing is caught; refuse a trace on
+    any other version (it would ride the record unhashed). The timing half is
+    not checked: it is outside the hash by design. Mirror of
+    `check_evaluation_trace` in meilynx-audit/src/evaluation_trace.rs."""
+    version = event.get('schema_version') or 'v1'
+    trace = event.get('evaluation_trace')
+    if version not in ('v1.16', 'v1.18'):
+        if trace is not None:
+            return [f'{version} record carries an evaluation_trace; it is hashed only in the v1.16 and v1.18 buckets']
+        return []
+    if trace is None:
+        # v1.18 presence-tags the trace: a refusal sealed before
+        # evaluation carries none and is whole.
+        return [] if version == 'v1.18' else ['v1.16 record has no evaluation_trace']
+    sealed = trace.get('outcomes_sha256_jcs')
+    if not isinstance(sealed, str):
+        return ['evaluation_trace has no outcomes_sha256_jcs']
+    outcomes = trace.get('outcomes')
+    if not isinstance(outcomes, dict):
+        return ['evaluation_trace has no outcomes']
+    if sha256_jcs(outcomes) != sealed:
+        return ['evaluation outcomes do not match outcomes_sha256_jcs (the outcomes were changed after sealing)']
+    return []
 
 
 def compute_event_hash_v1_12_mcp(
@@ -1114,7 +2567,7 @@ def compute_event_hash_v1_12_mcp(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     mcp_event, join_context, identity,
 ):
-    """MEI-2646 — v1.12 mcp.* hash: the v1.9 layout with the join keys
+    """v1.12 mcp.* hash: the v1.9 layout with the join keys
     presence-tagged whether or not the caller asserted any (`join_context`
     may be None), then the sealed identity block. Mirror of
     `compute_event_hash_v1_12_mcp` in sqlite.rs. One number for both lanes:
@@ -1122,7 +2575,7 @@ def compute_event_hash_v1_12_mcp(
     The v1.4-v1.9 feeds are DUPLICATED here, not shared."""
     if event_kind not in MCP_EVENT_KINDS:
         raise ValueError(
-            f"MEI-2646: compute_event_hash_v1_12_mcp called with non-MCP kind {event_kind!r}"
+            f"compute_event_hash_v1_12_mcp called with non-MCP kind {event_kind!r}"
         )
     h = _v1_2_prefix_hash(
         sequence_number, timestamp_utc, event_id, request_id,
@@ -1153,7 +2606,7 @@ def compute_event_hash_v1_12_mcp(
     h.update(encode_optional_str(join.get('correlation_id')))
     h.update(encode_optional_str(join.get('session_id')))
     h.update(encode_optional_str(join.get('agent_name')))
-    # MEI-2646 — the v1.12 addition.
+    # The v1.12 addition.
     h.update(encode_sealed_identity(identity))
     return h.hexdigest()
 
@@ -1169,7 +2622,7 @@ def compute_event_hash_v1_14_mcp(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     mcp_event, join_context, identity,
 ):
-    """MEI-2898 — v1.14 mcp.* hash: the v1.12 layout with the identity block
+    """v1.14 mcp.* hash: the v1.12 layout with the identity block
     presence-tagged (1-byte tag, then the block; 0 alone when absent), then
     the decision stage's wire name with the same presence tag every optional
     string uses. Mirror of `compute_event_hash_v1_14_mcp` in sqlite.rs.
@@ -1177,7 +2630,7 @@ def compute_event_hash_v1_14_mcp(
     v1.14. The v1.12 feeds are DUPLICATED here, not shared."""
     if event_kind not in MCP_EVENT_KINDS:
         raise ValueError(
-            f"MEI-2898: compute_event_hash_v1_14_mcp called with non-MCP kind {event_kind!r}"
+            f"compute_event_hash_v1_14_mcp called with non-MCP kind {event_kind!r}"
         )
     h = _v1_2_prefix_hash(
         sequence_number, timestamp_utc, event_id, request_id,
@@ -1213,8 +2666,216 @@ def compute_event_hash_v1_14_mcp(
     else:
         h.update(b'\x01')
         h.update(encode_sealed_identity(identity))
-    # MEI-2898 — the v1.14 addition.
+    # The v1.14 addition.
     h.update(encode_optional_str(mcp_event.get('stage')))
+    return h.hexdigest()
+
+
+# The data_reach block vocabulary.
+DATA_REACH_UNBOUND = 'unbound'
+DATA_REACH_ACCESS = ('read', 'write')
+DATA_REACH_OUTCOMES = ('matched', 'no_match', 'error')
+DATA_REACH_MAX_ARG_KEYS = 32
+DATA_REACH_MAX_ARG_KEY_CHARS = 64
+_DATA_REACH_BINDING_ID = re.compile(r'rb_[0-9a-f]{16}')
+
+
+def data_reach_shape_problem(block):
+    """Mirror of `McpDataReach::shape_error`: the shape every sealed
+    block has. A binding id the control plane minted exactly when a binding
+    matched (`unbound` otherwise), an access exactly then, a known outcome, and
+    argument names within the caps, non-empty, strictly ascending in UTF-8 byte
+    order. Returns a problem string, or None."""
+    if not isinstance(block, dict):
+        return 'data_reach is not an object'
+    outcome = block.get('outcome')
+    if outcome not in DATA_REACH_OUTCOMES:
+        return f'outcome {outcome!r} is not one of {DATA_REACH_OUTCOMES}'
+    matched = outcome == 'matched'
+    binding_id = block.get('binding_id')
+    minted = isinstance(binding_id, str) and _DATA_REACH_BINDING_ID.fullmatch(binding_id) is not None
+    if matched != minted or (not matched and binding_id != DATA_REACH_UNBOUND):
+        return f'binding_id {binding_id!r} does not fit outcome {outcome!r}'
+    access = block.get('access')
+    if matched != (access is not None) or (access is not None and access not in DATA_REACH_ACCESS):
+        return f'access {access!r} is set exactly when a binding matched (outcome {outcome!r})'
+    if not isinstance(block.get('schema_known'), bool):
+        return 'schema_known is not a boolean'
+    keys = block.get('arg_keys')
+    if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
+        return 'arg_keys is not a list of names'
+    if len(keys) > DATA_REACH_MAX_ARG_KEYS:
+        return f'{len(keys)} key names sealed; at most {DATA_REACH_MAX_ARG_KEYS}'
+    if any(k == '' or len(k) > DATA_REACH_MAX_ARG_KEY_CHARS for k in keys):
+        return f'a key name is empty or longer than {DATA_REACH_MAX_ARG_KEY_CHARS} characters'
+    encoded = [k.encode('utf-8') for k in keys]
+    if any(a >= b for a, b in zip(encoded, encoded[1:])):
+        return 'key names are not strictly ascending in byte order'
+    omitted = block.get('arg_keys_omitted')
+    if isinstance(omitted, bool) or not isinstance(omitted, int) or not 0 <= omitted <= 0xFFFFFFFF:
+        return 'arg_keys_omitted is not a u32'
+    return None
+
+
+def compute_event_hash_v1_18_mcp(
+    event_kind,
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    mcp_event, join_context, identity, customer,
+):
+    """v1.18 mcp.* hash for every MCP kind
+    and stage: the v1.14 layout (identity presence-tagged, the stage
+    optional), then the data_reach block presence-tagged (its members fed
+    byte for byte as v1.17 feeds them, and allowed only on a tool_call-stage
+    mcp.policy_decision), then the customer block. Mirror of
+    `compute_event_hash_v1_18_mcp` in sqlite.rs and
+    `McpEvidenceChainHasher.ComputeV118` in the control plane. The v1.14
+    feeds are duplicated, not shared."""
+    if event_kind not in MCP_EVENT_KINDS:
+        raise ValueError(f"compute_event_hash_v1_18_mcp is defined only for mcp.* kinds; got {event_kind!r}")
+    reach = mcp_event.get('data_reach')
+    if reach is not None:
+        if event_kind != EVENT_KIND_MCP_POLICY_DECISION or mcp_event.get('stage') != 'tool_call':
+            raise ValueError(
+                f"a data_reach block is sealed only on a tool_call-stage mcp.policy_decision; "
+                f"got {event_kind!r} at stage {mcp_event.get('stage')!r}"
+            )
+        problem = data_reach_shape_problem(reach)
+        if problem is not None:
+            raise ValueError(f"refusing to seal a malformed data_reach block: {problem}")
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(event_kind.encode('utf-8'))
+    h.update(mcp_event['virtual_server'].encode('utf-8'))
+    h.update(mcp_event['upstream_slug'].encode('utf-8'))
+    h.update(mcp_event['method'].encode('utf-8'))
+    h.update(encode_optional_str(mcp_event.get('tool_name')))
+    h.update(encode_optional_str(mcp_event.get('jsonrpc_id')))
+    h.update(mcp_event['protocol_version'].encode('utf-8'))
+    h.update(encode_optional_str(mcp_event.get('decision')))
+    h.update(encode_optional_str(mcp_event.get('reason')))
+    h.update(encode_optional_str(mcp_event.get('payload_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('mcp_bundle_sha256')))
+    h.update(encode_optional_str(mcp_event.get('correlated_event_id')))
+    h.update(encode_optional_i64(mcp_event.get('error_code')))
+    h.update(mcp_event['traceparent'].encode('utf-8'))
+    h.update(encode_principal_chain(mcp_event['principal_chain']))
+    h.update(encode_optional_str(mcp_event.get('redacted_payload_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('redaction_pre_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('redaction_post_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('hold_id')))
+    join = join_context or {}
+    h.update(encode_optional_str(join.get('correlation_id')))
+    h.update(encode_optional_str(join.get('session_id')))
+    h.update(encode_optional_str(join.get('agent_name')))
+    if identity is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(encode_sealed_identity(identity))
+    h.update(encode_optional_str(mcp_event.get('stage')))
+    # The data-reach block, presence-tagged (v1.17 required it).
+    if reach is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(reach['binding_id'].encode('utf-8'))
+        h.update(encode_optional_str(reach.get('access')))
+        h.update(reach['outcome'].encode('utf-8'))
+        h.update(b'\x01' if reach['schema_known'] else b'\x00')
+        keys = reach['arg_keys']
+        h.update(struct.pack('<I', len(keys)))
+        for key in keys:
+            raw = key.encode('utf-8')
+            h.update(struct.pack('<I', len(raw)))
+            h.update(raw)
+        h.update(struct.pack('<I', int(reach['arg_keys_omitted'])))
+    # The v1.18 addition.
+    h.update(encode_sealed_customer(customer))
+    return h.hexdigest()
+
+
+def compute_event_hash_v1_17_mcp(
+    event_kind,
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    mcp_event, join_context, identity,
+):
+    """v1.17 mcp.policy_decision hash: the v1.14 layout byte for
+    byte, then the data_reach block in definition order: binding_id (raw
+    UTF-8), access (presence-tagged), outcome (raw UTF-8), schema_known (one
+    byte), arg_keys (u32 LE count, then each name as a u32 LE byte length and
+    its UTF-8 bytes, so two names never read as one) and arg_keys_omitted
+    (u32 LE). Mirror of `compute_event_hash_v1_17_mcp` in sqlite.rs and
+    `McpEvidenceChainHasher.ComputeV117` (control plane). Defined only for a
+    tool_call-stage mcp.policy_decision carrying a block. The v1.14 feeds are
+    DUPLICATED here, not shared."""
+    if event_kind != EVENT_KIND_MCP_POLICY_DECISION or mcp_event.get('stage') != 'tool_call':
+        raise ValueError(
+            f"compute_event_hash_v1_17_mcp is defined only for a tool_call-stage "
+            f"mcp.policy_decision; got {event_kind!r} at stage {mcp_event.get('stage')!r}"
+        )
+    reach = mcp_event.get('data_reach')
+    if reach is None:
+        raise ValueError(
+            "compute_event_hash_v1_17_mcp requires a data_reach block; a record "
+            "sealed without one must stay in its pre-v1.17 bucket."
+        )
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(event_kind.encode('utf-8'))
+    h.update(mcp_event['virtual_server'].encode('utf-8'))
+    h.update(mcp_event['upstream_slug'].encode('utf-8'))
+    h.update(mcp_event['method'].encode('utf-8'))
+    h.update(encode_optional_str(mcp_event.get('tool_name')))
+    h.update(encode_optional_str(mcp_event.get('jsonrpc_id')))
+    h.update(mcp_event['protocol_version'].encode('utf-8'))
+    h.update(encode_optional_str(mcp_event.get('decision')))
+    h.update(encode_optional_str(mcp_event.get('reason')))
+    h.update(encode_optional_str(mcp_event.get('payload_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('mcp_bundle_sha256')))
+    h.update(encode_optional_str(mcp_event.get('correlated_event_id')))
+    h.update(encode_optional_i64(mcp_event.get('error_code')))
+    h.update(mcp_event['traceparent'].encode('utf-8'))
+    h.update(encode_principal_chain(mcp_event['principal_chain']))
+    h.update(encode_optional_str(mcp_event.get('redacted_payload_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('redaction_pre_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('redaction_post_sha256_jcs')))
+    h.update(encode_optional_str(mcp_event.get('hold_id')))
+    join = join_context or {}
+    h.update(encode_optional_str(join.get('correlation_id')))
+    h.update(encode_optional_str(join.get('session_id')))
+    h.update(encode_optional_str(join.get('agent_name')))
+    if identity is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(encode_sealed_identity(identity))
+    h.update(encode_optional_str(mcp_event.get('stage')))
+    # The v1.17 addition.
+    h.update(reach['binding_id'].encode('utf-8'))
+    h.update(encode_optional_str(reach.get('access')))
+    h.update(reach['outcome'].encode('utf-8'))
+    h.update(b'\x01' if reach['schema_known'] else b'\x00')
+    keys = reach['arg_keys']
+    h.update(struct.pack('<I', len(keys)))
+    for key in keys:
+        raw = key.encode('utf-8')
+        h.update(struct.pack('<I', len(raw)))
+        h.update(raw)
+    h.update(struct.pack('<I', reach['arg_keys_omitted']))
     return h.hexdigest()
 
 
@@ -1225,6 +2886,20 @@ def _on_behalf_of_is_verified(mcp_event):
     return chain.get('on_behalf_of') is not None and chain.get('on_behalf_of_attestation') == 'verified'
 
 
+# Every bucket whose preimage reads the content
+# attestation (`content.*`): the v1.10 and v1.11 llm_request hashers, and the
+# v1.12, v1.16 and v1.18 ones that carry it forward. Mirror of the Rust guard
+# in meilynx-audit/src/sqlite.rs (`llm_schema_version_with_content`); a new
+# llm_request bucket that hashes `content.*` is added here and there together,
+# and self-test assertion 31e pins the v1.18 member. `check_llm_content` reads
+# the same tuple, so a bucket that seals the digests is also one whose stored
+# content is re-derived from them (assertions 35a-35c).
+CONTENT_ATTESTATION_VERSIONS = ('v1.10', 'v1.11', 'v1.12', 'v1.16', 'v1.18')
+# The members whose preimage presence-tags the content block: a record sealed
+# with no capture policy carries none and stores its content unhashed.
+CONTENT_PRESENCE_TAGGED_VERSIONS = ('v1.12', 'v1.16', 'v1.18')
+
+
 def compute_event_hash_dispatch(
     schema_version,
     sequence_number, timestamp_utc, event_id, request_id,
@@ -1233,73 +2908,154 @@ def compute_event_hash_dispatch(
     cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
     event_kind=EVENT_KIND_LLM_REQUEST, auth_session=None, admin_action=None,
     mcp_event=None, coverage=None, join_context=None, content=None,
-    identity=None, coverage_key_inventory=None,
+    identity=None, coverage_key_inventory=None, decision_receipt=None,
+    evaluation_trace=None, customer=None,
 ):
-    """MEI-639 — Python mirror of compute_event_hash_dispatch in sqlite.rs.
+    """Python mirror of compute_event_hash_dispatch in sqlite.rs.
 
     Backwards compatibility contract:
       - "v1" / "v1.1" → legacy compute_event_hash (15-field, frozen).
       - "v1.2" → compute_event_hash_v1_2_* based on event_kind.
       - Unknown → raise ValueError (forward-compat guard, matches Rust).
     """
-    # MEI-2641 — ADR-0013 A: fail closed. The key-inventory payload is hashed
+    # Fail closed. The customer block enters only the
+    # v1.18 preimage (both lanes); anywhere else it would ride the record
+    # unhashed, and a v1.18 tag without it has no defined preimage. A block the
+    # resolver never produces is refused at the same point.
+    if customer is not None:
+        if schema_version != 'v1.18' or not (
+            event_kind == EVENT_KIND_LLM_REQUEST or event_kind in MCP_EVENT_KINDS
+        ):
+            raise ValueError(
+                f"customer block present on a {schema_version!r} {event_kind!r} "
+                f"event — it is hashed only in the v1.18 bucket on the LLM and MCP lanes."
+            )
+        problem = customer_shape_problem(customer)
+        if problem is not None:
+            raise ValueError(f"refusing a malformed customer block: {problem}")
+    # Fail closed. The evaluation outcome digest is
+    # hashed only by the v1.16 llm_request hasher (and the v1.18 bucket that
+    # carries it forward, presence-tagged); anywhere else the trace would sit
+    # on the record unhashed.
+    if evaluation_trace is not None and (
+        schema_version not in ('v1.16', 'v1.18') or event_kind != EVENT_KIND_LLM_REQUEST
+    ):
+        raise ValueError(
+            f"evaluation_trace present on a {schema_version!r} "
+            f"{event_kind!r} event — it is hashed only in the v1.16 and v1.18 llm_request buckets."
+        )
+    # The hashers read the sealed digest; a trace without one has
+    # no defined preimage and is a failed record, not a crash.
+    if evaluation_trace is not None and not (
+        isinstance(evaluation_trace, dict) and isinstance(evaluation_trace.get('outcomes_sha256_jcs'), str)
+    ):
+        raise ValueError("evaluation_trace has no outcomes_sha256_jcs, so the record has no defined preimage.")
+    # Fail closed. The receipt payload is hashed only by
+    # the v1.15 decision.receipt hasher; anywhere else it would sit on the record
+    # unhashed. A decider on a lapse (or none on a decision) is malformed.
+    if decision_receipt is not None and (
+        schema_version != 'v1.15' or event_kind != EVENT_KIND_DECISION_RECEIPT
+    ):
+        raise ValueError(
+            f"decision_receipt payload present on a {schema_version!r} "
+            f"{event_kind!r} event — it is hashed only in the v1.15 decision.receipt bucket."
+        )
+    if decision_receipt is not None and (
+        (decision_receipt.get('outcome') == 'lapsed') != (decision_receipt.get('decider_user_id') is None)
+    ):
+        raise ValueError(
+            "a decision receipt has a decider exactly when someone decided."
+        )
+    # Fail closed. The key-inventory payload is hashed
     # only by the v1.13 coverage.key_inventory hasher; anywhere else it would
     # sit on the record unhashed.
     if coverage_key_inventory is not None and (
         schema_version != 'v1.13' or event_kind != EVENT_KIND_COVERAGE_KEY_INVENTORY
     ):
         raise ValueError(
-            f"MEI-2641: coverage_key_inventory payload present on a {schema_version!r} "
+            f"coverage_key_inventory payload present on a {schema_version!r} "
             f"{event_kind!r} event — it is hashed only in the v1.13 "
             f"coverage.key_inventory bucket."
         )
-    # MEI-2151 — fail-closed invariant, mirror of the Rust dispatcher: a
+    # Fail-closed invariant, mirror of the Rust dispatcher: a
     # caller-asserted join key may only ride the one bucket whose preimage
     # contains it. An event carrying join_context on an older schema_version
     # would be presenting an UNHASHED join key as evidence — rewritable after
     # the fact without breaking the chain.
-    # MEI-2424 — the same rule for the content attestation: its digests are
-    # hashed only in the v1.10 and v1.11 buckets.
-    if content is not None and schema_version not in ('v1.10', 'v1.11', 'v1.12'):
+    # The same rule for the content attestation: its digests are
+    # hashed only in the v1.10 and v1.11 buckets, carried forward by v1.12,
+    # v1.16 and v1.18 (the mirror of the Rust guard in sqlite.rs).
+    if content is not None and schema_version not in CONTENT_ATTESTATION_VERSIONS:
         raise ValueError(
-            f"MEI-2424: content attestation present on a {schema_version!r} event — "
-            f"content digests are hashed only in the v1.10, v1.11 and v1.12 buckets."
+            f"content attestation present on a {schema_version!r} event — "
+            f"content digests are hashed only in the "
+            f"{', '.join(CONTENT_ATTESTATION_VERSIONS[:-1])} and {CONTENT_ATTESTATION_VERSIONS[-1]} buckets."
         )
-    # MEI-2456 — and the tool-call digests only in v1.11: the v1.10 hash does
+    # The guard above is by version, and v1.18 (like v1.12) is
+    # defined on both lanes; only the llm_request preimage reads `content.*`.
+    # The MCP hashers never do and the writer never seals a content block on
+    # an MCP record, so one there would ride the record unhashed: refuse it.
+    # v1.12 MCP keeps its historical behaviour (admitted, its stored content
+    # checked against the unhashed digests) so packs already issued verify as
+    # they did; a sealing build stamps every MCP record v1.18.
+    if content is not None and schema_version == 'v1.18' and event_kind != EVENT_KIND_LLM_REQUEST:
+        raise ValueError(
+            f"content attestation present on a {schema_version!r} {event_kind!r} event — "
+            f"content digests are hashed only on the llm_request lane, so this content is unattested."
+        )
+    if content is not None and not (isinstance(content, dict) and isinstance(content.get('capture_policy'), str)):
+        raise ValueError("content attestation has no capture_policy, so the record has no defined preimage.")
+    # And the tool-call digests only in v1.11: the v1.10 hash does
     # not read them, so a v1.10 record carrying one would present it unhashed.
-    if _has_tool_call_digests(content) and schema_version not in ('v1.11', 'v1.12'):
+    if _has_tool_call_digests(content) and schema_version not in ('v1.11', 'v1.12', 'v1.16', 'v1.18'):
         raise ValueError(
-            f"MEI-2456: tool-call digests present on a {schema_version!r} event — "
-            f"they are hashed only in the v1.11 and v1.12 buckets."
+            f"tool-call digests present on a {schema_version!r} event — "
+            f"they are hashed only in the v1.11, v1.12, v1.16 and v1.18 buckets."
         )
-    # MEI-2646 — ADR-0013 A: fail closed. The sealed identity enters only the
+    # Fail closed. The sealed identity enters only the
     # v1.12 preimage (both lanes); on any other version it would sit on the
     # record unhashed, rewritable without breaking the chain.
-    if identity is not None and schema_version not in ('v1.12', 'v1.14'):
+    if identity is not None and schema_version not in ('v1.12', 'v1.14', 'v1.16', 'v1.17', 'v1.18'):
         raise ValueError(
-            f"MEI-2646: identity block present on a {schema_version!r} event — "
-            f"it is hashed only in the v1.12 bucket (and the MCP v1.14 bucket that "
-            f"carries it forward)."
+            f"identity block present on a {schema_version!r} event — "
+            f"it is hashed only in the v1.12 bucket (and the MCP v1.14 and v1.17, "
+            f"LLM v1.16 and both-lane v1.18 buckets that carry it forward)."
         )
-    # MEI-2898 — the decision stage enters only the v1.14 preimage.
-    if mcp_event is not None and mcp_event.get('stage') is not None and schema_version != 'v1.14':
+    # The decision stage enters only the v1.14 preimage (and the
+    # v1.17 and v1.18 ones that carry it forward).
+    if mcp_event is not None and mcp_event.get('stage') is not None and schema_version not in ('v1.14', 'v1.17', 'v1.18'):
         raise ValueError(
-            f"MEI-2898: decision stage present on a {schema_version!r} event — "
-            f"it is hashed only in the v1.14 bucket."
+            f"decision stage present on a {schema_version!r} event — "
+            f"it is hashed only in the v1.14, v1.17 and v1.18 buckets."
         )
-    # MEI-2646 — the hashed delegated_human and the stored-not-hashed MEI-2633
+    # Fail closed. The data_reach block enters only the
+    # v1.17 preimage (and v1.18, presence-tagged), and only a tool_call-stage
+    # policy decision carries one; a block the classifier never produces is
+    # refused at the same point.
+    if mcp_event is not None and mcp_event.get('data_reach') is not None:
+        if (schema_version not in ('v1.17', 'v1.18') or event_kind != EVENT_KIND_MCP_POLICY_DECISION
+                or mcp_event.get('stage') != 'tool_call'):
+            raise ValueError(
+                f"data_reach present on a {schema_version!r} {event_kind!r} event at "
+                f"stage {mcp_event.get('stage')!r} — it is sealed only on a tool_call-stage "
+                f"mcp.policy_decision in the v1.17 and v1.18 buckets."
+            )
+        problem = data_reach_shape_problem(mcp_event['data_reach'])
+        if problem is not None:
+            raise ValueError(f"refusing a malformed data_reach block: {problem}")
+    # The hashed delegated_human and the stored-not-hashed
     # attestation marker must agree.
     if identity is not None and mcp_event is not None:
         if (identity.get('delegated_human') is not None) != _on_behalf_of_is_verified(mcp_event):
             raise ValueError(
-                "MEI-2646: identity.delegated_human disagrees with the principal chain's "
+                "identity.delegated_human disagrees with the principal chain's "
                 "on_behalf_of_attestation — the two must agree"
             )
-    if join_context is not None and schema_version not in ('v1.9', 'v1.10', 'v1.11', 'v1.12', 'v1.14'):
+    if join_context is not None and schema_version not in ('v1.9', 'v1.10', 'v1.11', 'v1.12', 'v1.14', 'v1.16', 'v1.17', 'v1.18'):
         raise ValueError(
-            f"MEI-2151: join_context present on a {schema_version!r} event — "
-            f"caller-asserted join keys are hashed only in the v1.9, v1.10, v1.11, v1.12 "
-            f"and v1.14 buckets."
+            f"join_context present on a {schema_version!r} event — "
+            f"caller-asserted join keys are hashed only in the v1.9, v1.10, v1.11, v1.12, "
+            f"v1.14, v1.16, v1.17 and v1.18 buckets."
         )
     if schema_version in ('v1', 'v1.1'):
         return compute_event_hash(
@@ -1319,7 +3075,7 @@ def compute_event_hash_dispatch(
         if event_kind == EVENT_KIND_AUTH_SESSION_STARTED:
             if auth_session is None:
                 raise ValueError(
-                    "MEI-639: AuthSessionStarted event missing auth_session payload"
+                    "AuthSessionStarted event missing auth_session payload"
                 )
             return compute_event_hash_v1_2_auth_session_started(
                 sequence_number, timestamp_utc, event_id, request_id,
@@ -1330,18 +3086,18 @@ def compute_event_hash_dispatch(
             )
         if event_kind == EVENT_KIND_ADMIN_ACTION:
             raise ValueError(
-                "MEI-1048: AdminAction events require schema_version v1.3, got v1.2"
+                "AdminAction events require schema_version v1.3, got v1.2"
             )
-        raise ValueError(f"MEI-639: unknown event_kind {event_kind!r}")
+        raise ValueError(f"unknown event_kind {event_kind!r}")
     if schema_version == 'v1.3':
         if event_kind != EVENT_KIND_ADMIN_ACTION:
             raise ValueError(
-                f"MEI-1048: schema_version v1.3 is defined only for admin.action "
+                f"schema_version v1.3 is defined only for admin.action "
                 f"events; got event_kind {event_kind!r}"
             )
         if admin_action is None:
             raise ValueError(
-                "MEI-1048: AdminAction event missing admin_action payload"
+                "AdminAction event missing admin_action payload"
             )
         return compute_event_hash_v1_3_admin_action(
             sequence_number, timestamp_utc, event_id, request_id,
@@ -1353,12 +3109,12 @@ def compute_event_hash_dispatch(
     if schema_version == 'v1.4':
         if event_kind not in MCP_EVENT_KINDS:
             raise ValueError(
-                f"MEI-925: schema_version v1.4 is defined only for mcp.* "
+                f"schema_version v1.4 is defined only for mcp.* "
                 f"events; got event_kind {event_kind!r}"
             )
         if mcp_event is None:
             raise ValueError(
-                f"MEI-925: {event_kind!r} event missing mcp_event payload"
+                f"{event_kind!r} event missing mcp_event payload"
             )
         return compute_event_hash_v1_4_mcp(
             event_kind,
@@ -1369,16 +3125,16 @@ def compute_event_hash_dispatch(
             mcp_event,
         )
     if schema_version == 'v1.5':
-        # MEI-804 — v1.5 extends the MCP bucket with the principal chain. Same
+        # v1.5 extends the MCP bucket with the principal chain. Same
         # mcp-only gate + payload-required posture as v1.4.
         if event_kind not in MCP_EVENT_KINDS:
             raise ValueError(
-                f"MEI-804: schema_version v1.5 is defined only for mcp.* "
+                f"schema_version v1.5 is defined only for mcp.* "
                 f"events; got event_kind {event_kind!r}"
             )
         if mcp_event is None:
             raise ValueError(
-                f"MEI-804: {event_kind!r} event missing mcp_event payload"
+                f"{event_kind!r} event missing mcp_event payload"
             )
         return compute_event_hash_v1_5_mcp(
             event_kind,
@@ -1389,17 +3145,17 @@ def compute_event_hash_dispatch(
             mcp_event,
         )
     if schema_version == 'v1.6':
-        # MEI-1189 — v1.6 extends the MCP bucket with the redacted-payload
+        # v1.6 extends the MCP bucket with the redacted-payload
         # content address (redacted capture, two-hash binding). Same mcp-only
         # gate + payload-required posture as v1.4/v1.5.
         if event_kind not in MCP_EVENT_KINDS:
             raise ValueError(
-                f"MEI-1189: schema_version v1.6 is defined only for mcp.* "
+                f"schema_version v1.6 is defined only for mcp.* "
                 f"events; got event_kind {event_kind!r}"
             )
         if mcp_event is None:
             raise ValueError(
-                f"MEI-1189: {event_kind!r} event missing mcp_event payload"
+                f"{event_kind!r} event missing mcp_event payload"
             )
         return compute_event_hash_v1_6_mcp(
             event_kind,
@@ -1410,17 +3166,17 @@ def compute_event_hash_dispatch(
             mcp_event,
         )
     if schema_version == 'v1.7':
-        # MEI-1063 — v1.7 extends the MCP bucket with the enforcement-axis
+        # v1.7 extends the MCP bucket with the enforcement-axis
         # redaction pre/post hashes (redact enforcement). Same mcp-only gate +
         # payload-required posture as v1.4/v1.5/v1.6.
         if event_kind not in MCP_EVENT_KINDS:
             raise ValueError(
-                f"MEI-1063: schema_version v1.7 is defined only for mcp.* "
+                f"schema_version v1.7 is defined only for mcp.* "
                 f"events; got event_kind {event_kind!r}"
             )
         if mcp_event is None:
             raise ValueError(
-                f"MEI-1063: {event_kind!r} event missing mcp_event payload"
+                f"{event_kind!r} event missing mcp_event payload"
             )
         return compute_event_hash_v1_7_mcp(
             event_kind,
@@ -1431,16 +3187,16 @@ def compute_event_hash_dispatch(
             mcp_event,
         )
     if schema_version == 'v1.8':
-        # MEI-1955 — v1.8 introduces exactly one new event class:
+        # v1.8 introduces exactly one new event class:
         # coverage.computed. Same kind-only gate posture as v1.3.
         if event_kind != EVENT_KIND_COVERAGE_COMPUTED:
             raise ValueError(
-                f"MEI-1955: schema_version v1.8 is defined only for "
+                f"schema_version v1.8 is defined only for "
                 f"coverage.computed events; got event_kind {event_kind!r}"
             )
         if coverage is None:
             raise ValueError(
-                "MEI-1955: CoverageComputed event missing coverage payload"
+                "CoverageComputed event missing coverage payload"
             )
         return compute_event_hash_v1_8_coverage(
             sequence_number, timestamp_utc, event_id, request_id,
@@ -1450,16 +3206,16 @@ def compute_event_hash_dispatch(
             coverage,
         )
     if schema_version == 'v1.13':
-        # MEI-2641 — v1.13 introduces exactly one new event class:
+        # v1.13 introduces exactly one new event class:
         # coverage.key_inventory. Same kind-only gate posture as v1.8.
         if event_kind != EVENT_KIND_COVERAGE_KEY_INVENTORY:
             raise ValueError(
-                f"MEI-2641: schema_version v1.13 is defined only for "
+                f"schema_version v1.13 is defined only for "
                 f"coverage.key_inventory events; got event_kind {event_kind!r}"
             )
         if coverage_key_inventory is None:
             raise ValueError(
-                "MEI-2641: CoverageKeyInventory event missing coverage_key_inventory payload"
+                "CoverageKeyInventory event missing coverage_key_inventory payload"
             )
         return compute_event_hash_v1_13_coverage_key_inventory(
             sequence_number, timestamp_utc, event_id, request_id,
@@ -1468,15 +3224,32 @@ def compute_event_hash_dispatch(
             cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
             coverage_key_inventory,
         )
+    if schema_version == 'v1.15':
+        # v1.15 introduces exactly one new event class:
+        # decision.receipt. Same kind-only gate posture as v1.8 and v1.13.
+        if event_kind != EVENT_KIND_DECISION_RECEIPT:
+            raise ValueError(
+                f"schema_version v1.15 is defined only for "
+                f"decision.receipt events; got event_kind {event_kind!r}"
+            )
+        if decision_receipt is None:
+            raise ValueError("DecisionReceipt event missing decision_receipt payload")
+        return compute_event_hash_v1_15_decision_receipt(
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            decision_receipt,
+        )
     if schema_version == 'v1.9':
-        # MEI-2151 — v1.9 is the first bucket that is NOT keyed to a new event
+        # v1.9 is the first bucket that is NOT keyed to a new event
         # class: it is the existing llm_request / mcp.* preimages plus the
         # caller-asserted cross-lane join keys, selected by presence of
         # join_context. Uncorrelated traffic on both lanes stays in its
         # existing bucket and is byte-stable.
         if join_context is None:
             raise ValueError(
-                "MEI-2151: schema_version v1.9 requires a join_context payload; "
+                "schema_version v1.9 requires a join_context payload; "
                 "an event with no caller-asserted join key must stay in its "
                 "pre-v1.9 bucket."
             )
@@ -1491,7 +3264,7 @@ def compute_event_hash_dispatch(
         if event_kind in MCP_EVENT_KINDS:
             if mcp_event is None:
                 raise ValueError(
-                    f"MEI-2151: {event_kind!r} event missing mcp_event payload"
+                    f"{event_kind!r} event missing mcp_event payload"
                 )
             return compute_event_hash_v1_9_mcp(
                 event_kind,
@@ -1502,21 +3275,21 @@ def compute_event_hash_dispatch(
                 mcp_event, join_context,
             )
         raise ValueError(
-            f"MEI-2151: schema_version v1.9 is defined only for llm_request "
+            f"schema_version v1.9 is defined only for llm_request "
             f"and mcp.* events; got event_kind {event_kind!r}"
         )
     if schema_version == 'v1.10':
-        # MEI-2424 — llm_request sealed under a declared capture policy. The
+        # llm_request sealed under a declared capture policy. The
         # join keys are optional here (presence-tagged either way).
         if content is None:
             raise ValueError(
-                "MEI-2424: schema_version v1.10 requires a content payload; an "
+                "schema_version v1.10 requires a content payload; an "
                 "LLM event sealed with no capture policy must stay in its "
                 "pre-v1.10 bucket."
             )
         if event_kind != EVENT_KIND_LLM_REQUEST:
             raise ValueError(
-                f"MEI-2424: schema_version v1.10 is defined only for llm_request "
+                f"schema_version v1.10 is defined only for llm_request "
                 f"events; got event_kind {event_kind!r}"
             )
         return compute_event_hash_v1_10_llm_request(
@@ -1527,18 +3300,18 @@ def compute_event_hash_dispatch(
             join_context, content,
         )
     if schema_version == 'v1.11':
-        # MEI-2456 — v1.10 plus the tool-call digests. The writer stamps v1.11
+        # v1.10 plus the tool-call digests. The writer stamps v1.11
         # exactly when the captured tool-call digest is present, so a v1.11
         # record without it has no defined preimage.
         if content is None or content.get('tool_calls_sha256_jcs') is None:
             raise ValueError(
-                "MEI-2456: schema_version v1.11 requires a content payload carrying "
+                "schema_version v1.11 requires a content payload carrying "
                 "tool_calls_sha256_jcs; a record whose response made no tool call "
                 "stays in its v1.10 bucket."
             )
         if event_kind != EVENT_KIND_LLM_REQUEST:
             raise ValueError(
-                f"MEI-2456: schema_version v1.11 is defined only for llm_request "
+                f"schema_version v1.11 is defined only for llm_request "
                 f"events; got event_kind {event_kind!r}"
             )
         return compute_event_hash_v1_11_llm_request(
@@ -1548,14 +3321,35 @@ def compute_event_hash_dispatch(
             cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
             join_context, content,
         )
+    if schema_version == 'v1.16':
+        # The LLM-lane evaluation bucket: the v1.12 llm_request
+        # preimage with identity presence-tagged, then the evaluation outcome
+        # digest. Stamped exactly when the record carries a trace.
+        if event_kind != EVENT_KIND_LLM_REQUEST:
+            raise ValueError(
+                f"schema_version v1.16 is defined only for llm_request "
+                f"events; got event_kind {event_kind!r}"
+            )
+        if evaluation_trace is None:
+            raise ValueError(
+                "schema_version v1.16 requires an evaluation_trace; a "
+                "record sealed without one must stay in its pre-v1.16 bucket."
+            )
+        return compute_event_hash_v1_16_llm_request(
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            join_context, content, identity, evaluation_trace,
+        )
     if schema_version == 'v1.12':
-        # MEI-2646 — the identity bucket on BOTH lanes: the llm_request
+        # The identity bucket on BOTH lanes: the llm_request
         # preimage (v1.11 layout, content presence-tagged) or the mcp.*
         # preimage (v1.9 layout, join presence-tagged), then the sealed
         # identity block. Stamped exactly when the record carries an identity.
         if identity is None:
             raise ValueError(
-                "MEI-2646: schema_version v1.12 requires an identity block; a "
+                "schema_version v1.12 requires an identity block; a "
                 "record sealed without one must stay in its pre-v1.12 bucket."
             )
         if event_kind == EVENT_KIND_LLM_REQUEST:
@@ -1568,7 +3362,7 @@ def compute_event_hash_dispatch(
             )
         if event_kind in MCP_EVENT_KINDS:
             if mcp_event is None:
-                raise ValueError(f"MEI-2646: {event_kind!r} event missing mcp_event payload")
+                raise ValueError(f"{event_kind!r} event missing mcp_event payload")
             return compute_event_hash_v1_12_mcp(
                 event_kind,
                 sequence_number, timestamp_utc, event_id, request_id,
@@ -1578,24 +3372,24 @@ def compute_event_hash_dispatch(
                 mcp_event, join_context, identity,
             )
         raise ValueError(
-            f"MEI-2646: schema_version v1.12 is defined only for llm_request "
+            f"schema_version v1.12 is defined only for llm_request "
             f"and mcp.* events; got event_kind {event_kind!r}"
         )
     if schema_version == 'v1.14':
-        # MEI-2898 — the MCP decision-stage bucket: the v1.12 mcp.* preimage
+        # The MCP decision-stage bucket: the v1.12 mcp.* preimage
         # with the identity block presence-tagged, then the stage. Stamped
         # exactly when the record carries a stage, which only
         # mcp.policy_decision records do.
         if event_kind not in MCP_EVENT_KINDS:
             raise ValueError(
-                f"MEI-2898: schema_version v1.14 is defined only for mcp.* events; "
+                f"schema_version v1.14 is defined only for mcp.* events; "
                 f"got event_kind {event_kind!r}"
             )
         if mcp_event is None:
-            raise ValueError(f"MEI-2898: {event_kind!r} event missing mcp_event payload")
+            raise ValueError(f"{event_kind!r} event missing mcp_event payload")
         if mcp_event.get('stage') is None:
             raise ValueError(
-                "MEI-2898: schema_version v1.14 requires a decision stage; a record "
+                "schema_version v1.14 requires a decision stage; a record "
                 "sealed without one must stay in its pre-v1.14 bucket."
             )
         return compute_event_hash_v1_14_mcp(
@@ -1606,8 +3400,60 @@ def compute_event_hash_dispatch(
             cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
             mcp_event, join_context, identity,
         )
+    if schema_version == 'v1.17':
+        # The MCP data-reach bucket: the v1.14 preimage, then the
+        # data_reach block. Defined only for a tool_call-stage
+        # mcp.policy_decision carrying one.
+        if event_kind != EVENT_KIND_MCP_POLICY_DECISION:
+            raise ValueError(
+                f"schema_version v1.17 is defined only for mcp.policy_decision "
+                f"events; got event_kind {event_kind!r}"
+            )
+        if mcp_event is None:
+            raise ValueError("mcp.policy_decision event missing mcp_event payload")
+        return compute_event_hash_v1_17_mcp(
+            event_kind,
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            mcp_event, join_context, identity,
+        )
+    if schema_version == 'v1.18':
+        # The customer-scope bucket on both lanes: the v1.16
+        # llm_request preimage (trace presence-tagged) or the v1.14 mcp.*
+        # preimage (data_reach presence-tagged), then the customer block.
+        # Stamped exactly when the record carries a block.
+        if customer is None:
+            raise ValueError(
+                "schema_version v1.18 requires a customer block; a record "
+                "sealed without one must stay in its pre-v1.18 bucket."
+            )
+        if event_kind == EVENT_KIND_LLM_REQUEST:
+            return compute_event_hash_v1_18_llm_request(
+                sequence_number, timestamp_utc, event_id, request_id,
+                model_requested, action, input_tokens, output_tokens,
+                total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+                cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+                join_context, content, identity, evaluation_trace, customer,
+            )
+        if event_kind in MCP_EVENT_KINDS:
+            if mcp_event is None:
+                raise ValueError(f"{event_kind!r} event missing mcp_event payload")
+            return compute_event_hash_v1_18_mcp(
+                event_kind,
+                sequence_number, timestamp_utc, event_id, request_id,
+                model_requested, action, input_tokens, output_tokens,
+                total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+                cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+                mcp_event, join_context, identity, customer,
+            )
+        raise ValueError(
+            f"schema_version v1.18 is defined only for llm_request and mcp.* "
+            f"events; got event_kind {event_kind!r}"
+        )
     raise ValueError(
-        f"MEI-639: unknown schema_version {schema_version!r} — "
+        f"unknown schema_version {schema_version!r} — "
         f"this verifier has no hash branch for it. Update verify-pack.py."
     )
 
@@ -1638,7 +3484,7 @@ _FIXTURE = dict(
     reasoning_tokens=None,
     estimated_cost_usd=0.0042,
     # Deliberately synthetic previous_hash — NOT the real genesis (c2989403cf897dac...).
-    # Uses the "dead beef" convention to be unambiguously non-production state. (MEI-493)
+    # Uses the "dead beef" convention to be unambiguously non-production state.
     previous_hash="deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
 )
 
@@ -1646,7 +3492,7 @@ _FIXTURE = dict(
 def run_self_test():
     """
     Two assertions covering Safeguard 1 (encoding correctness) and
-    the Z-suffix normalization path (MEI-492):
+    the Z-suffix normalization path:
 
     Assertion 1 — +00:00 fixture:
       Known input with +00:00 timestamp produces the pinned FIXTURE_HASH.
@@ -1692,7 +3538,7 @@ def run_self_test():
         print("SELF-TEST assertion 2b FAIL: Z and +00:00 produced the same hash — normalization is a no-op, which is wrong", file=sys.stderr)
         ok = False
 
-    # MEI-639 Assertion 3 — dispatcher's v1 branch byte-identical.
+    # Assertion 3 — dispatcher's v1 branch byte-identical.
     # Same canonical input as assertion 1, but routed through the new
     # schema_version dispatcher. Must produce FIXTURE_HASH bit-for-bit,
     # proving the Python dispatcher's v1 path doesn't drift from the
@@ -1710,7 +3556,7 @@ def run_self_test():
         print(f"  got:      {got_dispatch_v1}", file=sys.stderr)
         ok = False
 
-    # MEI-639 Assertion 4 — v1 path ignores event_kind / auth_session.
+    # Assertion 4 — v1 path ignores event_kind / auth_session.
     # Passing AuthSessionStarted + a fake payload to the v1 branch must
     # still produce FIXTURE_HASH. Proves the v1 path CANNOT be contaminated
     # by v1.2-only fields. Mirror of the third sub-assertion in the
@@ -1734,7 +3580,7 @@ def run_self_test():
         print(f"  got:      {got_dispatch_v1_with_v12_args}", file=sys.stderr)
         ok = False
 
-    # MEI-639 Assertion 5 — Rust/Python agreement on v1.2 LlmRequest.
+    # Assertion 5 — Rust/Python agreement on v1.2 LlmRequest.
     # Pinned v1.2 LlmRequest fixture hash. The Rust drift_catchers.rs
     # has a paired test asserting the SAME hash from the SAME inputs;
     # neither side is allowed to drift independently.
@@ -1749,7 +3595,7 @@ def run_self_test():
         print(f"  got:      {got_v12_llm}", file=sys.stderr)
         ok = False
 
-    # MEI-639 Assertion 6 — Rust/Python agreement on v1.2 AuthSessionStarted.
+    # Assertion 6 — Rust/Python agreement on v1.2 AuthSessionStarted.
     # Same input + auth payload exists in the Rust paired test.
     got_v12_auth = compute_event_hash_v1_2_auth_session_started(
         timestamp_utc="2026-05-17T00:00:00+00:00",
@@ -1764,7 +3610,7 @@ def run_self_test():
         print(f"  got:      {got_v12_auth}", file=sys.stderr)
         ok = False
 
-    # MEI-1048 Assertion 7 — v1.3 admin.action fixture (direct fn), paired
+    # Assertion 7 — v1.3 admin.action fixture (direct fn), paired
     # with the Rust mei1048_v1_3_admin_action_fixture_hash_pinned literal.
     ts_1760 = datetime.datetime.fromtimestamp(
         1_760_000_000, datetime.timezone.utc).isoformat()
@@ -1785,11 +3631,11 @@ def run_self_test():
         print(f'  got:      {got_v13}', file=sys.stderr)
         ok = False
 
-    # MEI-1096 Assertion 8 — the SAME v1.3 event, but recomputed through
+    # Assertion 8 — the SAME v1.3 event, but recomputed through
     # recompute_event_hash (the production path verify_manifest walks) from a
     # synthetic exported-JSON body: event_kind in serde snake_case ('admin_action'),
     # Z-suffix timestamp, nested admin_action payload. This is the regression
-    # that would have caught MEI-1096 — the record loop used to ignore all of it
+    # that would have caught it — the record loop used to ignore all of it
     # and compute a frozen v1 hash. Exercises serde->wire mapping + schema
     # dispatch + timestamp normalization + payload feed end-to-end.
     synthetic_admin_event = dict(
@@ -1804,12 +3650,12 @@ def run_self_test():
     if got_v13_loop == V1_3_ADMIN_ACTION_FIXTURE_HASH:
         print('SELF-TEST assertion 8 PASS: verify_manifest recompute path handles v1.3 admin.action')
     else:
-        print('SELF-TEST assertion 8 FAIL: recompute_event_hash mis-hashes v1.3 admin.action (MEI-1096 regression)', file=sys.stderr)
+        print('SELF-TEST assertion 8 FAIL: recompute_event_hash mis-hashes v1.3 admin.action', file=sys.stderr)
         print(f'  expected: {V1_3_ADMIN_ACTION_FIXTURE_HASH}', file=sys.stderr)
         print(f'  got:      {got_v13_loop}', file=sys.stderr)
         ok = False
 
-    # MEI-1096 Assertion 9 — the same production-path check for v1.2 auth,
+    # Assertion 9 — the same production-path check for v1.2 auth,
     # proving the record loop no longer silently downgrades v1.2 to v1 either.
     synthetic_auth_event = dict(
         schema_version='v1.2',
@@ -1827,12 +3673,12 @@ def run_self_test():
     if got_v12_loop == V1_2_AUTH_SESSION_STARTED_FIXTURE_HASH:
         print('SELF-TEST assertion 9 PASS: verify_manifest recompute path handles v1.2 auth.session_started')
     else:
-        print('SELF-TEST assertion 9 FAIL: recompute_event_hash mis-hashes v1.2 auth (MEI-1096 regression)', file=sys.stderr)
+        print('SELF-TEST assertion 9 FAIL: recompute_event_hash mis-hashes v1.2 auth', file=sys.stderr)
         print(f'  expected: {V1_2_AUTH_SESSION_STARTED_FIXTURE_HASH}', file=sys.stderr)
         print(f'  got:      {got_v12_loop}', file=sys.stderr)
         ok = False
 
-    # MEI-925 Assertions 10a-10c — v1.4 mcp.* fixtures (direct fn), paired
+    # Assertions 10a-10c — v1.4 mcp.* fixtures (direct fn), paired
     # with the Rust mei925_v1_4_*_fixture_hash_pinned literals in
     # meilynx-audit/tests/mei925_mcp_chain_round_trip.rs. Three shapes cover
     # the distinct byte encodings: required strings + Some-optionals
@@ -1865,11 +3711,11 @@ def run_self_test():
             print(f'  got:      {got}', file=sys.stderr)
             ok = False
 
-    # MEI-925 Assertion 11 — the tool_call fixture recomputed through
+    # Assertion 11 — the tool_call fixture recomputed through
     # recompute_event_hash (the production path verify_manifest walks) from a
     # synthetic exported-JSON body: event_kind in serde snake_case
     # ('mcp_tool_call'), Z-suffix timestamp, nested mcp_event payload — the
-    # MEI-1096 regression class applied to the v1.4 bucket.
+    # same regression class applied to the v1.4 bucket.
     synthetic_mcp_event = dict(
         schema_version='v1.4',
         event_kind='mcp_tool_call',
@@ -1887,7 +3733,7 @@ def run_self_test():
         print(f'  got:      {got_v14_loop}', file=sys.stderr)
         ok = False
 
-    # MEI-804 Assertions 12a-12d — v1.5 mcp.* fixtures (direct fn), paired with
+    # Assertions 12a-12d — v1.5 mcp.* fixtures (direct fn), paired with
     # the Rust mei925_v1_5_*_fixture_hash_pinned literals. v1.5 = the v1.4
     # preimage plus the trailing principal chain. 12a-12c reuse the three v1.4
     # shapes with an on-behalf-of chain (agent authenticated + human acted-for,
@@ -1912,7 +3758,7 @@ def run_self_test():
             print(f'  got:      {got}', file=sys.stderr)
             ok = False
 
-    # MEI-804 Assertion 13 — the v1.5 tool_call fixture recomputed through
+    # Assertion 13 — the v1.5 tool_call fixture recomputed through
     # recompute_event_hash (the production path verify_manifest walks): serde
     # snake_case event_kind, Z-suffix timestamp, nested mcp_event carrying the
     # principal_chain. Confirms the schema_version='v1.5' dispatch branch is
@@ -1934,7 +3780,7 @@ def run_self_test():
         print(f'  got:      {got_v15_loop}', file=sys.stderr)
         ok = False
 
-    # MEI-1189 Assertion 14a — v1.6 redacted tool_call fixture via the direct
+    # Assertion 14a — v1.6 redacted tool_call fixture via the direct
     # compute function. Cross-pinned with the Rust
     # mei1189_v1_6_redacted_tool_call_fixture_hash_pinned literal.
     got_v16 = compute_event_hash_v1_6_mcp(
@@ -1949,7 +3795,7 @@ def run_self_test():
         print(f'  got:      {got_v16}', file=sys.stderr)
         ok = False
 
-    # MEI-1189 Assertion 14b — the same v1.6 fixture recomputed through the
+    # Assertion 14b — the same v1.6 fixture recomputed through the
     # production recompute_event_hash path (schema_version='v1.6' dispatch,
     # nested mcp_event carrying the redacted content address). Confirms the v1.6
     # branch is reachable end-to-end from an exported-JSON body.
@@ -1970,7 +3816,7 @@ def run_self_test():
         print(f'  got:      {got_v16_loop}', file=sys.stderr)
         ok = False
 
-    # MEI-1063 Assertion 15a — v1.7 enforcement tool_call fixture via the direct
+    # Assertion 15a — v1.7 enforcement tool_call fixture via the direct
     # compute function. Cross-pinned with the Rust
     # mei1063_v1_7_enforcement_tool_call_fixture_hash_pinned literal.
     got_v17 = compute_event_hash_v1_7_mcp(
@@ -1985,7 +3831,7 @@ def run_self_test():
         print(f'  got:      {got_v17}', file=sys.stderr)
         ok = False
 
-    # MEI-1063 Assertion 15b — the same v1.7 fixture recomputed through the
+    # Assertion 15b — the same v1.7 fixture recomputed through the
     # production recompute_event_hash path (schema_version='v1.7' dispatch,
     # nested mcp_event carrying the enforcement redaction hashes). Confirms the
     # v1.7 branch is reachable end-to-end from an exported-JSON body.
@@ -2006,7 +3852,7 @@ def run_self_test():
         print(f'  got:      {got_v17_loop}', file=sys.stderr)
         ok = False
 
-    # MEI-1063 Assertion 15c — v1.7 HOLD policy_decision fixture via the direct
+    # Assertion 15c — v1.7 HOLD policy_decision fixture via the direct
     # compute function. Cross-pinned with the Rust
     # mei1063_v1_7_hold_fixture_hash_pinned literal. The structural inverse of
     # 15a: hold_id set, both redaction hashes absent.
@@ -2022,7 +3868,7 @@ def run_self_test():
         print(f'  got:      {got_v17_hold}', file=sys.stderr)
         ok = False
 
-    # MEI-1063 Assertion 15d — the same v1.7 hold fixture recomputed through the
+    # Assertion 15d — the same v1.7 hold fixture recomputed through the
     # production recompute_event_hash path (schema_version='v1.7' dispatch,
     # nested mcp_event carrying the hold_id). Confirms the hold record is
     # reachable end-to-end from an exported-JSON body.
@@ -2043,7 +3889,7 @@ def run_self_test():
         print(f'  got:      {got_v17_hold_loop}', file=sys.stderr)
         ok = False
 
-    # MEI-1955 Assertion 16a — v1.8 coverage.computed fixture (direct fn),
+    # Assertion 16a — v1.8 coverage.computed fixture (direct fn),
     # paired with the Rust mei1955_v1_8_coverage_fixture_hash_pinned literal in
     # meilynx-audit/tests/mei1955_coverage_chain_round_trip.rs.
     got_v18 = compute_event_hash_v1_8_coverage(
@@ -2063,11 +3909,11 @@ def run_self_test():
         print(f'  got:      {got_v18}', file=sys.stderr)
         ok = False
 
-    # MEI-1955 Assertion 16b — the same v1.8 event recomputed through
+    # Assertion 16b — the same v1.8 event recomputed through
     # recompute_event_hash (the production path verify_manifest walks) from a
     # synthetic exported-JSON body: event_kind in serde snake_case
     # ('coverage_computed'), Z-suffix timestamp, nested coverage payload — the
-    # MEI-1096 regression class applied to the v1.8 bucket.
+    # same regression class applied to the v1.8 bucket.
     synthetic_coverage_event = dict(
         schema_version='v1.8',
         event_kind='coverage_computed',
@@ -2085,7 +3931,7 @@ def run_self_test():
         print(f'  got:      {got_v18_loop}', file=sys.stderr)
         ok = False
 
-    # MEI-2641 Assertion 16c — v1.13 coverage.key_inventory fixture (direct
+    # Assertion 16c — v1.13 coverage.key_inventory fixture (direct
     # fn), paired with the Rust mei2641_v1_13_key_inventory_fixture_hash_pinned
     # literal in meilynx-audit/tests/mei2641_key_inventory_chain_round_trip.rs.
     got_v113 = compute_event_hash_v1_13_coverage_key_inventory(
@@ -2105,7 +3951,7 @@ def run_self_test():
         print(f'  got:      {got_v113}', file=sys.stderr)
         ok = False
 
-    # MEI-2641 Assertion 16d — the same v1.13 event through recompute_event_hash
+    # Assertion 16d — the same v1.13 event through recompute_event_hash
     # (the production path) from a synthetic exported-JSON body, then a payload
     # outside its bucket must be refused rather than hashed without it.
     synthetic_inventory_event = dict(
@@ -2131,7 +3977,176 @@ def run_self_test():
         print(f'  got:      {got_v113_loop} (misplaced rejected: {misplaced_rejected})', file=sys.stderr)
         ok = False
 
-    # MEI-2151 Assertion 17a — v1.9 llm_request fixture (direct fn), paired
+    # Assertion 28a — v1.15 decision.receipt fixture (direct fn),
+    # paired with the Rust mei2989_v1_15_decision_receipt_fixture_hash_pinned
+    # literal and the control plane's pinned vector.
+    got_v115 = compute_event_hash_v1_15_decision_receipt(
+        sequence_number=9, timestamp_utc='2026-10-01T15:00:31.000000+00:00',
+        event_id='evt-receipt-1', request_id='evt-receipt-1', model_requested='',
+        action='allow', input_tokens=0, output_tokens=0, total_tokens=None,
+        cache_creation_input_tokens=None, cache_read_input_tokens=None,
+        cached_input_tokens=None, reasoning_tokens=None, estimated_cost_usd=None,
+        previous_hash='b' * 64, receipt=_V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD,
+    )
+    if got_v115 == V1_15_DECISION_RECEIPT_FIXTURE_HASH:
+        print('SELF-TEST assertion 28a PASS: v1.15 decision.receipt fixture hash matches')
+    else:
+        print('SELF-TEST assertion 28a FAIL: v1.15 decision.receipt fixture drift', file=sys.stderr)
+        print(f'  expected: {V1_15_DECISION_RECEIPT_FIXTURE_HASH}', file=sys.stderr)
+        print(f'  got:      {got_v115}', file=sys.stderr)
+        ok = False
+
+    # Assertion 28b — the same record through recompute_event_hash (the
+    # production path) from a synthetic exported-JSON body with a Z-suffix
+    # timestamp, and the receipt checks pass on the intact record.
+    synthetic_receipt_event = dict(
+        schema_version='v1.15',
+        event_kind='decision_receipt',
+        timestamp_utc='2026-10-01T15:00:31.000000Z',
+        event_id='evt-receipt-1', request_id='evt-receipt-1', model_requested='',
+        action='allow', input_tokens=0, output_tokens=0,
+        decision_receipt=dict(_V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD),
+    )
+    got_v115_loop = recompute_event_hash(synthetic_receipt_event, 9, 'b' * 64)
+    receipt_problems = check_decision_receipt(synthetic_receipt_event)
+    if got_v115_loop == V1_15_DECISION_RECEIPT_FIXTURE_HASH and not receipt_problems:
+        print('SELF-TEST assertion 28b PASS: verify_manifest recompute path handles v1.15 decision.receipt')
+    else:
+        print('SELF-TEST assertion 28b FAIL: recompute_event_hash or check_decision_receipt mis-handles v1.15', file=sys.stderr)
+        print(f'  got: {got_v115_loop} problems: {receipt_problems}', file=sys.stderr)
+        ok = False
+
+    # Assertion 28c — the stored-not-hashed evidence list and the
+    # sealed clock verdict are checked: an edited evidence entry, a decision
+    # time moved past the deadline with the verdict left at `within`, and a
+    # decider removed from a decided receipt are all caught.
+    edited_evidence = dict(synthetic_receipt_event, decision_receipt=dict(
+        _V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD,
+        evidence=[dict(_V1_15_DECISION_RECEIPT_FIXTURE_EVIDENCE[0], event_hash='2' * 64), _V1_15_DECISION_RECEIPT_FIXTURE_EVIDENCE[1]],
+    ))
+    moved_clock = dict(synthetic_receipt_event, decision_receipt=dict(
+        _V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD, clock_decided_at=1791021601,
+    ))
+    no_decider = dict(synthetic_receipt_event, decision_receipt=dict(
+        _V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD, decider_user_id=None,
+    ))
+    wrong_action = dict(synthetic_receipt_event, action='block')
+    caught = [bool(check_decision_receipt(e)) for e in (edited_evidence, moved_clock, no_decider, wrong_action)]
+    if all(caught):
+        print('SELF-TEST assertion 28c PASS: edited evidence, a moved clock, a missing decider and a wrong action are caught')
+    else:
+        print(f'SELF-TEST assertion 28c FAIL: only {sum(caught)} of 4 receipt edits caught', file=sys.stderr)
+        ok = False
+
+    # Assertion 28d — the fail-closed invariants: a receipt payload on
+    # any other version or kind, v1.15 on another kind, v1.15 without a payload,
+    # and a decider on a lapse are all refused by the dispatcher.
+    rejected = 0
+    for case in (
+        dict(synthetic_receipt_event, schema_version='v1.13'),
+        dict(synthetic_receipt_event, event_kind='coverage_key_inventory'),
+        dict(synthetic_receipt_event, event_kind='llm_request', decision_receipt=None),
+        dict(synthetic_receipt_event, decision_receipt=None),
+        dict(synthetic_receipt_event, decision_receipt=dict(_V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD, outcome='lapsed')),
+    ):
+        try:
+            recompute_event_hash(case, 9, 'b' * 64)
+        except ValueError:
+            rejected += 1
+    if rejected == 5:
+        print('SELF-TEST assertion 28d PASS: a receipt outside v1.15, v1.15 without a receipt, and a malformed receipt are refused')
+    else:
+        print(f'SELF-TEST assertion 28d FAIL: only {rejected} of 5 fail-closed cases rejected', file=sys.stderr)
+        ok = False
+
+    # Assertion 29a — the v1.16 fixtures (direct fn): the outcome
+    # digest over the JCS form, and the hash with and without an identity
+    # (the identity presence tag is new in v1.16).
+    fixture_trace = {'outcomes_sha256_jcs': V1_16_OUTCOMES_DIGEST_FIXTURE}
+    got_digest = sha256_jcs(_V1_16_OUTCOMES_FIXTURE)
+    got_ident = compute_event_hash_v1_16_llm_request(
+        *_V1_16_FIXTURE_ARGS, None, None, _V1_16_IDENTITY_FIXTURE, fixture_trace,
+    )
+    got_bare = compute_event_hash_v1_16_llm_request(*_V1_16_FIXTURE_ARGS, None, None, None, fixture_trace)
+    if (got_digest, got_ident, got_bare) == (
+        V1_16_OUTCOMES_DIGEST_FIXTURE, V1_16_LLM_REQUEST_FIXTURE_HASH, V1_16_LLM_REQUEST_BARE_FIXTURE_HASH,
+    ):
+        print('SELF-TEST assertion 29a PASS: v1.16 outcome digest and llm_request fixture hashes match')
+    else:
+        print('SELF-TEST assertion 29a FAIL: v1.16 fixture drift', file=sys.stderr)
+        print(f'  digest {got_digest}\n  ident  {got_ident}\n  bare   {got_bare}', file=sys.stderr)
+        ok = False
+
+    # Assertion 29b — the production recompute path on an exported
+    # v1.16 record, and the outcome check passing on it. Timing rides the
+    # record outside the hash: editing it changes neither verdict.
+    v116_event = dict(
+        schema_version='v1.16', event_kind='llm_request', timestamp_utc='2026-10-09T16:21:00Z',
+        event_id='evt-v116-fixture', request_id='req-v116-fixture', model_requested='gpt-6-luna',
+        action='block', input_tokens=452, output_tokens=70, total_tokens=522,
+        identity=dict(_V1_16_IDENTITY_FIXTURE),
+        evaluation_trace={
+            'outcomes_sha256_jcs': V1_16_OUTCOMES_DIGEST_FIXTURE,
+            'outcomes': json.loads(json.dumps(_V1_16_OUTCOMES_FIXTURE)),
+            'timing': {'stages': [{'name': 'upstream', 'offset_us': 16400, 'duration_us': 2193000}], 'rules': [
+                {'offset_us': 2210200, 'duration_us': 22000}]},
+        },
+    )
+    retimed = json.loads(json.dumps(v116_event))
+    retimed['evaluation_trace']['timing']['rules'][0]['duration_us'] = 1
+    try:
+        recomputed = [recompute_event_hash(e, 7, 'deadbeef' * 8) for e in (v116_event, retimed)]
+    except ValueError as exc:
+        recomputed = [str(exc)]
+    if (recomputed == [V1_16_LLM_REQUEST_FIXTURE_HASH] * 2
+            and not check_evaluation_trace(v116_event) and not check_evaluation_trace(retimed)):
+        print('SELF-TEST assertion 29b PASS: verify_manifest recompute path handles v1.16; timing is outside the hash')
+    else:
+        print(f'SELF-TEST assertion 29b FAIL: recompute {recomputed}, problems {check_evaluation_trace(v116_event)}', file=sys.stderr)
+        ok = False
+
+    # Assertion 29c — an outcome edited after sealing still hashes
+    # (the preimage holds only the digest) and is caught by the outcome check.
+    edits = []
+    for mutate in (
+        lambda o: o['rules'][0].update(outcome='clean'),
+        lambda o: o['rules'][0].update(action='allow'),
+        lambda o: o.update(deciding_rule_id=None),
+        lambda o: o['delivery'].update(outcome='delivered'),
+        lambda o: o['rules'].append(dict(o['rules'][0], rule_id='extra')),
+    ):
+        edited = json.loads(json.dumps(v116_event))
+        mutate(edited['evaluation_trace']['outcomes'])
+        edits.append(
+            recompute_event_hash(edited, 7, 'deadbeef' * 8) == V1_16_LLM_REQUEST_FIXTURE_HASH
+            and bool(check_evaluation_trace(edited))
+        )
+    if all(edits):
+        print('SELF-TEST assertion 29c PASS: five outcome edits after sealing are caught by the outcome check')
+    else:
+        print(f'SELF-TEST assertion 29c FAIL: only {sum(edits)} of 5 outcome edits caught', file=sys.stderr)
+        ok = False
+
+    # Assertion 29d — the fail-closed invariants: a trace on any other
+    # version, v1.16 on another kind and v1.16 without a trace are refused by
+    # the dispatcher, and the record check flags a trace outside v1.16.
+    rejected = 0
+    for case in (
+        dict(v116_event, schema_version='v1.12'),
+        dict(v116_event, event_kind='mcp_tool_call'),
+        dict(v116_event, evaluation_trace=None),
+    ):
+        try:
+            recompute_event_hash(case, 7, 'deadbeef' * 8)
+        except ValueError:
+            rejected += 1
+    if rejected == 3 and check_evaluation_trace(dict(v116_event, schema_version='v1.12')):
+        print('SELF-TEST assertion 29d PASS: a trace outside v1.16 and v1.16 without a trace are refused')
+    else:
+        print(f'SELF-TEST assertion 29d FAIL: only {rejected} of 3 fail-closed cases rejected', file=sys.stderr)
+        ok = False
+
+    # Assertion 17a — v1.9 llm_request fixture (direct fn), paired
     # with the Rust mei2151_v1_9_llm_request_fixture_hash_pinned literal.
     got_v19_llm = compute_event_hash_v1_9_llm_request(
         timestamp_utc="2026-05-17T00:00:00+00:00",
@@ -2146,8 +4161,8 @@ def run_self_test():
         print(f'  got:      {got_v19_llm}', file=sys.stderr)
         ok = False
 
-    # MEI-2151 Assertion 17b — the same v1.9 LLM event through the production
-    # recompute path from a synthetic exported-JSON body (MEI-1096 class).
+    # Assertion 17b — the same v1.9 LLM event through the production
+    # recompute path from a synthetic exported-JSON body.
     synthetic_llm_v19_event = dict(
         schema_version='v1.9',
         event_kind='llm_request',
@@ -2169,7 +4184,7 @@ def run_self_test():
         print(f'  got:      {got_v19_llm_loop}', file=sys.stderr)
         ok = False
 
-    # MEI-2151 Assertion 17c — v1.9 mcp.tool_call fixture (direct fn), paired
+    # Assertion 17c — v1.9 mcp.tool_call fixture (direct fn), paired
     # with the Rust mei2151_v1_9_mcp_tool_call_fixture_hash_pinned literal.
     # Built on the v1.7 ENFORCEMENT payload on purpose: it proves v1.9 carries
     # both the v1.6 capture axis and the v1.7 enforcement axis forward rather
@@ -2188,8 +4203,8 @@ def run_self_test():
         print(f'  got:      {got_v19_mcp}', file=sys.stderr)
         ok = False
 
-    # MEI-2151 Assertion 17d — the same v1.9 MCP event through the production
-    # recompute path from a synthetic exported-JSON body (MEI-1096 class).
+    # Assertion 17d — the same v1.9 MCP event through the production
+    # recompute path from a synthetic exported-JSON body.
     synthetic_mcp_v19_event = dict(
         schema_version='v1.9',
         event_kind='mcp_tool_call',
@@ -2208,7 +4223,7 @@ def run_self_test():
         print(f'  got:      {got_v19_mcp_loop}', file=sys.stderr)
         ok = False
 
-    # MEI-2646 Assertion 24a — the asserted-claims digest: RFC 8785 over the
+    # Assertion 24a — the asserted-claims digest: RFC 8785 over the
     # stored labels. Paired with the Rust mei2646_asserted_digest_pinned literal;
     # this is the cross-language pin the stored-not-hashed labels rest on.
     got_digest = asserted_claims_digest(_V1_12_ASSERTED_FIXTURE_PAYLOAD)
@@ -2220,7 +4235,7 @@ def run_self_test():
         print(f'  got:      {got_digest}', file=sys.stderr)
         ok = False
 
-    # MEI-2646 Assertion 24b — v1.12 llm_request fixtures (direct fn): the T1
+    # Assertion 24b — v1.12 llm_request fixtures (direct fn): the T1
     # agent with join keys and a content block, and the bare T3 project-key
     # record (absent join, absent content: both presence tags pinned). Paired
     # with mei2646_v1_12_llm_request_fixture_hash_pinned.
@@ -2241,7 +4256,7 @@ def run_self_test():
             print(f'  got:      {got}', file=sys.stderr)
             ok = False
 
-    # MEI-2646 Assertion 24d — v1.12 mcp.tool_call fixture (direct fn): a T2
+    # Assertion 24d — v1.12 mcp.tool_call fixture (direct fn): a T2
     # identity whose verified delegated human agrees with the chain's
     # `verified` attestation marker. Paired with
     # mei2646_v1_12_mcp_tool_call_fixture_hash_pinned.
@@ -2260,8 +4275,8 @@ def run_self_test():
         print(f'  got:      {got_v112_mcp}', file=sys.stderr)
         ok = False
 
-    # MEI-2646 Assertion 24e — both v1.12 fixtures through the production
-    # recompute path from synthetic exported-JSON bodies (MEI-1096 class).
+    # Assertion 24e — both v1.12 fixtures through the production
+    # recompute path from synthetic exported-JSON bodies.
     synthetic_llm_v112_event = dict(
         schema_version='v1.12',
         event_kind='llm_request',
@@ -2302,7 +4317,7 @@ def run_self_test():
             print(f'SELF-TEST assertion {label} FAIL: check_sealed_identity rejected an intact record', file=sys.stderr)
             ok = False
 
-    # MEI-2646 Assertion 24f — the fail-closed invariants: an identity on any
+    # Assertion 24f — the fail-closed invariants: an identity on any
     # bucket other than v1.12 is a hard error; v1.12 without an identity is a
     # hard error; a delegated_human over an asserted on-behalf-of leg is a hard
     # error. Mirror of the Rust dispatcher guards.
@@ -2314,7 +4329,7 @@ def run_self_test():
                 identity=_V1_12_IDENTITY_T1_FIXTURE_PAYLOAD, **_FIXTURE,
             )
         except ValueError as e:
-            if 'MEI-2646' not in str(e):
+            if 'identity block present' not in str(e):
                 print(f'SELF-TEST assertion 24f FAIL: wrong rejection for identity on {stale_version}: {e}', file=sys.stderr)
                 ok = False
         else:
@@ -2342,7 +4357,7 @@ def run_self_test():
     except ValueError:
         print('SELF-TEST assertion 24f PASS: identity outside v1.12, v1.12 without identity, and a disagreeing delegation are rejected')
 
-    # MEI-2646 Assertion 24g — a rewritten stored label behind an intact digest
+    # Assertion 24g — a rewritten stored label behind an intact digest
     # is caught by check_sealed_identity (the chain hash alone cannot see it).
     relabelled = dict(synthetic_llm_v112_event,
                       identity=dict(_V1_12_IDENTITY_T1_FIXTURE_PAYLOAD,
@@ -2354,7 +4369,7 @@ def run_self_test():
         print('SELF-TEST assertion 24g FAIL: a rewritten asserted label went unnoticed', file=sys.stderr)
         ok = False
 
-    # MEI-2745 Assertion 24h — the stored-content check runs on v1.12 as on
+    # Assertion 24h — the stored-content check runs on v1.12 as on
     # v1.10/v1.11: offline, a sealed v1.12 record carrying content verifies;
     # the same record with its prompt edited after sealing still hash-verifies
     # but fails; a v1.12 record with no content block is not content-checked.
@@ -2401,7 +4416,7 @@ def run_self_test():
               f'edited detected: {edited_detected}, bare problems: {check_llm_content(bare)}', file=sys.stderr)
         ok = False
 
-    # MEI-2898 Assertion 27a — the v1.14 mcp.policy_decision fixtures (direct
+    # Assertion 27a — the v1.14 mcp.policy_decision fixtures (direct
     # fn): every earlier axis carried forward under a tool_result-stage allow,
     # and the bare shape (absent identity and join keys) of a call held at the
     # access stage with action "hold". Paired with
@@ -2423,7 +4438,7 @@ def run_self_test():
             print(f'  got:      {got}', file=sys.stderr)
             ok = False
 
-    # MEI-2898 Assertion 27b — both fixtures through the production recompute
+    # Assertion 27b — both fixtures through the production recompute
     # path from synthetic exported-JSON bodies, and the identity label check
     # on a v1.14 record (present: checked; absent: nothing to check).
     for label, payload, join, identity, action, expected in (
@@ -2452,7 +4467,7 @@ def run_self_test():
             print(f'  got:      {got}', file=sys.stderr)
             ok = False
 
-    # MEI-2898 Assertion 27c — the stage is attested: each stage, and its
+    # Assertion 27c — the stage is attested: each stage, and its
     # absence, gives a different hash; and the action is attested too, so a
     # hold rewritten to block (or the reverse) breaks the chain.
     seen = set()
@@ -2475,7 +4490,7 @@ def run_self_test():
         print('SELF-TEST assertion 27c FAIL: two stages (or hold and block) hash the same', file=sys.stderr)
         ok = False
 
-    # MEI-2898 Assertion 27d — the fail-closed invariants: a stage on any other
+    # Assertion 27d — the fail-closed invariants: a stage on any other
     # bucket is a hard error, v1.14 without a stage is a hard error, and v1.14
     # is defined only for mcp.* events.
     rejected = 0
@@ -2486,7 +4501,7 @@ def run_self_test():
                 mcp_event=_V1_14_MCP_HOLD_FIXTURE_PAYLOAD, **mcp_fixture_args,
             )
         except ValueError as e:
-            rejected += 'MEI-2898' in str(e)
+            rejected += 'decision stage' in str(e) or 'schema_version v1.14' in str(e)
     for kwargs in (
         dict(event_kind=EVENT_KIND_MCP_POLICY_DECISION,
              mcp_event=dict(_V1_14_MCP_HOLD_FIXTURE_PAYLOAD, stage=None)),
@@ -2495,7 +4510,7 @@ def run_self_test():
         try:
             compute_event_hash_dispatch('v1.14', **kwargs, **mcp_fixture_args)
         except ValueError as e:
-            rejected += 'MEI-2898' in str(e)
+            rejected += 'decision stage' in str(e) or 'schema_version v1.14' in str(e)
     if rejected == 6:
         print('SELF-TEST assertion 27d PASS: a stage outside v1.14, v1.14 without a stage, '
               'and v1.14 on a non-MCP kind are rejected')
@@ -2503,7 +4518,263 @@ def run_self_test():
         print(f'SELF-TEST assertion 27d FAIL: only {rejected} of 6 fail-closed cases rejected', file=sys.stderr)
         ok = False
 
-    # MEI-2151 Assertion 17e — the fail-closed invariant: a join_context on any
+    # Assertion 30a — the v1.17 data-reach fixtures (direct fn).
+    # Paired with mei2987_v1_17_fixture_hashes_pinned and the control plane's
+    # DataReach_Matched_And_NoMatch_MatchPinnedV117Fixtures.
+    for label, payload, join, identity, action, expected in (
+        ('30a', _V1_17_MCP_MATCHED_FIXTURE_PAYLOAD, _V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD,
+         _V1_12_IDENTITY_T2_FIXTURE_PAYLOAD, 'allow', V1_17_MCP_MATCHED_FIXTURE_HASH),
+        ('30a-no-match', _V1_17_MCP_NO_MATCH_FIXTURE_PAYLOAD, None, None, 'block', V1_17_MCP_NO_MATCH_FIXTURE_HASH),
+    ):
+        got = compute_event_hash_v1_17_mcp(
+            EVENT_KIND_MCP_POLICY_DECISION, mcp_event=payload, join_context=join,
+            identity=identity, **dict(mcp_fixture_args, action=action),
+        )
+        if got == expected:
+            print(f'SELF-TEST assertion {label} PASS: v1.17 data-reach fixture hash matches')
+        else:
+            print(f'SELF-TEST assertion {label} FAIL: v1.17 data-reach fixture drift', file=sys.stderr)
+            print(f'  expected: {expected}', file=sys.stderr)
+            print(f'  got:      {got}', file=sys.stderr)
+            ok = False
+
+    # Assertion 30b — both fixtures through the production recompute
+    # path from synthetic exported-JSON bodies.
+    for label, payload, join, identity, action, expected in (
+        ('30b', _V1_17_MCP_MATCHED_FIXTURE_PAYLOAD, _V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD,
+         _V1_12_IDENTITY_T2_FIXTURE_PAYLOAD, 'allow', V1_17_MCP_MATCHED_FIXTURE_HASH),
+        ('30b-no-match', _V1_17_MCP_NO_MATCH_FIXTURE_PAYLOAD, None, None, 'block', V1_17_MCP_NO_MATCH_FIXTURE_HASH),
+    ):
+        ev = dict(
+            schema_version='v1.17', event_kind='mcp_policy_decision',
+            timestamp_utc=ts_1760.replace('+00:00', 'Z'),
+            event_id='evt-mcp-fixture', request_id='req-mcp-fixture',
+            model_requested='', action=action, input_tokens=0, output_tokens=0,
+            mcp_event=json.loads(json.dumps(payload)),
+        )
+        if join is not None:
+            ev['join_context'] = dict(join)
+        if identity is not None:
+            ev['identity'] = dict(identity)
+        got = recompute_event_hash(ev, 11, 'prev-fixture')
+        if got == expected and not check_sealed_identity(ev):
+            print(f'SELF-TEST assertion {label} PASS: verify_manifest recompute path handles v1.17')
+        else:
+            print(f'SELF-TEST assertion {label} FAIL: recompute_event_hash mis-hashes v1.17', file=sys.stderr)
+            print(f'  expected: {expected}', file=sys.stderr)
+            print(f'  got:      {got}', file=sys.stderr)
+            ok = False
+
+    # Assertion 30c — every member of the block is attested: a
+    # tampered binding, access, outcome, schema flag, name, name order, name
+    # count or omitted count each changes the hash, and two names never hash
+    # like their concatenation (the length prefix).
+    base = _V1_17_MCP_MATCHED_FIXTURE_PAYLOAD['data_reach']
+    tampered = (
+        dict(base, binding_id='rb_0000000000000000'), dict(base, access='write'), dict(base, access=None),
+        dict(base, outcome='no_match'), dict(base, outcome='error'), dict(base, schema_known=False),
+        dict(base, arg_keys=['account_id', 'fields']), dict(base, arg_keys=['account_id', 'fields', 'region']),
+        dict(base, arg_keys=['account_idfields', 'r\u00e9gion']),
+        dict(base, arg_keys_omitted=0), dict(base, arg_keys_omitted=2),
+    )
+    seen = {V1_17_MCP_MATCHED_FIXTURE_HASH}
+    for block in tampered:
+        seen.add(compute_event_hash_v1_17_mcp(
+            EVENT_KIND_MCP_POLICY_DECISION, mcp_event=dict(_V1_17_MCP_MATCHED_FIXTURE_PAYLOAD, data_reach=block),
+            join_context=_V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD, identity=_V1_12_IDENTITY_T2_FIXTURE_PAYLOAD,
+            **dict(mcp_fixture_args, action='allow'),
+        ))
+    if len(seen) == len(tampered) + 1:
+        print('SELF-TEST assertion 30c PASS: every member of the data_reach block is attested')
+    else:
+        print('SELF-TEST assertion 30c FAIL: two different data_reach blocks hash the same', file=sys.stderr)
+        ok = False
+
+    # Assertion 30d — the fail-closed invariants: the block on any
+    # other bucket, v1.17 on another kind or stage or without a block, and a
+    # block the classifier never produces are all hard errors.
+    no_match = _V1_17_MCP_NO_MATCH_FIXTURE_PAYLOAD
+    cases = [
+        (version, dict(event_kind=EVENT_KIND_MCP_POLICY_DECISION, mcp_event=no_match))
+        for version in ('v1.5', 'v1.7', 'v1.12', 'v1.14')
+    ] + [
+        ('v1.17', dict(event_kind=kind, mcp_event=no_match))
+        for kind in (EVENT_KIND_MCP_TOOL_CALL, EVENT_KIND_MCP_TOOL_RESULT, EVENT_KIND_MCP_ERROR, EVENT_KIND_LLM_REQUEST)
+    ] + [
+        ('v1.17', dict(event_kind=EVENT_KIND_MCP_POLICY_DECISION, mcp_event=dict(no_match, stage=stage)))
+        for stage in MCP_DECISION_STAGES if stage != 'tool_call'
+    ] + [
+        ('v1.17', dict(event_kind=EVENT_KIND_MCP_POLICY_DECISION, mcp_event=dict(no_match, data_reach=None))),
+    ] + [
+        ('v1.17', dict(event_kind=EVENT_KIND_MCP_POLICY_DECISION, mcp_event=dict(no_match, data_reach=block)))
+        for block in (
+            dict(no_match['data_reach'], binding_id='rb_5c1d0e3a7b9f2468'),
+            dict(base, binding_id='unbound'), dict(base, binding_id='rb_123-45-6789'),
+            dict(base, access=None), dict(no_match['data_reach'], access='read'),
+            dict(base, access='admin'), dict(base, outcome='maybe'),
+            dict(base, arg_keys=[f'k{i:02d}' for i in range(33)]),
+            dict(base, arg_keys=['a' * 65]), dict(base, arg_keys=['']),
+            dict(base, arg_keys=['fields', 'account_id']), dict(base, arg_keys=['fields', 'fields']),
+            dict(base, arg_keys_omitted=-1),
+        )
+    ]
+    rejected = 0
+    for version, kwargs in cases:
+        try:
+            compute_event_hash_dispatch(version, **kwargs, **mcp_fixture_args)
+        except ValueError as e:
+            rejected += any(s in str(e) for s in ('data_reach present', 'compute_event_hash_v1_17_mcp',
+                                                  'malformed data_reach block', 'decision stage', 'schema_version v1.14'))
+    if rejected == len(cases):
+        print(f'SELF-TEST assertion 30d PASS: all {len(cases)} misplaced, incomplete or malformed '
+              'data_reach shapes are rejected')
+    else:
+        print(f'SELF-TEST assertion 30d FAIL: only {rejected} of {len(cases)} fail-closed cases rejected', file=sys.stderr)
+        ok = False
+
+    # Assertion 31a — the v1.18 fixtures on both lanes (direct fns).
+    # Paired with mei3097_customer_scope_chain_round_trip.rs and the control
+    # plane's hasher tests; a disagreement here is the drift the examiner
+    # would otherwise find first.
+    fixture_trace = {'outcomes_sha256_jcs': V1_16_OUTCOMES_DIGEST_FIXTURE}
+    got_cred = compute_event_hash_v1_18_llm_request(
+        *_V1_16_FIXTURE_ARGS, None, None, _V1_16_IDENTITY_FIXTURE, fixture_trace, _V1_18_CUSTOMER_CREDENTIAL_FIXTURE,
+    )
+    got_asserted = compute_event_hash_v1_18_llm_request(
+        *_V1_16_FIXTURE_ARGS, None, None, _V1_16_IDENTITY_FIXTURE, fixture_trace, _V1_18_CUSTOMER_ASSERTED_FIXTURE,
+    )
+    got_bare = compute_event_hash_v1_18_llm_request(
+        *_V1_16_FIXTURE_ARGS, None, None, None, None, _V1_18_CUSTOMER_NONE_FIXTURE,
+    )
+    got_mcp_matched = compute_event_hash_v1_18_mcp(
+        EVENT_KIND_MCP_POLICY_DECISION, 7, '2026-10-10T12:00:01+00:00', 'evt-reach-matched', 'req-reach-7', '',
+        'allow', 0, 0, None, None, None, None, None, None, 'deadbeef' * 8,
+        _V1_17_MCP_MATCHED_FIXTURE_PAYLOAD, _V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD, _V1_12_IDENTITY_T2_FIXTURE_PAYLOAD,
+        _V1_18_MCP_CUSTOMER_CREDENTIAL_FIXTURE,
+    )
+    got_mcp_tool_call = compute_event_hash_v1_18_mcp(
+        EVENT_KIND_MCP_TOOL_CALL, 7, '2026-10-10T12:00:01+00:00', 'evt-tool-call', 'req-tool-7', '',
+        'allow', 0, 0, None, None, None, None, None, None, 'deadbeef' * 8,
+        _V1_5_MCP_TOOL_CALL_FIXTURE_PAYLOAD, None, None, _V1_18_CUSTOMER_NONE_FIXTURE,
+    )
+    expected = [V1_18_LLM_CREDENTIAL_FIXTURE_HASH, V1_18_LLM_ASSERTED_FIXTURE_HASH, V1_18_LLM_BARE_FIXTURE_HASH,
+                V1_18_MCP_MATCHED_CREDENTIAL_FIXTURE_HASH, V1_18_MCP_TOOL_CALL_NONE_FIXTURE_HASH]
+    got = [got_cred, got_asserted, got_bare, got_mcp_matched, got_mcp_tool_call]
+    if (got == expected and customer_label_sha256('bank-a') == V1_18_CUSTOMER_LABEL_FIXTURE_DIGEST
+            and len(set(got)) == 5):
+        print('SELF-TEST assertion 31a PASS: v1.18 fixture hashes match on both lanes')
+    else:
+        print(f'SELF-TEST assertion 31a FAIL: v1.18 fixture drift: {got} != {expected}', file=sys.stderr)
+        ok = False
+
+    # Assertion 31b — the production recompute path (recompute_event_hash
+    # over an exported record) selects the v1.18 arms, and the record check
+    # catches a rewritten asserted label behind an unchanged digest.
+    v118_llm = dict(
+        schema_version='v1.18', event_id='evt-v116-fixture', request_id='req-v116-fixture',
+        timestamp_utc='2026-10-09T16:21:00Z', model_requested='gpt-6-luna', action='block',
+        input_tokens=452, output_tokens=70, total_tokens=522,
+        identity=dict(_V1_16_IDENTITY_FIXTURE, asserted={}),
+        evaluation_trace={'outcomes_sha256_jcs': V1_16_OUTCOMES_DIGEST_FIXTURE,
+                          'outcomes': json.loads(json.dumps(_V1_16_OUTCOMES_FIXTURE))},
+        customer=dict(_V1_18_CUSTOMER_ASSERTED_FIXTURE), customer_id='bank-b',
+    )
+    v118_mcp = dict(
+        schema_version='v1.18', event_kind='mcp_tool_call', event_id='evt-tool-call', request_id='req-tool-7',
+        timestamp_utc='2026-10-10T12:00:01Z', model_requested='', action='allow', input_tokens=0, output_tokens=0,
+        mcp_event=dict(_V1_5_MCP_TOOL_CALL_FIXTURE_PAYLOAD), customer=dict(_V1_18_CUSTOMER_NONE_FIXTURE),
+    )
+    recomputed = [recompute_event_hash(v118_llm, 7, 'deadbeef' * 8), recompute_event_hash(v118_mcp, 7, 'deadbeef' * 8)]
+    rewritten = dict(v118_llm, customer_id='bank-c')
+    v118_llm['identity']['asserted_digest'] = asserted_claims_digest({})
+    if (recomputed == [V1_18_LLM_ASSERTED_FIXTURE_HASH, V1_18_MCP_TOOL_CALL_NONE_FIXTURE_HASH]
+            and check_customer_scope(v118_llm) == [] and check_customer_scope(v118_mcp) == []
+            and len(check_customer_scope(rewritten)) == 1
+            and check_evaluation_trace(dict(v118_mcp, event_kind=None, schema_version='v1.18',
+                                            customer=dict(_V1_18_CUSTOMER_NONE_FIXTURE))) == []):
+        print('SELF-TEST assertion 31b PASS: verify_manifest recompute path handles v1.18; a rewritten asserted label is caught')
+    else:
+        print(f'SELF-TEST assertion 31b FAIL: recompute {recomputed}, problems {check_customer_scope(rewritten)}', file=sys.stderr)
+        ok = False
+
+    # Assertion 31c — every member of the customer block is attested:
+    # changing the digest, the source or the kid moves the hash.
+    variants = [
+        dict(_V1_18_CUSTOMER_CREDENTIAL_FIXTURE, label_sha256='b' * 64),
+        dict(_V1_18_CUSTOMER_CREDENTIAL_FIXTURE, credential_kid='other-kid'),
+        {'label_sha256': V1_18_CUSTOMER_LABEL_FIXTURE_DIGEST, 'source': 'asserted'},
+    ]
+    seen = {V1_18_LLM_CREDENTIAL_FIXTURE_HASH}
+    for block in variants:
+        seen.add(compute_event_hash_v1_18_llm_request(
+            *_V1_16_FIXTURE_ARGS, None, None, _V1_16_IDENTITY_FIXTURE, fixture_trace, block,
+        ))
+    if len(seen) == 1 + len(variants):
+        print('SELF-TEST assertion 31c PASS: every member of the customer block is attested')
+    else:
+        print('SELF-TEST assertion 31c FAIL: two different customer blocks hash the same', file=sys.stderr)
+        ok = False
+
+    # Assertion 31d — fail closed: a customer block on another bucket,
+    # v1.18 without a block, v1.18 on a non-lane kind, and malformed blocks.
+    cases = [
+        ('v1.16', dict(event_kind=EVENT_KIND_LLM_REQUEST, identity=_V1_16_IDENTITY_FIXTURE,
+                       evaluation_trace=fixture_trace, customer=_V1_18_CUSTOMER_NONE_FIXTURE)),
+        ('v1.17', dict(event_kind=EVENT_KIND_MCP_POLICY_DECISION, mcp_event=_V1_17_MCP_MATCHED_FIXTURE_PAYLOAD,
+                       customer=_V1_18_CUSTOMER_NONE_FIXTURE)),
+        ('v1.18', dict(event_kind=EVENT_KIND_LLM_REQUEST)),
+        ('v1.18', dict(event_kind=EVENT_KIND_ADMIN_ACTION, customer=_V1_18_CUSTOMER_NONE_FIXTURE)),
+        ('v1.18', dict(event_kind=EVENT_KIND_LLM_REQUEST, customer={'source': 'none', 'label_sha256': 'a' * 64})),
+        ('v1.18', dict(event_kind=EVENT_KIND_LLM_REQUEST, customer={'source': 'asserted'})),
+        ('v1.18', dict(event_kind=EVENT_KIND_LLM_REQUEST, customer={'source': 'credential', 'label_sha256': 'a' * 64})),
+        ('v1.18', dict(event_kind=EVENT_KIND_LLM_REQUEST, customer={'source': 'credential', 'label_sha256': 'A' * 64, 'credential_kid': 'k'})),
+        ('v1.18', dict(event_kind=EVENT_KIND_LLM_REQUEST, customer={'source': 'tenant', 'label_sha256': 'a' * 64})),
+        ('v1.18', dict(event_kind=EVENT_KIND_MCP_TOOL_CALL, mcp_event=_V1_17_MCP_MATCHED_FIXTURE_PAYLOAD,
+                       customer=_V1_18_CUSTOMER_NONE_FIXTURE)),
+    ]
+    rejected = 0
+    for version, kwargs in cases:
+        try:
+            compute_event_hash_dispatch(version, 7, '2026-10-10T12:00:01+00:00', 'e', 'r', '', 'allow',
+                                        0, 0, None, None, None, None, None, None, 'deadbeef' * 8, **kwargs)
+        except ValueError as e:
+            rejected += any(s in str(e) for s in ('customer block', 'schema_version v1.18', 'data_reach present',
+                                                  'compute_event_hash_v1_17_mcp', 'malformed data_reach block'))
+    if rejected == len(cases):
+        print(f'SELF-TEST assertion 31d PASS: all {len(cases)} misplaced, incomplete or malformed customer shapes are rejected')
+    else:
+        print(f'SELF-TEST assertion 31d FAIL: only {rejected} of {len(cases)} fail-closed cases rejected', file=sys.stderr)
+        ok = False
+
+    # Assertion 31e — a v1.18 llm_request carries its content
+    # attestation (the v1.18 preimage hashes content.*), so the fail-closed
+    # guard must admit it; a bucket that does not hash it still refuses.
+    try:
+        compute_event_hash_dispatch('v1.18', 7, '2026-10-10T12:00:01+00:00', 'e', 'r', 'gpt-4.1-mini', 'allow',
+                                    0, 0, None, None, None, None, None, None, 'deadbeef' * 8,
+                                    event_kind=EVENT_KIND_LLM_REQUEST, identity=_V1_16_IDENTITY_FIXTURE,
+                                    evaluation_trace=fixture_trace, customer=_V1_18_CUSTOMER_NONE_FIXTURE,
+                                    content=dict(_V1_12_CONTENT_FIXTURE_PAYLOAD))
+        admitted = True
+    except ValueError as e:
+        admitted = False
+        print(f'SELF-TEST assertion 31e FAIL: a v1.18 llm_request with a content attestation was refused: {e}', file=sys.stderr)
+    refused = 0
+    for version in ('v1.9', 'v1.14', 'v1.17'):
+        try:
+            compute_event_hash_dispatch(version, 7, '2026-10-10T12:00:01+00:00', 'e', 'r', 'gpt-4.1-mini', 'allow',
+                                        0, 0, None, None, None, None, None, None, 'deadbeef' * 8,
+                                        event_kind=EVENT_KIND_LLM_REQUEST, content=dict(_V1_12_CONTENT_FIXTURE_PAYLOAD))
+        except ValueError as e:
+            refused += 'content attestation present' in str(e)
+    if admitted and refused == 3:
+        print('SELF-TEST assertion 31e PASS: a v1.18 llm_request keeps its content attestation; v1.9, v1.14 and v1.17 refuse one')
+    else:
+        if admitted:
+            print(f'SELF-TEST assertion 31e FAIL: only {refused} of 3 buckets without content.* in their preimage refused a content attestation', file=sys.stderr)
+        ok = False
+
+    # Assertion 17e — the fail-closed invariant: a join_context on any
     # bucket other than v1.9 is a hard error, not a silently-unhashed field.
     # Mirror of the Rust dispatcher guard. This is the assertion that would
     # have caught the original defect class had it existed: a join key sealed
@@ -2531,18 +4802,18 @@ def run_self_test():
     return ok
 
 
-# MEI-639 — v1.2 fixture hashes. Pinned in BOTH this Python file and
-# the Rust drift_catchers.rs (and verify-pack.py in meilynx-platform per
-# MEI-492). If you change the v1.2 encoding, update all three. The
+# v1.2 fixture hashes. Pinned in BOTH this Python file and
+# the Rust drift_catchers.rs (and verify-pack.py in meilynx-platform).
+# If you change the v1.2 encoding, update all three. The
 # legacy v1 FIXTURE_HASH above stays at ba7a7f3d… (the v1 path is
 # frozen; no encoding change can ever bump it).
 V1_2_LLM_REQUEST_FIXTURE_HASH = "5f85e27ee519003176c2acb8dd287a9c9dfdd1ba0cc41ec3c92e1c56c9869456"
 V1_2_AUTH_SESSION_STARTED_FIXTURE_HASH = "1f3d58eaaf32e85fa96105e66a71943de4ce865d64d896ef1f4afde25aeea7af"
-# MEI-1048 — v1.3 admin.action fixture. Paired with
+# v1.3 admin.action fixture. Paired with
 # meilynx-audit/tests/mei1048_admin_chain_round_trip.rs::mei1048_v1_3_admin_action_fixture_hash_pinned;
 # neither side may drift independently.
 V1_3_ADMIN_ACTION_FIXTURE_HASH = "eb3899be87ed811f84b5616289f0b3dde43344359ca5d772bcb6637d02fb11ea"
-# MEI-925 — v1.4 mcp.* fixtures. Paired with
+# v1.4 mcp.* fixtures. Paired with
 # meilynx-audit/tests/mei925_mcp_chain_round_trip.rs::mei925_v1_4_*_fixture_hash_pinned;
 # neither side may drift independently.
 V1_4_MCP_TOOL_CALL_FIXTURE_HASH = "3563b67d9185df93bf551fec5d2b4e7db82513dcd2805d4708f69958aa6f5525"
@@ -2578,7 +4849,7 @@ _V1_4_MCP_ERROR_FIXTURE_PAYLOAD = dict(
     correlated_event_id='evt-mcp-fixture',
     error_code=-32000,
 )
-# MEI-804 — v1.5 mcp.* fixtures. Paired with
+# v1.5 mcp.* fixtures. Paired with
 # meilynx-audit/tests/mei925_mcp_chain_round_trip.rs::mei925_v1_5_*_fixture_hash_pinned
 # (and the bare-agent pin); neither side may drift independently. v1.5 = v1.4
 # preimage + the principal chain, so the payloads add `principal_chain` and the
@@ -2617,7 +4888,7 @@ _V1_5_MCP_BARE_AGENT_FIXTURE_PAYLOAD = dict(
     _V1_4_MCP_TOOL_CALL_FIXTURE_PAYLOAD,
     principal_chain=_FIXTURE_BARE_AGENT_CHAIN,
 )
-# MEI-1189 — v1.6 mcp.* fixture. Paired with
+# v1.6 mcp.* fixture. Paired with
 # meilynx-audit/tests/mei925_mcp_chain_round_trip.rs::mei1189_v1_6_redacted_tool_call_fixture_hash_pinned;
 # neither side may drift independently. v1.6 = v1.5 preimage + the redacted
 # content address, so the payload adds `redacted_payload_sha256_jcs` and the
@@ -2628,7 +4899,7 @@ _V1_6_MCP_TOOL_CALL_FIXTURE_PAYLOAD = dict(
     _V1_5_MCP_TOOL_CALL_FIXTURE_PAYLOAD,
     redacted_payload_sha256_jcs='5f70bf18a086007016e948b04aed3b82103a36bea41755b6cddfaf10ace3c6ef',
 )
-# MEI-1063 — v1.7 mcp.* enforcement (redact) fixture. Paired with
+# v1.7 mcp.* enforcement (redact) fixture. Paired with
 # meilynx-audit/tests/mei925_mcp_chain_round_trip.rs::mei1063_v1_7_enforcement_tool_call_fixture_hash_pinned;
 # neither side may drift independently. v1.7 = v1.6 preimage + the three
 # enforcement-axis fields (two redaction hashes + hold_id). The payload builds
@@ -2643,7 +4914,7 @@ _V1_7_MCP_TOOL_CALL_FIXTURE_PAYLOAD = dict(
     redaction_pre_sha256_jcs='0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f',
     redaction_post_sha256_jcs='f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0',
 )
-# MEI-1063 — v1.7 mcp.* HOLD fixture. Paired with
+# v1.7 mcp.* HOLD fixture. Paired with
 # meilynx-audit/tests/mei925_mcp_chain_round_trip.rs::mei1063_v1_7_hold_fixture_hash_pinned;
 # neither side may drift independently. The structural inverse of the redact
 # fixture: hold_id is set, both redaction hashes stay absent (a hold is a
@@ -2663,7 +4934,7 @@ _V1_3_ADMIN_FIXTURE_PAYLOAD = dict(
     description="rotated audit encryption key",
     metadata_json='{"key_version":"3"}',
 )
-# MEI-1955 — v1.8 coverage.computed fixture. Paired with
+# v1.8 coverage.computed fixture. Paired with
 # meilynx-audit/tests/mei1955_coverage_chain_round_trip.rs::mei1955_v1_8_coverage_fixture_hash_pinned;
 # neither side may drift independently.
 V1_8_COVERAGE_COMPUTED_FIXTURE_HASH = "0a8cbfc4c91c111f11d4ce404d8c20ecfdcca076e74de380565448d19800652e"
@@ -2682,7 +4953,104 @@ _V1_8_COVERAGE_FIXTURE_PAYLOAD = dict(
     numerator_source='instance_sqlite',
     denominator_fetched_at='2026-08-19T01:00:00Z',
 )
-# MEI-2641 — v1.13 coverage.key_inventory fixture. Paired with
+# v1.15 decision.receipt fixture. Paired with
+# meilynx-audit/tests/mei2989_decision_receipt_chain_round_trip.rs::mei2989_v1_15_decision_receipt_fixture_hash_pinned
+# and the control plane's Mei2989DecisionReceiptSealingTests.PinnedVectorHash;
+# no side may drift independently.
+# v1.16 llm_request fixtures. Paired with the same
+# constants in meilynx-audit (`evaluation_trace.rs` for the outcome digest,
+# `tests/mei3037_evaluation_trace_chain_round_trip.rs` for the hashes);
+# neither side may drift independently.
+_V1_16_OUTCOMES_FIXTURE = {
+    'v': 1,
+    'rules': [{
+        'rule_id': 'payment-risk-policy', 'rule_name': 'Payment risk policy',
+        'stage': 'post_response', 'validator_kind': 'webhook',
+        'outcome': 'matched', 'action': 'block',
+    }],
+    'deciding_rule_id': 'payment-risk-policy',
+    'delivery': {'mode': 'non_streaming', 'outcome': 'withheld'},
+}
+V1_16_OUTCOMES_DIGEST_FIXTURE = "7feba313b876be8fb7cb1efcd2bc6fea4a2650aaed592946047471d3dd9cba38"
+_V1_16_IDENTITY_FIXTURE = {
+    'agent_id': 'agt_fixture', 'tier': 't1', 'credential_kind': 'agent_key',
+    'credential_kid': 'kid-fixture', 'delegated_human': None, 'asserted_digest': 'a' * 64,
+}
+_V1_16_FIXTURE_ARGS = (
+    7, '2026-10-09T16:21:00+00:00', 'evt-v116-fixture', 'req-v116-fixture',
+    'gpt-6-luna', 'block', 452, 70, 522, None, None, None, None, None, 'deadbeef' * 8,
+)
+V1_16_LLM_REQUEST_FIXTURE_HASH = "985cec7081f7c4efab7a745fba9f3aa73e68ea1f9b3f42dc8a51cc38359173cc"
+V1_16_LLM_REQUEST_BARE_FIXTURE_HASH = "254d2401a772b260d64d6fd843b17f0c0147b3306f57af6a35d25ae3c4115bef"
+
+V1_15_DECISION_RECEIPT_FIXTURE_HASH = "4e93ecd462a3acd7a0a73e1fe98317a35fe0da3c1876e8389d4b63c668450682"
+_V1_15_DECISION_RECEIPT_FIXTURE_EVIDENCE = [
+    {"chain_id": "chain-1", "content_digests": {"payload_sha256_jcs": "c" * 64}, "event_hash": "1" * 64,
+     "event_id": "evt-toolcall-1", "role": "ai_contribution", "sequence_number": 6},
+    {"chain_id": "chain-1", "content_digests": {}, "event_hash": "a" * 64,
+     "event_id": "evt-decision-1", "role": "hold", "sequence_number": 7},
+]
+_V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD = dict(
+    receipt_id='0f0e0d0c-0b0a-4908-8706-050403020100',
+    receipt_type='finra-communication-review',
+    receipt_type_version='1',
+    registry_digest='5' * 64,
+    source_kind='mcp_hold',
+    source_ref='hold-' + '7' * 32,
+    subject_ref_sha256=None,
+    evidence_set_sha256=hashlib.sha256(json.dumps(
+        _V1_15_DECISION_RECEIPT_FIXTURE_EVIDENCE, separators=(',', ':'), sort_keys=True, ensure_ascii=False,
+    ).encode('utf-8')).hexdigest(),
+    policy_version='d' * 64,
+    outcome='approved',
+    outcome_reason_code=None,
+    outcome_reason_sha256=None,
+    decider_user_id='11111111-2222-4333-8444-555555555555',
+    decider_role='compliance-officer',
+    decider_identity_provenance=None,
+    credential_status='not_verified',
+    credential_class='registered_principal',
+    credential_registry=None,
+    credential_verified_at=None,
+    procedure_status='not_recorded',
+    procedure_id=None,
+    procedure_version=None,
+    procedure_document_sha256=None,
+    procedure_effective_at=None,
+    clock_rule='finra-3110-review-window@P2D',
+    clock_start_basis='sealed_record',
+    clock_started_at=1790848800,   # 2026-10-01T10:00:00Z
+    clock_deadline_at=1791021600,  # 2026-10-03T10:00:00Z
+    clock_decided_at=1790866800,   # 2026-10-01T15:00:00Z
+    clock_elapsed_seconds=18000,
+    clock_status='within',
+    held_before_use=True,
+    supersedes_receipt_id=None,
+    cp_anchor_event_id='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+    cp_anchor_event_hash='e' * 64,
+    issued_at=1790866801,          # 2026-10-01T15:00:01Z
+    evidence=_V1_15_DECISION_RECEIPT_FIXTURE_EVIDENCE,
+)
+# The lapsed half of the cross-language fixture: the
+# approved fixture with no decision. Paired with
+# mei2989_decision_receipt_chain_round_trip.rs::mei2989_v1_15_lapsed_receipt_fixture_hash_pinned
+# and the control plane's Mei2989DecisionReceiptSealingTests; none may drift
+# independently.
+V1_15_LAPSED_RECEIPT_FIXTURE_HASH = "95439e39ec1b44781952e9a62b56b5acf042f17a774d073cee7e67b9a516090f"
+_V1_15_LAPSED_RECEIPT_FIXTURE_PAYLOAD = dict(
+    _V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD,
+    receipt_id='1f1e1d1c-1b1a-4918-8716-151413121110',
+    outcome='lapsed',
+    decider_user_id=None,
+    decider_role=None,
+    clock_decided_at=None,
+    clock_elapsed_seconds=None,
+    clock_status='lapsed',
+    cp_anchor_event_id='bbbbbbbb-cccc-4ddd-8eee-ffffffffffff',
+    cp_anchor_event_hash='f' * 64,
+    issued_at=1791021660,          # 2026-10-03T10:01:00Z, a minute past the deadline
+)
+# v1.13 coverage.key_inventory fixture. Paired with
 # meilynx-audit/tests/mei2641_key_inventory_chain_round_trip.rs::mei2641_v1_13_key_inventory_fixture_hash_pinned;
 # neither side may drift independently.
 V1_13_COVERAGE_KEY_INVENTORY_FIXTURE_HASH = "92b5fcefc0b1269fd79c3665243219b81ee712372e10d6d0d322a77266bae2b6"
@@ -2708,7 +5076,7 @@ _V1_13_KEY_INVENTORY_FIXTURE_PAYLOAD = dict(
         '"governed":false,"requests":12,"input_tokens":1200,"output_tokens":300}]'
     ),
 )
-# MEI-2151 — v1.9 fixtures: the caller-asserted cross-lane join keys appended
+# v1.9 fixtures: the caller-asserted cross-lane join keys appended
 # to the v1.2-LlmRequest and v1.7-mcp preimages. Paired with
 # meilynx-audit/tests/mei2151_join_context_chain_round_trip.rs; neither side
 # may drift independently.
@@ -2724,7 +5092,7 @@ _V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD = dict(
 V1_9_LLM_REQUEST_FIXTURE_HASH = "7b48689b1658d27c27e149d182297cfd10a168769e50097a482e7dbebbefaf0a"
 V1_9_MCP_TOOL_CALL_FIXTURE_HASH = "d6a68730a4ad2aa3e2ddb8c1534e1f22ff4a5b99a0bce678fdfd5bc12d0e2a14"
 
-# MEI-2424 — v1.10 llm_request fixtures. Paired with
+# v1.10 llm_request fixtures. Paired with
 # meilynx-audit/tests/mei2424_content_chain_round_trip.rs; neither side may
 # drift independently. The stored response digest is deliberately absent so
 # the pin covers its presence tag.
@@ -2738,7 +5106,7 @@ _V1_10_CONTENT_FIXTURE_PAYLOAD = dict(
 V1_10_LLM_REQUEST_FIXTURE_HASH = "e6a655927bfc7e6933aa020de625e3459cd4ce1158dc26c2d564eed923c7eb43"
 V1_10_LLM_REQUEST_JOIN_FIXTURE_HASH = "86b2ab42b6c2cb7b28c750de2d3466210509bcda0ace58fc3340db0d1587214e"
 
-# MEI-2424 — content-digest fixtures. Paired with
+# Content-digest fixtures. Paired with
 # meilynx-proxy/src/audit_capture.rs::content_digests_are_pinned_for_the_verifier:
 # the record's `messages` / `response_text` / `findings` exactly as the proxy
 # serializes them, and the digests the proxy seals over them.
@@ -2756,7 +5124,7 @@ V1_10_DIGEST_FIXTURE_PROMPT = "ba5adc603cb95f7951ed1e2bfb3de1b66d9eeb232ff94af90
 V1_10_DIGEST_FIXTURE_RESPONSE = "ad49d1a5366d1125bfd9a017997b7a28a9de6c669288ec46d42eab12351ecc05"
 V1_10_DIGEST_FIXTURE_FINDINGS = "c39486077115ab8f01410a60ab472c0e7b6e948a59950b4a98d1be5b9b44111b"
 
-# MEI-2456 — v1.11 llm_request fixtures. Paired with
+# v1.11 llm_request fixtures. Paired with
 # meilynx-audit/tests/mei2456_tool_calls_chain_round_trip.rs; neither side may
 # drift independently. The first pin carries both tool-call digests; the join
 # pin carries a hash_only-shaped payload (stored digests absent) so the
@@ -2776,7 +5144,7 @@ _V1_11_HASH_ONLY_CONTENT_FIXTURE_PAYLOAD = dict(
 V1_11_LLM_REQUEST_FIXTURE_HASH = "afd2d6fa30b6de48b227afdec6291e889919af46dc382d96476bd8ebaa2fc2d8"
 V1_11_LLM_REQUEST_JOIN_HASH_ONLY_FIXTURE_HASH = "20da367bc79f4e9f1bfdb4203885b8ce5378c6ad9da33e1536935265f4a3bbfa"
 
-# MEI-2646 — v1.12 fixtures (both lanes). Paired with
+# v1.12 fixtures (both lanes). Paired with
 # meilynx-audit/tests/mei2646_identity_chain_round_trip.rs; neither side may
 # drift independently. The asserted labels are a fully populated object so the
 # RFC 8785 canonicalisation of every field is what the digest pins.
@@ -2837,7 +5205,7 @@ V1_12_LLM_REQUEST_FIXTURE_HASH = "62826a249c726dd87608fa0c05db6387b045b9583e76fa
 V1_12_LLM_REQUEST_BARE_FIXTURE_HASH = "99ab7d921ff414be33abe689efb6671b13b32a274c868c72b4868461c2f29e96"
 V1_12_MCP_TOOL_CALL_FIXTURE_HASH = "c2f71dbf0ff7e00ac709c6b5a4f44222edf2d1ef29324252f6961f8cc6311780"
 
-# MEI-2898 — v1.14 mcp.policy_decision fixtures. Paired with
+# v1.14 mcp.policy_decision fixtures. Paired with
 # meilynx-audit/tests/mei2898_decision_stage_chain_round_trip.rs and the
 # control plane's McpEvidenceChainHasherTests. The first carries every axis
 # forward (redaction, join, a T2 identity) under a tool_result-stage allow; the
@@ -2871,7 +5239,64 @@ _V1_14_MCP_HOLD_FIXTURE_PAYLOAD = dict(
 V1_14_MCP_DECISION_FIXTURE_HASH = "d36fa042cb3e49ada8f7b1807e10251a1a7dd64b9e40317990e38e9aaa3476e6"
 V1_14_MCP_HOLD_FIXTURE_HASH = "b0a1b82c017b9385df9e8e056fc42d23e3e86ff220d947828d5b34c0353e94f2"
 
-# MEI-2456 — tool-call digest fixture. Paired with
+# v1.17 data-reach fixtures. Paired with
+# meilynx-audit/tests/mei2987_data_reach_chain_round_trip.rs and the control
+# plane's McpEvidenceChainHasherTests. The first is the v1.14 decision fixture
+# as a tool_call-stage allow that matched a declared read binding (every
+# earlier axis carried forward, one non-ASCII name so the length prefix is
+# pinned in UTF-8 bytes); the second is the bare shape of a call the merged
+# reach rule refused because no binding matched, with no advertised schema.
+_V1_17_MCP_MATCHED_FIXTURE_PAYLOAD = dict(
+    _V1_14_MCP_DECISION_FIXTURE_PAYLOAD,
+    correlated_event_id='evt-mcp-call',
+    stage='tool_call',
+    data_reach=dict(
+        binding_id='rb_5c1d0e3a7b9f2468', access='read', outcome='matched', schema_known=True,
+        arg_keys=['account_id', 'fields', 'r\u00e9gion'], arg_keys_omitted=1,
+    ),
+)
+_V1_17_MCP_NO_MATCH_FIXTURE_PAYLOAD = dict(
+    _V1_14_MCP_HOLD_FIXTURE_PAYLOAD,
+    tool_name='crm__lookup_account',
+    decision='block',
+    reason='blocked_by_rule:agt_01J9ZK3Q7R8S9T0V1W2X3Y4Z5A.reach.crm__lookup_account',
+    hold_id=None,
+    stage='tool_call',
+    data_reach=dict(
+        binding_id='unbound', access=None, outcome='no_match', schema_known=False,
+        arg_keys=[], arg_keys_omitted=3,
+    ),
+)
+V1_17_MCP_MATCHED_FIXTURE_HASH = "ef39155a691caddfc9e43e16526688b75d1ebf303c0aab019cfebad455c6cdfb"
+V1_17_MCP_NO_MATCH_FIXTURE_HASH = "e4f901d2b831615de9c6ef666f63c1240c4815a5407f8951135a85b55480c91d"
+# v1.18 fixtures on both lanes. Paired with
+# meilynx-audit/tests/mei3097_customer_scope_chain_round_trip.rs and the
+# control plane's McpEvidenceChainHasherTests (v1.18); no side may drift
+# independently. `bank-a`'s digest is the known answer every side pins.
+V1_18_CUSTOMER_LABEL_FIXTURE_DIGEST = "c21eb9bf8ae659a9e14fe4ee47dfeb9e2c56af8d865ad3e3edf26107919c2e59"
+_V1_18_CUSTOMER_CREDENTIAL_FIXTURE = {
+    'label_sha256': V1_18_CUSTOMER_LABEL_FIXTURE_DIGEST, 'source': 'credential', 'credential_kid': 'kid-fixture',
+}
+_V1_18_CUSTOMER_ASSERTED_FIXTURE = {
+    'label_sha256': "077e4916f96423e22060e2a7445e6eace3dd4e7319bc0edb5957770185f95a4a", 'source': 'asserted',
+}
+_V1_18_CUSTOMER_NONE_FIXTURE = {'source': 'none'}
+# LLM lane: the v1.16 evaluated request, credential-bound (the identity's kid
+# carries the label); the same request asserted-only; a refusal sealed before
+# evaluation (no identity, no trace) with no label.
+V1_18_LLM_CREDENTIAL_FIXTURE_HASH = "2b80c5920d2eb52f890cab191a866b402fa2827bef69bed9d5960873735fa396"
+V1_18_LLM_ASSERTED_FIXTURE_HASH = "6dd5a049c7a2297e009996c4701d4d419fb37d2768771c43c9977ad2cc80c2c4"
+V1_18_LLM_BARE_FIXTURE_HASH = "7a362892cf3a8690454411162f92fe217658445c03ea0774d17e33d3104c3509"
+# MCP lane: the v1.17 matched decision (T2 identity, join keys, data_reach)
+# credential-bound; a bare v1.5-shaped tool_call record (no identity, no
+# stage, no reach) with no label.
+_V1_18_MCP_CUSTOMER_CREDENTIAL_FIXTURE = {
+    'label_sha256': V1_18_CUSTOMER_LABEL_FIXTURE_DIGEST, 'source': 'credential', 'credential_kid': 'a7f3k2m9p4q8r1s6',
+}
+V1_18_MCP_MATCHED_CREDENTIAL_FIXTURE_HASH = "1545ab0c02e19d6651d9ba2d4c9041c4482903fb7f7a41ebd590b7c93c700194"
+V1_18_MCP_TOOL_CALL_NONE_FIXTURE_HASH = "a19ca9ced54f811a0c2f0b84e86e3d7541272e28f12b12f5d5c0aafb9ad113e6"
+
+# Tool-call digest fixture. Paired with
 # meilynx-proxy/src/audit_capture.rs::tool_call_digests_are_pinned_for_the_verifier:
 # the record's `tool_calls` exactly as the proxy serializes them, and the
 # digests the proxy seals over them (as captured, and under `redacted`, where
@@ -2910,7 +5335,7 @@ def action_str(event):
     Extract the action string from the stored event JSON.
     GovernanceAction serializes as its snake_case string ("allow", "warn",
     "redact", "mask_output", "hold", "block") and is hashed verbatim.
-    MEI-2897 — "hold" is a held MCP call waiting on approval; records sealed
+    "hold" is a held MCP call waiting on approval; records sealed
     before it carry "block" for a held call, with mcp_event.decision
     "require_approval" and an rbac_require_approval_hold reason.
     """
@@ -2922,16 +5347,16 @@ def action_str(event):
 
 
 def recompute_event_hash(event, seq, previous_hash):
-    """MEI-1096 — recompute one event's hash from its exported WORM JSON,
+    """Recompute one event's hash from its exported WORM JSON,
     dispatching on schema_version + event_kind exactly as the Rust writer /
     verifier does (compute_event_hash_dispatch in sqlite.rs).
 
     THIS is the production recompute path verify_manifest walks. Before
-    MEI-1096 the record loop called the frozen v1 `compute_event_hash`
+    the fix the record loop called the frozen v1 `compute_event_hash`
     unconditionally, so every v1.2 auth.session_started and v1.3 admin.action
     event in a real pack failed verification even though the chain was intact
     — the reproducer's own self-test exercised the dispatch functions but not
-    this loop (MEI-618 class: the test never traversed the production path).
+    this loop (the test never traversed the production path).
     run_self_test now drives THIS helper with synthetic v1.2/v1.3 events.
     """
     ts = normalize_timestamp(event.get('timestamp_utc', ''))
@@ -2939,7 +5364,7 @@ def recompute_event_hash(event, seq, previous_hash):
     serde_kind = event.get('event_kind')  # None → default LlmRequest (field omitted)
     if serde_kind not in SERDE_EVENT_KIND_TO_WIRE:
         raise ValueError(
-            f"MEI-1096: unknown event_kind {serde_kind!r} in exported event — "
+            f"unknown event_kind {serde_kind!r} in exported event — "
             f"this reproducer has no hash branch for it. Update verify-pack.py."
         )
     return compute_event_hash_dispatch(
@@ -2967,6 +5392,9 @@ def recompute_event_hash(event, seq, previous_hash):
         content=event.get('content'),
         identity=event.get('identity'),
         coverage_key_inventory=event.get('coverage_key_inventory'),
+        decision_receipt=event.get('decision_receipt'),
+        evaluation_trace=event.get('evaluation_trace'),
+        customer=event.get('customer'),
     )
 
 
@@ -2978,7 +5406,7 @@ def record_file_name(seq):
 
 
 # ---------------------------------------------------------------------------
-# Record objects: per-record and segment layouts (ADR-0081, MEI-2863)
+# Record objects: per-record and segment layouts
 #
 # A managed proxy's run chain may store its records as segment objects, each
 # holding a contiguous range of records: `{first:020}-{last:020}.seg`, whose
@@ -3003,7 +5431,7 @@ _SEGMENT_CACHE_SIZE = 8
 
 
 def record_object_range(name):
-    """ADR-0081 D6: the inclusive range [first, last] of sequences the object
+    """The inclusive range [first, last] of sequences the object
     `name` (relative to the chain prefix) holds, or None when it is not a
     record object. `{n:020}.bin` holds [n, n]; `{a:020}-{b:020}.seg` holds
     [a, b] when a <= b and it holds at most SEGMENT_MAX_RECORDS records."""
@@ -3020,7 +5448,7 @@ def record_object_range(name):
 
 
 def split_segment(body, first, last):
-    """ADR-0081 D2: the records a segment body holds, in sequence order, each
+    """The records a segment body holds, in sequence order, each
     byte-identical to the `{seq:020}.bin` object it replaces. Compact JSON
     escapes line feeds inside strings, so splitting on 0x0A is exact. Raises
     ValueError unless the body holds exactly last - first + 1 records, each
@@ -3039,7 +5467,7 @@ class RecordNotFound(FileNotFoundError):
 
 
 class SegmentFork(ValueError):
-    """Two objects hold different bytes for one sequence (ADR-0081 D7)."""
+    """Two objects hold different bytes for one sequence."""
 
 
 class ChainRecords:
@@ -3073,7 +5501,7 @@ class ChainRecords:
         """Index every record object that can hold a sequence in [lo, hi]."""
         try:
             names = self._list_names(lo, hi)
-        except Exception as exc:  # ADR-0013 A: propagate loud — every record in the window then fails its fetch
+        except Exception as exc:  # Propagate loud — every record in the window then fails its fetch
             self._failed.append((lo, hi, exc))
             raise OSError(f"cannot list the chain's record objects: {exc}") from exc
         for name in names:
@@ -3083,7 +5511,7 @@ class ChainRecords:
             if span is None:
                 if _SEGMENT_OBJECT_NAME.fullmatch(name):
                     self._report(f"NOTICE: {name} is not a record object: a segment holds from 1 to "
-                                 f"{SEGMENT_MAX_RECORDS} records, first <= last (ADR-0081 D6)")
+                                 f"{SEGMENT_MAX_RECORDS} records, first <= last")
                 self._indexed.add(name)
                 continue
             self._indexed.add(name)
@@ -3167,8 +5595,8 @@ def local_fetcher(records_path, report=print):
 
     `records_path` is either:
       - a directory holding the chain's record objects as the bucket stores
-        them, `<seq:020d>.bin` and `<first:020d>-<last:020d>.seg` in any mix
-        (ADR-0081), or files named `<seq:020d>.json`; or
+        them, `<seq:020d>.bin` and `<first:020d>-<last:020d>.seg` in any mix,
+        or files named `<seq:020d>.json`; or
       - a single `.jsonl` file (one record per line) / `.json` file (an
         array of records), each record carrying its own `sequence_number`.
     """
@@ -3240,7 +5668,7 @@ def timestamp_recording_fetcher(fetch, times):
         try:
             times[seq] = _epoch_of_record(json.loads(raw))
         except (ValueError, TypeError, AttributeError):
-            pass  # ADR-0013 A: deliberately swallowed — the chain walk reports an unreadable record itself
+            pass  # Deliberately swallowed — the chain walk reports an unreadable record itself
         return raw
 
     return fetch_and_record
@@ -3264,9 +5692,11 @@ def manifest_sequence_window(manifest):
 
 def manifest_storage_layout_error(manifest):
     """None when the manifest's storage layout is one this verifier reads (a
-    manifest before 1.2 has none: its chain is per-record), else the message
-    to print before exiting 2. ADR-0081 D9."""
-    if manifest.get("schema_version") != "1.2":
+    manifest before 1.2 has none: its chain is per-record; a 1.3 manifest has
+    one only when its chain is segmented), else the message to print
+    before exiting 2."""
+    version = manifest.get("schema_version")
+    if version != "1.2" and not (version in ("1.3", "1.4", "1.5") and "storage_layout" in manifest):
         return None
     layout = manifest.get("storage_layout")
     if layout in STORAGE_LAYOUTS:
@@ -3276,7 +5706,7 @@ def manifest_storage_layout_error(manifest):
 
 
 def object_reference_problem(entry, holders=None):
-    """Manifest 1.2 (ADR-0081 D9): None when the entry's `object` reference
+    """Manifest 1.2: None when the entry's `object` reference
     names a record object that holds the entry's sequence at `index`, else
     the problem. With `holders` (--bucket mode) the bucket listing must also
     show that object holding the sequence. An offline directory is not
@@ -3296,7 +5726,48 @@ def object_reference_problem(entry, holders=None):
     return None
 
 
-def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=False, holders=None):
+def manifest_references_objects(manifest):
+    """Whether each manifest entry names the object holding its record: every
+    1.2 manifest, and a 1.3, 1.4 or 1.5 manifest that has a storage_layout."""
+    version = manifest.get('schema_version')
+    return version == '1.2' or (version in ('1.3', '1.4', '1.5') and 'storage_layout' in manifest)
+
+
+# The event_id a hash-only stub stands in with, for the decision
+# receipt evidence check: its hash is in the pack, its event_id is not.
+STUB_EVENT_ID = object()
+
+
+def stub_problems(stub, seq, entry, require_manifest_hash=False):
+    """What is wrong with a hash-only stub at `seq` against its
+    manifest entry: members other than STUB_FIELDS, a missing hash, another
+    sequence, or an event_hash that is not the one the manifest signs."""
+    if not isinstance(stub, dict):
+        return ["a hash-only stub is a JSON object"]
+    problems = []
+    extra = sorted(set(stub) - set(STUB_FIELDS))
+    if extra:
+        problems.append(f"it carries more than its coordinates ({', '.join(extra)})")
+    missing = [k for k in ('sequence_number', 'event_hash', 'previous_hash') if not isinstance(stub.get(k), (str, int))
+               or isinstance(stub.get(k), bool)]
+    if missing:
+        problems.append(f"it has no {', '.join(missing)}")
+    if stub.get('sequence_number') != seq:
+        problems.append(f"it says sequence_number {stub.get('sequence_number')!r}")
+    stub_hash = stub.get('event_hash')
+    manifest_recomputed = entry.get('recomputed_event_hash', '')
+    if require_manifest_hash and not manifest_recomputed:
+        problems.append("its manifest entry has no recomputed_event_hash, so the manifest signature does not cover it")
+    for key in ('recomputed_event_hash', 'stored_event_hash'):
+        held = entry.get(key, '')
+        if held and stub_hash != held:
+            problems.append(f"event_hash {str(stub_hash)[:16]}... is not the manifest's {key} {str(held)[:16]}...")
+    return problems
+
+
+def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=False, holders=None,
+                         receipts_out=None, records_out=None, stripped=frozenset(), cannot_evaluate_out=None,
+                         stubs=None):
     """Walk each event in the manifest, fetch its record through `fetch(seq)`,
     recompute the hash and check the chain linkage. Source-agnostic: `fetch`
     is the only thing that differs between the GCS and the offline path, so
@@ -3308,7 +5779,26 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
     record outside what the signature covers.
 
     `holders(seq)`, in --bucket mode, lists the objects holding a sequence,
-    against which a manifest 1.2 entry's object reference is checked."""
+    against which a manifest 1.2 entry's object reference is checked.
+
+    `receipts_out`, when given, is filled with each decision receipt record's
+    sequence -> payload, for the control-plane anchor check.
+
+    `stripped` is the removed-field set of a content-stripped
+    Exchange pack (STRIPPED_FIELDS), empty otherwise. Each record must then
+    carry none of those fields and none of WITHHELD_FIELDS; every one it does
+    carry is reported as CANNOT EVALUATE and appended, as (seq, problem), to
+    `cannot_evaluate_out`, which the caller turns into exit 2. The content
+    axes the pack removed are checked from their sealed digests only.
+
+    `stubs` (sequence -> (reason, field), from manifest_stubs) are
+    the records a stripped pack ships as hash-only stubs. A stub is checked
+    by its coordinates: exactly STUB_FIELDS, its own sequence, the event_hash
+    the manifest signs, and the link to the record before it. Its hash is not
+    recomputed (that needs the body), and the record after it links to its
+    event_hash. A stub of an unreadable record attests nothing and fails, as
+    the record itself would."""
+    stubs = stubs or {}
     hash_version = manifest.get('hash_version', '')
     if hash_version not in SUPPORTED_HASH_VERSIONS:
         print(
@@ -3320,7 +5810,7 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
 
     genesis = genesis_hash()
 
-    # MEI-2476 — the hashes the next record's previous_hash may link to. After
+    # The hashes the next record's previous_hash may link to. After
     # a record that passed, exactly the hash it verified at. After a record
     # that failed, every hash the pack commits to for it: its own event_hash
     # (when readable) and the manifest entry's stored_event_hash and
@@ -3348,7 +5838,7 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
         }
 
     all_passed = True
-    references_objects = manifest.get('schema_version') == '1.2'
+    references_objects = manifest_references_objects(manifest)
     events_in_manifest = manifest.get('events', [])
     if not events_in_manifest:
         print("WARN: manifest.events is empty — nothing to verify.")
@@ -3357,6 +5847,11 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
     def report(line):
         if not quiet:
             print(line)
+
+    # What the decision-receipt checks after the walk read: each
+    # record's (event_id, event_hash) by sequence, and each receipt's payload.
+    pack_records = {}
+    receipts = {}
 
     for entry in sorted(events_in_manifest, key=lambda e: e['sequence']):
         seq = entry['sequence']
@@ -3380,11 +5875,58 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             all_passed = False
             continue
 
+        # A hash-only stub: linked through, never recomputed.
+        if seq in stubs:
+            reason, field = stubs[seq]
+            record = event if isinstance(event, dict) else {}
+            if stripped:
+                for problem in stripped_record_problems(record):
+                    report(f"CANNOT EVALUATE seq={seq}: {problem}")
+                    if cannot_evaluate_out is not None:
+                        cannot_evaluate_out.append((seq, problem))
+            stub_hash = record.get('event_hash') if isinstance(record.get('event_hash'), str) else ''
+            stub_prev = record.get('previous_hash') if isinstance(record.get('previous_hash'), str) else ''
+            pack_records[seq] = (STUB_EVENT_ID, stub_hash)
+            next_link = committed_hashes(entry, stub_hash)
+            if reason == 'unreadable_record':
+                report(f"FAIL seq={seq}: hash-only stub of a record that does not parse (the chain's own break); "
+                       f"nothing in the pack attests its hash.")
+                all_passed = False
+                continue
+            problems = stub_problems(event, seq, entry, require_manifest_hash)
+            if link_targets and stub_prev not in link_targets:
+                expected = ' or '.join(f"{h[:16]}..." for h in sorted(link_targets))
+                problems.append(f"chain break. previous_hash={stub_prev[:16]}... expected={expected}")
+            if problems:
+                report(f"FAIL seq={seq}: hash-only stub ({field}): {'; '.join(problems)}")
+                all_passed = False
+                continue
+            if not link_targets:
+                report(f"WARN seq={seq}: hash-only stub hash={stub_hash[:16]}..., but its chain link to "
+                       f"seq={link_seq} was not checked, because that record failed and nothing in the pack "
+                       f"attests its hash.")
+            else:
+                report(f"STUB seq={seq} hash={stub_hash[:16]}... chain_ok: hash-only stub, {field} "
+                       f"({STUB_REASONS[reason]}); body withheld, hash not recomputed")
+            next_link = {stub_hash}
+            continue
+
         stored_prev = event.get('previous_hash', '')
         stored_hash = event.get('event_hash', '')
         next_link = committed_hashes(entry, stored_hash)
+        pack_records[seq] = (event.get('event_id'), stored_hash)
+        if records_out is not None:
+            records_out[seq] = event
+        if isinstance(event.get('decision_receipt'), dict):
+            receipts[seq] = event['decision_receipt']
+        # A stripped pack's record carries nothing the profile removes.
+        if stripped:
+            for problem in stripped_record_problems(event):
+                report(f"CANNOT EVALUATE seq={seq}: {problem}")
+                if cannot_evaluate_out is not None:
+                    cannot_evaluate_out.append((seq, problem))
 
-        # MEI-1096 — dispatch on the event's own schema_version + event_kind
+        # Dispatch on the event's own schema_version + event_kind
         # (v1/v1.1 llm, v1.2 auth, v1.3 admin), the same recompute path
         # run_self_test exercises. Timestamp normalization + action extraction
         # happen inside recompute_event_hash.
@@ -3394,25 +5936,52 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             report(f"FAIL seq={seq}: {exc}")
             all_passed = False
             continue
+        except (KeyError, TypeError, AttributeError, struct.error) as exc:
+            # A field the preimage reads is missing or has the wrong
+            # shape: the record fails by name, never a traceback.
+            report(f"FAIL seq={seq}: the record is malformed and has no defined preimage "
+                   f"({type(exc).__name__}: {exc})")
+            all_passed = False
+            continue
 
         hash_ok = (recomputed == stored_hash)
         link_checked = bool(link_targets)
         chain_ok = not link_checked or (isinstance(stored_prev, str) and stored_prev in link_targets)
 
-        # MEI-2424 — a v1.10 record's hash covers the digests of its content;
+        # A v1.10 record's hash covers the digests of its content;
         # this checks the content itself still matches them.
         content_ok = True
-        for problem in check_llm_content(event):
+        for problem in check_llm_content(event, stripped):
             report(f"FAIL seq={seq}: {problem}")
             all_passed = False
             content_ok = False
-        # MEI-2646 — a v1.12 record's hash covers the digest of its asserted
+        # A v1.12 record's hash covers the digest of its asserted
         # labels; this checks the stored labels still match it.
-        for problem in check_sealed_identity(event):
+        for problem in check_sealed_identity(event, stripped):
             report(f"FAIL seq={seq}: {problem}")
             all_passed = False
             content_ok = False
-        # MEI-2863 — a manifest 1.2 entry names the object holding its record.
+        # A v1.15 record's hash covers the digest of its evidence list
+        # and its sealed clock verdict; this checks the stored list and the
+        # arithmetic still match them.
+        for problem in check_decision_receipt(event):
+            report(f"FAIL seq={seq}: {problem}")
+            all_passed = False
+            content_ok = False
+        # A v1.16 record's hash covers the digest of its evaluation
+        # outcomes; this checks the stored outcomes still match it.
+        for problem in check_evaluation_trace(event):
+            report(f"FAIL seq={seq}: {problem}")
+            all_passed = False
+            content_ok = False
+        # A v1.18 record's hash covers its customer block; this
+        # checks the block is one the resolver produces and, when the plain
+        # label is stored beside it, that the sealed digest is the label's.
+        for problem in check_customer_scope(event):
+            report(f"FAIL seq={seq}: {problem}")
+            all_passed = False
+            content_ok = False
+        # A manifest 1.2 entry names the object holding its record.
         if references_objects:
             problem = object_reference_problem(entry, holders)
             if problem:
@@ -3460,11 +6029,31 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
         elif content_ok:
             next_link = {stored_hash}
 
+    # Each receipt's evidence against the records in
+    # this pack, then the manifest's receipt index against the receipts.
+    window_seqs = {e['sequence'] for e in events_in_manifest}
+    pack_chain = chain_for_prefix(manifest.get('prefix', 'audit/'))
+    for seq, receipt in sorted(receipts.items()):
+        failures, warnings = receipt_evidence_findings(seq, receipt, pack_chain, pack_records, window_seqs)
+        for line in warnings:
+            report(line)
+        for problem in failures:
+            report(f"FAIL seq={seq}: {problem}")
+            all_passed = False
+    failures, lines = receipt_index_findings(manifest, receipts, window_seqs, set(pack_records))
+    for problem in failures:
+        report(f"FAIL decision_receipts: {problem}")
+        all_passed = False
+    for line in lines:
+        report(line)
+    if receipts_out is not None:
+        receipts_out.update(receipts)
+
     return all_passed
 
 
 # ---------------------------------------------------------------------------
-# Signed packs (window B): Sigstore bundle verification (MEI-922)
+# Signed packs (window B): Sigstore bundle verification
 #
 # A window B pack ships `manifest.json.sigstore.json`: a Sigstore bundle
 # (media type v0.3) that cosign writes when it signs `manifest.json`
@@ -3497,6 +6086,16 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
 PINNED_SIGNER_IDENTITY = "https://github.com/Meilynx/meilynx-proxy/.github/workflows/integrity-pack-signed.yml@refs/heads/main"
 PINNED_OIDC_ISSUER = "https://token.actions.githubusercontent.com"
 
+# The second identity class: a per-tenant signer, a Google service account that can read
+# only its own tenant's audit bucket. Fulcio records Google's issuer and the
+# account's email as an rfc822Name subjectAltName. There is no default for
+# this class and no pattern: the reader passes the exact email the evidence
+# holder published for the project (--certificate-identity), because anyone
+# can create a Google service account, and only the published identity binds
+# the pack to that tenant. A pack signed in this class without an identity
+# from the reader cannot be evaluated (exit 2); it never passes.
+GOOGLE_OIDC_ISSUER = "https://accounts.google.com"
+
 SIGNATURE_METHOD_COSIGN_KEYLESS = "cosign-sigstore-keyless"
 SIGSTORE_BUNDLE_MEDIA_TYPES = {
     "application/vnd.dev.sigstore.bundle.v0.3+json",
@@ -3528,6 +6127,16 @@ class SignatureInvalid(Exception):
 class SignatureUnsupported(Exception):
     """The signature uses a method or format this verifier does not know.
     Exit 2, the same as an unknown hash_version: update the verifier."""
+
+
+class SignerIdentityRequired(Exception):
+    """A valid signature by a per-tenant signer (GOOGLE_OIDC_ISSUER), checked
+    without an identity from the reader. Exit 2: the verifier cannot decide
+    whose pack this is, and the certificate cannot vouch for itself."""
+
+    def __init__(self, identities):
+        super().__init__(", ".join(identities) or "no identity")
+        self.identities = identities
 
 
 # Sigstore public-good trust anchors, copied from sigstore/root-signing
@@ -3859,8 +6468,8 @@ def ecdsa_verify_der(c, public_point, digest, signature_der):
 
 
 # ── RSA (PKCS#1 v1.5 and PSS) and the signature backend ───────────────────
-# Verification only, over public inputs, for RFC 3161 timestamp tokens
-# (MEI-2758). PKCS#1 v1.5 rebuilds the whole k-byte encoding and compares it,
+# Verification only, over public inputs, for RFC 3161 timestamp tokens.
+# PKCS#1 v1.5 rebuilds the whole k-byte encoding and compares it,
 # never parsing the decrypted block, so there is no lenient-parser
 # forgery surface (Bleichenbacher 2006). PSS is EMSA-PSS-VERIFY (RFC 8017
 # §9.1.2) with MGF1 over the signature hash and a salt as long as that hash.
@@ -4147,8 +6756,9 @@ class Certificate:
             out.add(_der_oid(value[vcs:vce]))
         return out
 
-    def san_values(self):
-        """URI and email subjectAltName values."""
+    def san_values(self, tags=(0x81, 0x86)):
+        """URI and email subjectAltName values; `tags=(0x81,)` for the email
+        (rfc822Name) values only."""
         ext = self.extensions.get(OID_SUBJECT_ALT_NAME)
         if ext is None:
             return []
@@ -4158,7 +6768,7 @@ class Certificate:
             raise DerError("malformed subjectAltName")
         out = []
         for tag, vcs, vce, _ in _der_children(value, cs, ce):
-            if tag in (0x81, 0x86):  # rfc822Name, uniformResourceIdentifier
+            if tag in tags:  # 0x81 rfc822Name, 0x86 uniformResourceIdentifier
                 out.append(value[vcs:vce].decode("ascii"))
         return out
 
@@ -4372,11 +6982,16 @@ def _utc(epoch):
 
 # ── Bundle ─────────────────────────────────────────────────────────────────
 
-def verify_sigstore_bundle(bundle, artifact_digest, expected_identity, expected_issuer, trust):
+def verify_sigstore_bundle(bundle, artifact_digest, expected_identity, expected_issuer, trust,
+                           identity_supplied=True):
     """Verify a Sigstore bundle (v0.3, hashedrekord, Rekor v1) over an artifact
     whose SHA-256 is `artifact_digest`. Returns a dict describing the verified
-    signer. Raises SignatureInvalid (with one of the REASON_* values) or
-    SignatureUnsupported."""
+    signer. Raises SignatureInvalid (with one of the REASON_* values),
+    SignatureUnsupported, or SignerIdentityRequired when the certificate is a
+    per-tenant signer's (GOOGLE_OIDC_ISSUER) and `identity_supplied` is False:
+    the reader gave no identity, so the default (the signing workflow) is all
+    there is to compare with, and a per-tenant pack is checked only against
+    the identity its holder published."""
     if not isinstance(bundle, dict):
         raise SignatureInvalid(REASON_MALFORMED, "bundle is not a JSON object")
     media_type = bundle.get("mediaType")
@@ -4492,12 +7107,17 @@ def verify_sigstore_bundle(bundle, artifact_digest, expected_identity, expected_
             f"logged at {_utc(integrated_time)}, certificate valid {_utc(leaf.not_before)} to {_utc(leaf.not_after)}",
         )
 
-    # 6. The certificate names the expected signer.
+    # 6. The certificate names the expected signer. A per-tenant signer
+    # (Google issuer) is named by an email SAN only, and only an identity the
+    # reader supplied can match it.
     try:
-        identities = leaf.san_values()
         issuer = leaf.fulcio_issuer()
+        per_tenant = issuer == GOOGLE_OIDC_ISSUER
+        identities = leaf.san_values((0x81,) if per_tenant else (0x81, 0x86))
     except (DerError, UnicodeDecodeError) as exc:
         raise SignatureInvalid(REASON_MALFORMED, f"signing certificate identity: {exc}")
+    if per_tenant and not identity_supplied:
+        raise SignerIdentityRequired(identities)
     if expected_identity not in identities:
         raise SignatureInvalid(
             REASON_IDENTITY_MISMATCH,
@@ -4509,6 +7129,7 @@ def verify_sigstore_bundle(bundle, artifact_digest, expected_identity, expected_
     return {
         "identity": expected_identity,
         "issuer": issuer,
+        "per_tenant": per_tenant,
         "integrated_time": integrated_time,
         "log_index": log_index,
         "log_url": log["url"],
@@ -4530,9 +7151,11 @@ def pack_is_signed(manifest):
 
 
 def check_pack_signature(manifest, manifest_bytes, read_sibling, expected_identity,
-                         expected_issuer, trust):
+                         expected_issuer, trust, identity_supplied=True):
     """Verify a signed pack's signature. `read_sibling(name)` returns the bytes
-    of a file next to manifest.json, or None when it does not exist."""
+    of a file next to manifest.json, or None when it does not exist.
+    `identity_supplied` is False when the reader passed no
+    --certificate-identity (see verify_sigstore_bundle)."""
     descriptor = manifest.get("signature")
     if not isinstance(descriptor, dict):
         raise SignatureInvalid(REASON_SIGNATURE_MISSING, "the manifest is signed-mode but has no signature descriptor")
@@ -4552,6 +7175,7 @@ def check_pack_signature(manifest, manifest_bytes, read_sibling, expected_identi
     try:
         return verify_sigstore_bundle(
             bundle, hashlib.sha256(manifest_bytes).digest(), expected_identity, expected_issuer, trust,
+            identity_supplied=identity_supplied,
         )
     except (AttributeError, TypeError, KeyError, IndexError, ValueError, UnicodeDecodeError) as exc:
         # A bundle whose structure is not what the format defines (a field of
@@ -4591,7 +7215,7 @@ UNSIGNED_NOTICE = (
 )
 
 
-# ── Chain-head anchors (MEI-2758, ADR-0075) ────────────────────────────────
+# ── Chain-head anchors ────────────────────────────────
 # RFC 3161 timestamp tokens over chain-head statements, stored next to the
 # chain as anchors/{chain}/{seq:020}.json (the statement) and
 # anchors/{chain}/{seq:020}.{tsa_id}.tsr (one token per witness). Every rule
@@ -4869,7 +7493,7 @@ class TsaRoot:
         return self.start <= t <= self.end
 
 
-# ADR-0075 D10 pins. Each root's SHA-256 is asserted when it is loaded.
+# Pinned trust roots. Each root's SHA-256 is asserted when it is loaded.
 TSA_TRUST_ROOTS = {
     "sigstore": [(
         "sigstore-tsa-selfsigned (sigstore/root-signing trusted_root.json @ c9bda74)",
@@ -4934,7 +7558,7 @@ def load_pinned_tsa_roots():
 
 def load_tsa_roots_pem(tsa_id, text):
     """--tsa-root ID=FILE: PEM certificates trusted for witness `tsa_id`, each
-    only within its own notBefore..notAfter (ADR-0075 D10)."""
+    only within its own notBefore..notAfter."""
     blocks = re.findall(r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", text, re.S)
     leftover = re.sub(r"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----", "", text, flags=re.S)
     if not blocks or leftover.strip():
@@ -5470,13 +8094,13 @@ class BucketAnchorSource(AnchorSource):
         try:
             blobs = self.client.list_blobs(self.bucket_name, prefix=self.prefix)
             return [b.name[len(self.prefix):] for b in blobs]
-        except Exception as exc:  # ADR-0013 A: propagate loud — an unlistable bucket cannot be evaluated
+        except Exception as exc:  # Propagate loud — an unlistable bucket cannot be evaluated
             raise AnchorSourceError(f"cannot list gs://{self.bucket_name}/{self.prefix}: {exc}") from exc
 
     def get(self, name):
         try:
             return self.bucket.blob(self.prefix + name).download_as_bytes()
-        except Exception as exc:  # ADR-0013 A: NotFound is "absent" (judged as missing); anything else propagates
+        except Exception as exc:  # NotFound is "absent" (judged as missing); anything else propagates
             if type(exc).__name__ == "NotFound":
                 return None
             raise AnchorSourceError(f"cannot read gs://{self.bucket_name}/{self.prefix}{name}: {exc}") from exc
@@ -5534,15 +8158,22 @@ def _iso(t):
     return _utc(int(t))
 
 
-def _read_record(record_fetch, seq):
+def _read_record(record_fetch, seq, stubs=frozenset()):
     """(event, recomputed event hash) for the chain record at `seq`, or an
-    AnchorFailure naming why it could not be read."""
+    AnchorFailure naming why it could not be read. For a hash-only
+    stub (`seq` in `stubs`) the hash is the stub's event_hash, which the chain
+    walk checks against the signed manifest and the link; a stub's hash cannot
+    be recomputed without its body."""
     try:
         raw = record_fetch(seq)
-    except Exception as exc:  # ADR-0013 A: fail-closed — any fetch error (GCS NotFound, OSError) fails the check
+    except Exception as exc:  # Fail-closed — any fetch error (GCS NotFound, OSError) fails the check
         raise AnchorFailure("record_unreadable", f"{type(exc).__name__}: {exc}")
     try:
         event = json.loads(raw)
+        if seq in stubs:
+            if not isinstance(event.get("event_hash"), str):
+                raise ValueError("hash-only stub without an event_hash")
+            return event, event["event_hash"]
         return event, recompute_event_hash(event, seq, event.get("previous_hash", ""))
     except (ValueError, KeyError, TypeError, AttributeError) as exc:
         raise AnchorFailure("record_unreadable", str(exc))
@@ -5569,7 +8200,7 @@ class _AnchorCheck:
         self.cannot = True
 
 
-def _verify_one_anchor(seq, chain, source, record_fetch, roots_for, listed_tokens, check, label):
+def _verify_one_anchor(seq, chain, source, record_fetch, roots_for, listed_tokens, check, label, stubs=frozenset()):
     """Verify the statement and every token stored for `seq`. Returns
     (earliest gen_time, verified witness ids) or None after reporting."""
     raw = source.get(f"{seq:020d}.json")
@@ -5589,10 +8220,13 @@ def _verify_one_anchor(seq, chain, source, record_fetch, roots_for, listed_token
         check.fail(f"FAIL anchor seq={seq}: {label}statement does not name chain {chain} at this sequence")
         return None
     try:
-        event, recomputed = _read_record(record_fetch, seq)
+        event, recomputed = _read_record(record_fetch, seq, stubs)
     except AnchorFailure as exc:
         check.fail(f"FAIL anchor seq={seq}: {label}cannot read the anchored record ({exc.detail})")
         return None
+    if seq in stubs:
+        print(f"NOTICE anchor seq={seq}: the anchored record is a hash-only stub; its event_hash is the one the "
+              f"manifest signs and the chain links, not recomputed")
     if head["event_hash"] != recomputed or event.get("event_hash") != recomputed:
         check.fail(
             f"FAIL anchor seq={seq}: {label}anchored head event_hash does not match the record "
@@ -5671,7 +8305,7 @@ def records_clock_ahead(covering, lo, record_epoch):
         try:
             when = record_epoch(seq)
         except ValueError:
-            unreadable += 1  # ADR-0013 A: deliberately counted, not failed — the chain check judges the record
+            unreadable += 1  # Deliberately counted, not failed — the chain check judges the record
             continue
         if when > earliest + ANCHOR_CLOCK_TOLERANCE_SECONDS:
             ahead += 1
@@ -5749,14 +8383,14 @@ def verify_anchors(manifest, record_fetch, source, roots_for, record_times=None)
         return CANNOT_EVALUATE
     try:
         return _verify_listed_and_found(anchoring, entry, listed, seals, (lo, hi), record_fetch, source,
-                                        roots_for, check, record_times or {})
+                                        roots_for, check, record_times or {}, frozenset(manifest_stubs(manifest)))
     except OSError as exc:
         print(f"ERROR: cannot read the anchor objects ({exc})", file=sys.stderr)
         return CANNOT_EVALUATE
 
 
 def _verify_listed_and_found(anchoring, entry, listed, seals, window, record_fetch, source, roots_for, check,
-                             record_times):
+                             record_times, stubs=frozenset()):
     chain, reason = entry["chain"], entry["reason"]
     lo, hi = window
     covered = []
@@ -5772,7 +8406,7 @@ def _verify_listed_and_found(anchoring, entry, listed, seals, window, record_fet
             check.fail(f"FAIL anchor seq={seq}: statement key does not match the anchor layout")
             continue
         listed_tokens = {"statement_sha256": a["statement"]["sha256"], "tokens": a["tokens"]}
-        result = _verify_one_anchor(seq, chain, source, record_fetch, roots_for, listed_tokens, check, "")
+        result = _verify_one_anchor(seq, chain, source, record_fetch, roots_for, listed_tokens, check, "", stubs)
         if result is not None:
             covered.append(seq)
             covering.append((seq, result[0]))
@@ -5792,7 +8426,7 @@ def _verify_listed_and_found(anchoring, entry, listed, seals, window, record_fet
                 outside += 1
                 continue
             result = _verify_one_anchor(seq, chain, source, record_fetch, roots_for, None, check,
-                                        "discovered, not listed: ")
+                                        "discovered, not listed: ", stubs)
             if result is not None:
                 print(f"NOTICE anchor seq={seq}: not listed in the manifest; found and verified "
                       f"({'; '.join(result[1])})")
@@ -5801,9 +8435,18 @@ def _verify_listed_and_found(anchoring, entry, listed, seals, window, record_fet
 
     for seal in seals:
         try:
-            event, recomputed = _read_record(record_fetch, seal["seq"])
+            event, recomputed = _read_record(record_fetch, seal["seq"], stubs)
         except AnchorFailure as exc:
             check.fail(f"FAIL anchoring seal seq={seal['seq']}: cannot read the record ({exc.detail})")
+            continue
+        # A seal shipped as a hash-only stub is checked by its hash;
+        # its action type is the manifest's.
+        if seal["seq"] in stubs:
+            if recomputed != seal["event_hash"]:
+                check.fail(f"FAIL anchoring seal seq={seal['seq']}: the hash-only stub is not the listed seal")
+            else:
+                print(f"NOTICE: chain {chain} carries the seal {seal['action_type']} at seq={seal['seq']} "
+                      f"(a hash-only stub: its hash matches; its action type is the manifest's)")
             continue
         action = (event.get("admin_action") or {}).get("action_type")
         if (recomputed != seal["event_hash"] or event.get("event_hash") != recomputed
@@ -5838,7 +8481,7 @@ def _verify_listed_and_found(anchoring, entry, listed, seals, window, record_fet
             return record_times[seq]
         try:
             return _epoch_of_record(json.loads(record_fetch(seq)))
-        except Exception as exc:  # ADR-0013 A: an unreadable record is counted as unchecked; the chain check fails it
+        except Exception as exc:  # An unreadable record is counted as unchecked; the chain check fails it
             raise ValueError(str(exc))
 
     ahead, first, unreadable = records_clock_ahead(covering, lo, record_epoch)
@@ -5860,7 +8503,7 @@ def _verify_listed_and_found(anchoring, entry, listed, seals, window, record_fet
             print(f"NOTICE: unanchored tail seq={anchored_through + 1}..{hi}: these records are not yet "
                   f"covered by a chain-head anchor")
     print("NOTE: an anchor shows a record existed no later than the token's genTime and is unchanged "
-          "since; it does not show the chain is complete (ADR-0075 D13).")
+          "since; it does not show the chain is complete.")
     return PASSED
 
 
@@ -5873,6 +8516,152 @@ def manifest_schema_version_error(manifest):
         return None
     return (f"manifest schema_version {version!r} is not one this verifier supports "
             f"({', '.join(SUPPORTED_MANIFEST_SCHEMA_VERSIONS)}). Re-run with an updated verifier.")
+
+
+def manifest_evidence_class_error(manifest):
+    """None when the manifest's evidence label is where its version says
+    (exactly in 1.4) and is one this verifier reads, else the
+    message to print before exiting 2. A label is never ignored: an unknown
+    one, a 1.4 manifest without one, or one on an earlier version cannot be
+    evaluated."""
+    version = manifest.get("schema_version", "1.0")
+    label = manifest.get("evidence_class")
+    # A 1.5 (stripped) pack carries the label when it has one.
+    if version == "1.5" and "evidence_class" not in manifest:
+        return None
+    if version not in ("1.4", "1.5"):
+        if "evidence_class" in manifest:
+            return f"manifest {version} carries an evidence_class, which only 1.4 and 1.5 define"
+        return None
+    if label in EVIDENCE_CLASSES:
+        return None
+    return (f"manifest evidence_class {label!r} is not one this verifier reads "
+            f"({', '.join(EVIDENCE_CLASSES)}). Re-run with an updated verifier.")
+
+
+def evidence_class_suffix(manifest):
+    """The label every verdict line carries for a 1.4 pack, else ''."""
+    label = manifest.get("evidence_class")
+    return f" [evidence class: {label}]" if label in EVIDENCE_CLASSES else ""
+
+
+def stubs_problem(manifest):
+    """None when a 1.5 manifest's `stubs` is absent, or lists
+    distinct sequences of the pack's events in order, each with a reason this
+    verifier reads and a field path; else the problem."""
+    stubs = manifest.get("stubs")
+    if stubs is None:
+        return None
+    if not isinstance(stubs, list) or not stubs:
+        return "manifest 1.5 stubs is not a non-empty list"
+    listed = {e.get("sequence") for e in manifest.get("events", []) if isinstance(e, dict)}
+    previous = None
+    for stub in stubs:
+        if not isinstance(stub, dict) or set(stub) != {"sequence", "reason", "field"}:
+            return "manifest 1.5 stubs entry is not {sequence, reason, field}"
+        seq = stub["sequence"]
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq not in listed:
+            return f"manifest 1.5 stub sequence {seq!r} is not a sequence of this pack's events"
+        if previous is not None and seq <= previous:
+            return "manifest 1.5 stubs are not distinct sequences in order"
+        previous = seq
+        if stub["reason"] not in STUB_REASONS:
+            return (f"manifest 1.5 stub reason {stub['reason']!r} is not one this verifier reads "
+                    f"({', '.join(STUB_REASONS)}). Re-run with an updated verifier.")
+        if not isinstance(stub["field"], str) or not stub["field"]:
+            return "manifest 1.5 stub field must be a non-empty string"
+    return None
+
+
+def manifest_content_error(manifest):
+    """None when the manifest's content claim is where its version
+    says (exactly in 1.5) and is the stripped profile this verifier reads,
+    else the message to print before exiting 2. A claim is never ignored: an
+    unknown content value, a removed-field list that is not this verifier's,
+    a malformed stub list, or the fields on an earlier version cannot be
+    evaluated."""
+    version = manifest.get("schema_version", "1.0")
+    present = [k for k in ("content", "removed_fields", "stubs") if k in manifest]
+    if version != "1.5":
+        if present:
+            return f"manifest {version} carries {', '.join(present)}, which only 1.5 defines"
+        return None
+    if manifest.get("content") != CONTENT_STRIPPED:
+        return (f"manifest 1.5 content {manifest.get('content')!r} is not one this verifier reads "
+                f"({CONTENT_STRIPPED!r}). Re-run with an updated verifier.")
+    removed = manifest.get("removed_fields")
+    if (not isinstance(removed, list) or not all(isinstance(f, str) for f in removed)
+            or len(set(removed)) != len(removed) or set(removed) != set(STRIPPED_FIELDS)):
+        return (f"manifest 1.5 removed_fields {removed!r} is not the stripped profile this verifier reads "
+                f"({', '.join(STRIPPED_FIELDS)}). Re-run with an updated verifier.")
+    return stubs_problem(manifest)
+
+
+def pack_is_stripped(manifest):
+    """Whether the manifest says its records are content-stripped."""
+    return manifest.get("schema_version") == "1.5" and manifest.get("content") == CONTENT_STRIPPED
+
+
+def manifest_stubs(manifest):
+    """Sequence -> (reason, field) of every hash-only stub a
+    stripped pack lists; empty for any other pack."""
+    if not pack_is_stripped(manifest) or not isinstance(manifest.get("stubs"), list):
+        return {}
+    return {s["sequence"]: (s["reason"], s["field"]) for s in manifest["stubs"] if isinstance(s, dict)}
+
+
+def content_suffix(manifest):
+    """What every verdict line of a stripped pack carries, else ''."""
+    if not pack_is_stripped(manifest):
+        return ""
+    stubs = len(manifest_stubs(manifest))
+    if stubs:
+        return f" [content: stripped; {stubs} hash-only stub{'s' if stubs != 1 else ''}]"
+    return " [content: stripped]"
+
+
+def content_lines(manifest):
+    """The lines printed before the records of a stripped pack."""
+    if not pack_is_stripped(manifest):
+        return []
+    lines = [
+        "CONTENT: stripped. This is a content-stripped pack: captured content and personal data were removed "
+        f"from every record ({', '.join(STRIPPED_FIELDS)}). Each record keeps every field its hash covers, so "
+        "the chain is verified from the sealed digests; the removed content itself cannot be shown."
+    ]
+    stubs = manifest_stubs(manifest)
+    if stubs:
+        lines.append(
+            f"STUBS: {len(stubs)} record(s) cannot be stripped and still verify, and ship as hash-only stubs "
+            f"({', '.join(STUB_FIELDS)}; nothing of the body). The chain is linked through each without "
+            f"recomputing its hash.")
+    return lines
+
+
+def _record_path(event, path):
+    """(present, value) of a dotted record path (`a` or `a.b`)."""
+    node = event
+    for part in path.split('.'):
+        if not isinstance(node, dict) or part not in node:
+            return False, None
+        node = node[part]
+    return True, node
+
+
+def stripped_record_problems(event):
+    """What a record in a stripped pack carries that the stripped
+    profile removes or withholds. Any is a contradiction of the signed
+    content claim: the pack cannot be evaluated as what it says it is."""
+    problems = []
+    for path in STRIPPED_FIELDS:
+        if _record_path(event, path)[0]:
+            problems.append(f"the manifest says content stripped, and the record carries {path}")
+    for path in WITHHELD_FIELDS:
+        present, value = _record_path(event, path)
+        if present and value is not None:
+            problems.append(f"the manifest says content stripped, and the record carries {path}, a personal "
+                            f"identifier the stripped profile withholds")
+    return problems
 
 
 def load_tsa_roots(specs):
@@ -5897,6 +8686,24 @@ def combine_with_anchor_status(chain_status, anchor_status):
     return chain_status
 
 
+def expected_signer(identity_arg, issuer_arg):
+    """(identity, issuer, supplied) a signed pack is checked against, from
+    --certificate-identity and --certificate-oidc-issuer (None when not given).
+    No identity: the Meilynx signing workflow, and a per-tenant pack then
+    cannot be evaluated. An email identity with no issuer is the per-tenant
+    class, whose issuer is Google's; any other identity keeps the workflow's
+    issuer. The issuer is still compared exactly with the certificate's."""
+    supplied = identity_arg is not None
+    identity = identity_arg if supplied else PINNED_SIGNER_IDENTITY
+    if issuer_arg is not None:
+        issuer = issuer_arg
+    elif supplied and "@" in identity and "://" not in identity:
+        issuer = GOOGLE_OIDC_ISSUER
+    else:
+        issuer = PINNED_OIDC_ISSUER
+    return identity, issuer, supplied
+
+
 def report_pack_signature(manifest, manifest_bytes, manifest_path, args):
     """Verify a signed pack's signature and print the verdict. Returns PASSED,
     FAILED, or CANNOT_EVALUATE (a signature method or format this verifier
@@ -5910,9 +8717,14 @@ def report_pack_signature(manifest, manifest_bytes, manifest_path, args):
             return CANNOT_EVALUATE
     else:
         trust = load_trusted_root(SIGSTORE_PUBLIC_GOOD_TRUST_ROOT)
-    if args.certificate_identity != PINNED_SIGNER_IDENTITY:
-        print(f"NOTE: expecting signer identity {args.certificate_identity} (--certificate-identity). "
-              f"Production packs are signed by {PINNED_SIGNER_IDENTITY}.")
+    identity, issuer, supplied = expected_signer(args.certificate_identity, args.certificate_oidc_issuer)
+    if issuer == GOOGLE_OIDC_ISSUER:
+        print(f"NOTE: expecting the per-tenant signer {identity} (--certificate-identity), issuer {issuer}. "
+              f"Compare it with the signer identity the evidence holder published for this project; "
+              f"the pack cannot vouch for its own signer.")
+    elif identity != PINNED_SIGNER_IDENTITY:
+        print(f"NOTE: expecting signer identity {identity} (--certificate-identity). "
+              f"Packs signed by the Meilynx signing workflow carry {PINNED_SIGNER_IDENTITY}.")
 
     def read_sibling(name):
         path = manifest_path.parent / name
@@ -5920,9 +8732,17 @@ def report_pack_signature(manifest, manifest_bytes, manifest_path, args):
 
     try:
         signer = check_pack_signature(
-            manifest, manifest_bytes, read_sibling,
-            args.certificate_identity, args.certificate_oidc_issuer, trust,
+            manifest, manifest_bytes, read_sibling, identity, issuer, trust, identity_supplied=supplied,
         )
+    except SignerIdentityRequired as exc:
+        print(
+            f"ERROR: this pack is signed by a per-tenant signer ({', '.join(exc.identities) or 'no identity'}, "
+            f"issuer {GOOGLE_OIDC_ISSUER}). Its signature checks out, but whose pack it is can only be "
+            f"established against the signer identity the evidence holder published for the project. "
+            f"Re-run with --certificate-identity <that identity>.",
+            file=sys.stderr,
+        )
+        return CANNOT_EVALUATE
     except SignatureUnsupported as exc:
         print(
             f"ERROR: {exc}. This verifier checks cosign keyless signatures stored as a "
@@ -5933,12 +8753,116 @@ def report_pack_signature(manifest, manifest_bytes, manifest_path, args):
     except SignatureInvalid as exc:
         print(f"FAIL signature: {exc}")
         return FAILED
-    print(f"SIGNATURE OK: manifest.json is signed by {signer['identity']}")
+    print(f"SIGNATURE OK: manifest.json is signed by {signer['identity']}"
+          + (" (per-tenant signer, the identity you supplied)" if signer.get("per_tenant") else ""))
     print(f"  OIDC issuer: {signer['issuer']}")
     print(f"  logged in {signer['log_url'] or 'the transparency log'} at "
           f"{_utc(signer['integrated_time'])} (log index {signer['log_index']})")
     return PASSED
 
+
+# contracts/control-plane-chain-v1.json, written by the control plane:
+# (stored record text, event_hash), one chain from genesis. A drift catcher
+# in the crate (mei3033_control_plane_chain.rs) holds these to the contract.
+_CONTROL_PLANE_V1_VECTORS = (
+    ('{"actor_user_id":"11111111-2222-4333-8444-555555555555","correlation_id":"c04e6a8b-0d1f-4a3c-8e5b-7d9f1b3d5f70","event_hash":"e8e8c864c95e924a25a25c79876f6740179ddc0cc629c94cc84ba0f0d42124f4","event_id":"2c4e6a8b-0d1f-4a3c-8e5b-7d9f1b3d5f70","event_kind":"mcp_approval.released","occurred_at":"2026-10-01T09:01:00.1234567Z","payload":{"actor_role":"member","actor_user_id":"11111111-2222-4333-8444-555555555555","approval_id":"0a0b0c0d-0e0f-4101-8202-030405060708","evidence_record_id":"9f8e7d6c-5b4a-4392-8180-706050403020","hold_id":"hold-77777777777777777777777777777777","reason":"rbac_require_approval_hold:rule-42","status":"Released","tool_name":"crm__send_client_email","upstream_slug":"crm-prod","virtual_server":"crm"},"previous_hash":"c2989403cf897daccd825cc41377b804343c5a4851eac1daf32b58eb1fa4edf8","project_id":"7d1c0b6a-5e4f-4a3b-9c2d-1e0f9a8b7c6d","schema_version":"v1","sequence_number":0,"target_resource_id":"0a0b0c0d-0e0f-4101-8202-030405060708"}',
+     'e8e8c864c95e924a25a25c79876f6740179ddc0cc629c94cc84ba0f0d42124f4'),
+    ('{"actor_user_id":null,"correlation_id":"c05f7b9c-1e2a-4b4d-9f6c-8e0a2c4e6a81","event_hash":"8dd16459c459840af14f12b0a9e3647724cdb0c85592024b4027dade8849bfae","event_id":"3d5f7b9c-1e2a-4b4d-9f6c-8e0a2c4e6a81","event_kind":"mcp_approval.expired","occurred_at":"2026-10-02T09:00:30.0000000Z","payload":{"actor_role":null,"actor_user_id":null,"approval_id":"1a1b1c1d-1e1f-4111-8212-131415161718","evidence_record_id":"9f8e7d6c-5b4a-4392-8180-706050403020","expires_at_utc":"2026-10-02T09:00:00.0000000Z","hold_id":"hold-88888888888888888888888888888888","reason":"rbac_require_approval_hold:rule-42","requested_at_utc":"2026-10-01T09:00:00.0000000Z","status":"Expired","tool_name":"crm__send_client_email","trigger":"sweep","upstream_slug":"crm-prod","virtual_server":"crm"},"previous_hash":"e8e8c864c95e924a25a25c79876f6740179ddc0cc629c94cc84ba0f0d42124f4","project_id":"7d1c0b6a-5e4f-4a3b-9c2d-1e0f9a8b7c6d","schema_version":"v1","sequence_number":1,"target_resource_id":"1a1b1c1d-1e1f-4111-8212-131415161718"}',
+     '8dd16459c459840af14f12b0a9e3647724cdb0c85592024b4027dade8849bfae'),
+    ('{"actor_user_id":"11111111-2222-4333-8444-555555555555","correlation_id":"c06a8c0d-2f3b-4c5e-8a7d-9f1b3d5f7b92","event_hash":"a574db394c58e51d08878473592f27c981137d70d8afa3dc9eacc48283eebc09","event_id":"4e6a8c0d-2f3b-4c5e-8a7d-9f1b3d5f7b92","event_kind":"supervisory-review.decision_recorded","occurred_at":"2026-10-03T14:30:00.0000001Z","payload":{"Apple":2,"_under":3,"banana":1,"decision":"approve","label":"Revisão — “quoted” \\\\ back\\nslash\\t\\u0001 😀 \x7f","notes_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","été":4,"😀smile":6,"～wave":5},"previous_hash":"8dd16459c459840af14f12b0a9e3647724cdb0c85592024b4027dade8849bfae","project_id":"7d1c0b6a-5e4f-4a3b-9c2d-1e0f9a8b7c6d","schema_version":"v1","sequence_number":2,"target_resource_id":"5f7b9d1e-3a4c-4d6f-9b8e-0a2c4e6a8ca3"}',
+     'a574db394c58e51d08878473592f27c981137d70d8afa3dc9eacc48283eebc09'),
+    ('{"actor_user_id":"11111111-2222-4333-8444-555555555555","correlation_id":"c07b9d1e-3a4c-4d6f-9b8e-0a2c4e6a8ca4","event_hash":"7365bfb06edeae54659f7d56c299564fe8bcb75894cefdd3f1008cd39b8186a9","event_id":"5f7b9d1e-3a4c-4d6f-9b8e-0a2c4e6a8ca4","event_kind":"compliance-report.generated","occurred_at":"2026-10-04T00:00:00.0000000Z","payload":{"decimal":1.5,"decimal_small":0.00001,"double_half":0.5,"double_integral":3,"double_large":1E+20,"double_small":1E-05,"int":42,"long":9223372036854775807,"neg":-7,"neg_zero":0,"nested":{"arr":[1,2.5,null,true,false,"x"],"empty_arr":[],"empty_obj":{}}},"previous_hash":"a574db394c58e51d08878473592f27c981137d70d8afa3dc9eacc48283eebc09","project_id":"7d1c0b6a-5e4f-4a3b-9c2d-1e0f9a8b7c6d","schema_version":"v1","sequence_number":3,"target_resource_id":"6a8c0e2f-4b5d-4e7a-8c9f-1b3d5f7b9db5"}',
+     '7365bfb06edeae54659f7d56c299564fe8bcb75894cefdd3f1008cd39b8186a9'),
+    ('{"actor_user_id":null,"correlation_id":"c08c0e2f-4b5d-4e7a-8c9f-1b3d5f7b9db6","event_hash":"eabf6b518391ea65e74e0edccb8809ba1fd1c99303e6369d0a9aec194761e789","event_id":"6a8c0e2f-4b5d-4e7a-8c9f-1b3d5f7b9db6","event_kind":"proxy.key_rotated","occurred_at":"2026-05-08T12:00:00.0000000Z","payload":null,"previous_hash":"7365bfb06edeae54659f7d56c299564fe8bcb75894cefdd3f1008cd39b8186a9","project_id":null,"schema_version":"v1","sequence_number":4,"target_resource_id":"7b9d1f3a-5c6e-4f8b-9d0a-2c4e6a8c0ec7"}',
+     'eabf6b518391ea65e74e0edccb8809ba1fd1c99303e6369d0a9aec194761e789'),
+)
+
+
+def control_plane_self_test():
+    """The control-plane chain: the cross-language vectors, the
+    chain walk, the fail modes (a number rewritten to an equal value, a
+    missing record, an unpublished schema_version, a malformed section) and
+    each receipt's anchor against the chain."""
+    ok = True
+    sink = []
+
+    def check(label, passed, what, detail=''):
+        nonlocal ok
+        print(f"SELF-TEST assertion {label} {'PASS' if passed else 'FAIL'}: {what}")
+        if not passed:
+            if detail:
+                print(detail, file=sys.stderr)
+            ok = False
+
+    for i, (text, expected) in enumerate(_CONTROL_PLANE_V1_VECTORS):
+        got = control_plane_event_hash_v1(load_control_plane_record(text.encode('utf-8')))
+        check(f'cp1.{i}', got == expected, f"control-plane vector {i} recomputes to its event_hash",
+              f"got {got}, want {expected}")
+
+    def manifest_for(texts, version='1.3'):
+        records = [load_control_plane_record(t.encode('utf-8')) for t in texts]
+        return {'schema_version': version, 'control_plane': {
+            'chain_family': 'control-plane', 'prefix': 'control-plane/', 'hash_algorithm': 'SHA-256',
+            'hash_version': 'v1', 'genesis_hash': genesis_hash(), 'verified': True,
+            'records_checked': len(records),
+            'events': [{'sequence': n, 'event_id': r['event_id'], 'stored_event_hash': r['event_hash'],
+                        'recomputed_event_hash': r['event_hash']} for n, r in enumerate(records)]}}
+
+    def walk(texts, manifest=None, missing=()):
+        def fetch(seq):
+            if seq in missing:
+                raise FileNotFoundError(f"no control-plane record {seq}")
+            return texts[seq].encode('utf-8')
+        sink.clear()
+        return verify_control_plane_chain(fetch, manifest or manifest_for(texts), sink.append)
+
+    texts = [t for t, _ in _CONTROL_PLANE_V1_VECTORS]
+    passed, records = walk(texts)
+    check('cp2', passed and len(records) == len(texts) and any(l.startswith('CONTROL-PLANE OK') for l in sink),
+          "the five vectors walk as one chain from genesis", '\n'.join(sink))
+
+    rewritten = list(texts)
+    rewritten[3] = rewritten[3].replace('"double_small":1E-05', '"double_small":0.00001')
+    passed, _ = walk(rewritten, manifest_for(texts))
+    check('cp3', not passed and any('control-plane seq=3: hash mismatch' in l for l in sink),
+          "a number rewritten to an equal value fails at its record", '\n'.join(sink))
+
+    passed, _ = walk(texts, missing=(2,))
+    check('cp4', not passed and any('control-plane seq=2: record unreadable' in l for l in sink),
+          "a missing control-plane record fails the walk", '\n'.join(sink))
+
+    v2 = json.loads(texts[0])
+    v2['schema_version'] = 'v2'
+    passed, _ = walk([json.dumps(v2)] + texts[1:], manifest_for(texts))
+    check('cp5', not passed and any("schema_version 'v2' is not a published control-plane preimage" in l
+                                    for l in sink),
+          "an unpublished schema_version fails", '\n'.join(sink))
+
+    no_section = {'schema_version': '1.3'}
+    stray = dict(manifest_for(texts), schema_version='1.2')
+    wrong_prefix = manifest_for(texts)
+    wrong_prefix['control_plane']['prefix'] = 'audit/'
+    check('cp6', all(control_plane_manifest_problem(m) for m in (no_section, stray, wrong_prefix))
+          and control_plane_manifest_problem(manifest_for(texts)) is None,
+          "a control_plane section is required in 1.3, refused elsewhere, and must name control-plane/")
+
+    _, records = walk(texts)
+    released = load_control_plane_record(texts[0].encode('utf-8'))
+    receipts = {
+        7: {'receipt_id': 'r-match', 'cp_anchor_event_id': released['event_id'],
+            'cp_anchor_event_hash': released['event_hash']},
+        8: {'receipt_id': 'r-mismatch', 'cp_anchor_event_id': released['event_id'],
+            'cp_anchor_event_hash': 'f' * 64},
+        9: {'receipt_id': 'r-outside', 'cp_anchor_event_id': 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee',
+            'cp_anchor_event_hash': 'e' * 64},
+    }
+    failures, warnings, lines = receipt_anchor_findings(receipts, records)
+    check('cp7', len(failures) == 1 and 'decision receipt r-mismatch' in failures[0]
+          and len(warnings) == 1 and warnings[0].startswith('WARN receipt_anchor_outside_pack seq=9')
+          and lines == ['RECEIPT ANCHOR OK seq=7 receipt=r-match control-plane seq=0'],
+          "a receipt anchor matches, mismatches, or lies outside the pack",
+          f"{failures}\n{warnings}\n{lines}")
+    return ok
 
 def offline_self_test():
     """Exercise the offline (`--records`) path end to end on a synthetic
@@ -6022,7 +8946,7 @@ def offline_self_test():
 
 
 def segment_self_test():
-    """MEI-2863 — segment objects (ADR-0081). The range parser, the segment
+    """Segment objects. The range parser, the segment
     split, and the D7 verdicts on a synthetic five-record v1 chain stored as
     segments: clean, mixed, identical overlap (WARN), forked overlap (FAIL),
     gap (FAIL through the chain link), truncation (PASS on the records
@@ -6058,7 +8982,7 @@ def segment_self_test():
           and record_object_range("7.bin") is None
           and record_object_range(f"{n(7)}.json") is None,
           "object names parse to ranges: <n>.bin is [n, n], <a>-<b>.seg is [a, b] with 1 to 1024 "
-          "records, anything else is not a record (ADR-0081 D6)")
+          "records, anything else is not a record")
 
     genesis = genesis_hash()
     events = []
@@ -6192,12 +9116,12 @@ def segment_self_test():
           "a manifest 1.2 storage_layout is per-record or segmented-v1; absent or unknown is refused (exit 2)",
           repr(layouts))
     check('26m', 'segmented-records-v1' in VERIFIER_CAPABILITIES,
-          "VERIFIER_CAPABILITIES advertises segmented-records-v1 (ADR-0081 D9)")
+          "VERIFIER_CAPABILITIES advertises segmented-records-v1")
     return ok
 
 
 def attribution_self_test():
-    """MEI-2476 — every FAIL line names the record that failed. A four-record
+    """Every FAIL line names the record that failed. A four-record
     v1 chain has record 1 tampered in one way per assertion. Each must print
     exactly one `FAIL seq=1` line and no FAIL for the intact record 2, whose
     previous_hash still names what the chain committed to for record 1. When
@@ -6314,8 +9238,276 @@ def attribution_self_test():
     return ok
 
 
+def receipt_self_test():
+    """Decision receipts through the verification
+    loop: the fail-mode tests D8 requires before a production roll, the lapsed
+    half of the cross-language fixture, each evidence entry against the pack
+    record it cites, and the manifest's `decision_receipts` index."""
+    import contextlib
+    import io
+
+    ok = True
+
+    def check(label, passed, what, detail=''):
+        nonlocal ok
+        print(f"SELF-TEST assertion {label} {'PASS' if passed else 'FAIL'}: {what}")
+        if not passed:
+            if detail:
+                print(detail, file=sys.stderr)
+            ok = False
+
+    run_chain = 'chain_tnt_pxy_selftest_proxy_run_r1'
+    genesis = genesis_hash()
+
+    def llm(seq, prev):
+        event = {
+            'schema_version': 'v1', 'sequence_number': seq,
+            'timestamp_utc': f'2026-10-01T10:00:0{seq}+00:00',
+            'event_id': f'evt-{seq}', 'request_id': f'req-{seq}', 'model_requested': 'gpt-4.1-mini',
+            'action': 'allow', 'input_tokens': 11, 'output_tokens': 7, 'total_tokens': 18,
+            'estimated_cost_usd': None, 'previous_hash': prev,
+        }
+        event['event_hash'] = recompute_event_hash(event, seq, prev)
+        return event
+
+    def receipt_record(seq, prev, evidence, **fields):
+        payload = dict(_V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD, evidence=evidence,
+                       evidence_set_sha256=sha256_jcs(evidence), **fields)
+        event = {
+            'schema_version': 'v1.15', 'event_kind': 'decision_receipt', 'sequence_number': seq,
+            'timestamp_utc': f'2026-10-01T15:00:3{seq}+00:00', 'event_id': f'evt-receipt-{seq}',
+            'request_id': f'evt-receipt-{seq}', 'model_requested': '',
+            'action': RECEIPT_OUTCOME_TO_ACTION[payload['outcome']],
+            'input_tokens': 0, 'output_tokens': 0, 'previous_hash': prev, 'decision_receipt': payload,
+        }
+        event['event_hash'] = recompute_event_hash(event, seq, prev)
+        return event
+
+    def cite(event, chain, role):
+        return {'chain_id': chain, 'content_digests': {}, 'event_hash': event['event_hash'],
+                'event_id': event['event_id'], 'role': role, 'sequence_number': event['sequence_number']}
+
+    def pack(prefix, evidence, index='auto', mutate=None, **fields):
+        """A three-record chain (two LLM records, then a receipt citing
+        `evidence(records)`) and its manifest. `index`: 'auto' lists the
+        receipt, None omits the key, or a list to use verbatim."""
+        first = llm(0, genesis)
+        second = llm(1, first['event_hash'])
+        receipt = receipt_record(2, second['event_hash'], evidence([first, second]), **fields)
+        records = [first, second, receipt]
+        if mutate:
+            mutate(records)
+        manifest = {'hash_version': 'v1', 'prefix': prefix,
+                    'events': [{'sequence': r['sequence_number'], 'recomputed_event_hash': r['event_hash']}
+                               for r in (first, second, receipt)]}
+        if index == 'auto':
+            p = receipt['decision_receipt']
+            manifest['decision_receipts'] = [{'sequence': 2, 'receipt_id': p['receipt_id'],
+                                              'receipt_type': p['receipt_type'], 'clock_status': p['clock_status']}]
+        elif index is not None:
+            manifest['decision_receipts'] = index
+        raw = {r['sequence_number']: json.dumps(r).encode('utf-8') for r in records}
+        return raw, manifest
+
+    def verify(raw, manifest):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            passed = verify_manifest_with(lambda s: raw[s], manifest)
+        return passed, out.getvalue()
+
+    def lines(out, prefix):
+        return [line for line in out.splitlines() if line.startswith(prefix)]
+
+    on_chain = lambda recs: [cite(recs[0], run_chain, 'ai_contribution'), cite(recs[1], run_chain, 'hold')]
+    run_prefix = f'audit/{run_chain}/'
+
+    # 28e — D8: a tampered decider, outcome, deadline or credential status fails
+    # verification at the receipt record (its stored hash kept).
+    caught = []
+    for name, value in (('decider_user_id', '22222222-2222-4333-8444-555555555555'), ('outcome', 'rejected'),
+                        ('clock_deadline_at', 1791025200), ('credential_status', 'not_required')):
+        def edit(records, name=name, value=value):
+            records[2]['decision_receipt'][name] = value
+        raw, manifest = pack(run_prefix, on_chain, mutate=edit)
+        passed, out = verify(raw, manifest)
+        caught.append(not passed and any(line.startswith('FAIL seq=2:') for line in out.splitlines()))
+    check('28e', all(caught), 'a tampered decider_user_id, outcome, clock_deadline_at or credential_status fails at the receipt record',
+          f'caught: {caught}')
+
+    # 28f — D8: within with the decision after the deadline (elapsed kept
+    # consistent, so only the status recomputation sees it), verified without a
+    # verification time, and a decider on a lapse, each named.
+    base = dict(_V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD)
+    late = dict(base, clock_decided_at=base['clock_deadline_at'] + 1,
+                clock_elapsed_seconds=base['clock_deadline_at'] + 1 - base['clock_started_at'])
+    unverified = dict(base, credential_status='verified', credential_registry='registry_id')
+    lapse_with_decider = dict(base, outcome='lapsed', clock_decided_at=None, clock_elapsed_seconds=None,
+                              clock_status='lapsed', issued_at=base['clock_deadline_at'] + 60)
+    problems = [
+        check_decision_receipt({'schema_version': 'v1.15', 'action': a, 'decision_receipt': p})
+        for p, a in ((late, 'allow'), (unverified, 'allow'), (lapse_with_decider, 'block'))
+    ]
+    check('28f', [len(p) for p in problems] == [1, 1, 1]
+          and 'clock_status' in problems[0][0] and 'credential_status verified' in problems[1][0]
+          and 'names a decider' in problems[2][0],
+          'within after the deadline, verified without verified_at and a lapse with a decider each fail on their own',
+          f'problems: {problems}')
+
+    # 28g — D8: decision.receipt stamped v1.14, and v1.15 on mcp.policy_decision
+    # (with or without the payload), are refused.
+    receipt_event = dict(schema_version='v1.15', event_kind='decision_receipt',
+                         timestamp_utc='2026-10-01T15:00:31.000000Z', event_id='e', request_id='e',
+                         model_requested='', action='allow', input_tokens=0, output_tokens=0,
+                         decision_receipt=dict(base))
+    refused = 0
+    for case in (dict(receipt_event, schema_version='v1.14'),
+                 dict(receipt_event, event_kind='mcp_policy_decision'),
+                 dict(receipt_event, event_kind='mcp_policy_decision', decision_receipt=None)):
+        try:
+            recompute_event_hash(case, 9, 'b' * 64)
+        except ValueError:
+            refused += 1
+    check('28g', refused == 3, 'decision.receipt on v1.14 and v1.15 on mcp.policy_decision are refused',
+          f'refused {refused} of 3')
+
+    # 28h — the lapsed half of the cross-language fixture (D8), paired with
+    # mei2989_v1_15_lapsed_receipt_fixture_hash_pinned and the control plane.
+    got = compute_event_hash_v1_15_decision_receipt(
+        sequence_number=10, timestamp_utc='2026-10-03T10:01:31.000000+00:00',
+        event_id='evt-receipt-2', request_id='evt-receipt-2', model_requested='', action='block',
+        input_tokens=0, output_tokens=0, total_tokens=None, cache_creation_input_tokens=None,
+        cache_read_input_tokens=None, cached_input_tokens=None, reasoning_tokens=None,
+        estimated_cost_usd=None, previous_hash='b' * 64, receipt=_V1_15_LAPSED_RECEIPT_FIXTURE_PAYLOAD,
+    )
+    lapsed_event = dict(receipt_event, timestamp_utc='2026-10-03T10:01:31.000000Z', event_id='evt-receipt-2',
+                        request_id='evt-receipt-2', action='block',
+                        decision_receipt=dict(_V1_15_LAPSED_RECEIPT_FIXTURE_PAYLOAD))
+    check('28h', got == V1_15_LAPSED_RECEIPT_FIXTURE_HASH
+          and recompute_event_hash(lapsed_event, 10, 'b' * 64) == V1_15_LAPSED_RECEIPT_FIXTURE_HASH
+          and not check_decision_receipt(lapsed_event),
+          'v1.15 lapsed decision.receipt fixture hash matches and the lapse checks out',
+          f'expected {V1_15_LAPSED_RECEIPT_FIXTURE_HASH}, got {got}')
+
+    # 28n — a lapse means the deadline passed with no decision, so
+    # a receipt that lapsed (by outcome or clock status) before its deadline
+    # fails, naming both fields; one issued at or after the deadline passes.
+    lapse = dict(_V1_15_LAPSED_RECEIPT_FIXTURE_PAYLOAD)
+    deadline = lapse['clock_deadline_at']
+    early = [check_decision_receipt({'schema_version': 'v1.15', 'action': 'block',
+                                     'decision_receipt': dict(lapse, issued_at=deadline - 1)}),
+             check_decision_receipt({'schema_version': 'v1.15', 'action': 'block',
+                                     'decision_receipt': dict(lapse, outcome='rejected', issued_at=deadline - 1)})]
+    on_time = [check_decision_receipt({'schema_version': 'v1.15', 'action': 'block',
+                                       'decision_receipt': dict(lapse, issued_at=t)}) for t in (deadline, deadline + 60)]
+    check('28n', all(any('lapsed before its deadline' in p and 'issued_at' in p and 'clock_deadline_at' in p for p in e)
+                     for e in early) and on_time == [[], []],
+          'a lapse issued before its deadline fails, naming issued_at and clock_deadline_at; one at or after it passes',
+          f'early: {early}, on time: {on_time}')
+    # The same through the walk: the receipt record fails, its hash intact.
+    raw, manifest = pack(run_prefix, on_chain, outcome='lapsed', decider_user_id=None, decider_role=None,
+                         clock_decided_at=None, clock_elapsed_seconds=None, clock_status='lapsed',
+                         issued_at=deadline - 3600)
+    passed, out = verify(raw, manifest)
+    fails = lines(out, 'FAIL seq=2:')
+    check('28n2', not passed and len(fails) == 1 and 'lapsed before its deadline' in fails[0],
+          'a pack holding a lapse issued before its deadline fails at that receipt', out)
+
+    # 28i — evidence that cites records in this pack, by their chain's own id,
+    # verifies with no warning, and the index lists the receipt.
+    raw, manifest = pack(run_prefix, on_chain)
+    passed, out = verify(raw, manifest)
+    check('28i', passed and not lines(out, 'WARN') and not lines(out, 'FAIL')
+          and 'RECEIPTS INDEX OK: 1 decision receipt(s)' in out,
+          'receipt evidence matching the pack records verifies with no warning', out)
+
+    # 28j — a receipt sealed citing a record by the wrong event_hash (or
+    # event_id) fails at the receipt record, naming the field. The receipt is
+    # internally consistent: its evidence digest and hash were computed over
+    # the wrong citation, as a control plane that cited the wrong record would.
+    def wrong(field, value):
+        def evidence(recs):
+            entries = on_chain(recs)
+            entries[1][field] = value
+            return entries
+        return evidence
+    results = []
+    for field, value in (('event_hash', '2' * 64), ('event_id', 'evt-other')):
+        raw, manifest = pack(run_prefix, wrong(field, value))
+        passed, out = verify(raw, manifest)
+        fails = lines(out, 'FAIL seq=2:')
+        results.append(not passed and len(fails) == 1 and f'evidence[1] (sequence=1) {field}' in fails[0])
+    check('28j', all(results), 'a receipt citing a pack record by the wrong event_hash or event_id fails, naming the field',
+          f'results: {results}')
+
+    # 28k — entries whose records are not in this pack (another run's chain, or
+    # this chain beyond the window) warn with their coordinates and verify.
+    def outside(recs):
+        return [dict(cite(recs[0], 'chain_tnt_pxy_selftest_proxy_run_r0', 'ai_contribution'), sequence_number=7),
+                dict(cite(recs[1], run_chain, 'hold'), sequence_number=5)]
+    raw, manifest = pack(run_prefix, outside)
+    passed, out = verify(raw, manifest)
+    warns = lines(out, 'WARN receipt_evidence_outside_pack')
+    check('28k', passed and len(warns) == 2 and not lines(out, 'FAIL')
+          and 'chain=chain_tnt_pxy_selftest_proxy_run_r0 sequence=7 event_id=evt-0' in warns[0]
+          and f'chain={run_chain} sequence=5 event_id=evt-1' in warns[1],
+          'evidence outside the pack is WARN receipt_evidence_outside_pack with its coordinates, and verifies', out)
+
+    # 28l — the flat `audit/` chain is cited by its tenant-scoped id and is
+    # checked; an entry naming no chain is in the pack only when the record at
+    # its sequence carries its hash, and warns otherwise.
+    tenant = lambda recs: [cite(recs[0], 'chain_tnt_pxy_selftest_proxy', 'ai_contribution'),
+                           cite(recs[1], 'chain_tnt_pxy_selftest_proxy', 'hold')]
+    raw, manifest = pack('audit/', tenant)
+    flat_ok, flat_out = verify(raw, manifest)
+    raw, manifest = pack('audit/', lambda recs: [dict(e, event_hash='3' * 64) if e['role'] == 'hold' else e
+                                                 for e in tenant(recs)])
+    flat_bad, _ = verify(raw, manifest)
+    unnamed = lambda recs: [dict(cite(recs[0], None, 'ai_contribution'), event_id=None),
+                            dict(cite(recs[1], None, 'hold'), event_id=None, event_hash='4' * 64)]
+    raw, manifest = pack(run_prefix, unnamed)
+    unnamed_ok, unnamed_out = verify(raw, manifest)
+    unnamed_warns = lines(unnamed_out, 'WARN receipt_evidence_outside_pack')
+    check('28l', flat_ok and not lines(flat_out, 'WARN') and not flat_bad and unnamed_ok
+          and len(unnamed_warns) == 1 and 'chain=(not recorded) sequence=1' in unnamed_warns[0],
+          'the flat chain is checked under its tenant-scoped id, and an unnamed entry is matched by its hash or warned',
+          f'{flat_out}\n{unnamed_out}')
+
+    # 28m — the manifest's decision_receipts index: an older manifest without
+    # it is accepted with a note; an unlisted receipt, an extra entry, a wrong
+    # field or an unknown field fails; a receipt-free pack has no key.
+    p = _V1_15_DECISION_RECEIPT_FIXTURE_PAYLOAD
+    entry = {'sequence': 2, 'receipt_id': p['receipt_id'], 'receipt_type': p['receipt_type'], 'clock_status': 'within'}
+    outcomes = {}
+    raw, manifest = pack(run_prefix, on_chain, index=None)
+    outcomes['absent'], out = verify(raw, manifest)
+    absent_noted = 'NOTE: the manifest has no decision_receipts index' in out
+    for label, index in (('unlisted', []),
+                         ('extra', [entry, dict(entry, sequence=1)]),
+                         ('wrong-status', [dict(entry, clock_status='breached')]),
+                         ('wrong-type', [dict(entry, receipt_type='sar-narrative-signoff')]),
+                         ('unknown-field', [dict(entry, outcome='approved')]),
+                         ('duplicate', [entry, entry]),
+                         ('not-a-list', {'2': entry})):
+        raw, manifest = pack(run_prefix, on_chain, index=index)
+        outcomes[label], out = verify(raw, manifest)
+        outcomes[label] = outcomes[label] or not lines(out, 'FAIL decision_receipts:')
+    receipt_free = {'hash_version': 'v1', 'prefix': run_prefix, 'events': []}
+    first = llm(0, genesis)
+    receipt_free['events'] = [{'sequence': 0, 'recomputed_event_hash': first['event_hash']}]
+    free_raw = {0: json.dumps(first).encode('utf-8')}
+    free_ok, free_out = verify(free_raw, receipt_free)
+    free_extra, _ = verify(free_raw, dict(receipt_free, decision_receipts=[dict(entry, sequence=0)]))
+    check('28m', outcomes['absent'] and absent_noted
+          and not any(v for k, v in outcomes.items() if k != 'absent')
+          and free_ok and 'RECEIPT' not in free_out and 'NOTE' not in free_out and not free_extra,
+          'the decision_receipts index lists every receipt and nothing else, field for field; an older manifest without it is noted',
+          f'outcomes (True = passed): {outcomes}, absent noted: {absent_noted}, free: {free_ok}/{free_extra}')
+
+    return ok
+
+
 def content_self_test():
-    """MEI-2424 — the v1.10 content attestation: fixture hashes paired with the
+    """The v1.10 content attestation: fixture hashes paired with the
     Rust tests, the production recompute path, the fail-closed dispatcher
     guards, the JCS digests paired with the proxy's sealer, and the offline
     content check (a record whose prompt was edited after sealing fails even
@@ -6425,7 +9617,7 @@ def content_self_test():
 
 
 def tool_calls_self_test():
-    """MEI-2456 — the v1.11 tool-call attestation: fixture hashes paired with
+    """The v1.11 tool-call attestation: fixture hashes paired with
     the Rust tests, the production recompute path, the fail-closed dispatcher
     guards, the JCS tool-call digests paired with the proxy's sealer, and the
     offline content check (a record whose tool input was edited after sealing
@@ -6442,7 +9634,7 @@ def tool_calls_self_test():
     ts = "2026-05-17T00:00:00+00:00"
 
     # 21a / 21b — direct fn: both tool digests, no join; then a hash_only
-    # payload (stored digests absent) with the MEI-2151 join fixture.
+    # payload (stored digests absent) with the join fixture.
     got = compute_event_hash_v1_11_llm_request(
         timestamp_utc=ts, join_context=None, content=_V1_11_CONTENT_FIXTURE_PAYLOAD, **_FIXTURE,
     )
@@ -6563,6 +9755,745 @@ def tool_calls_self_test():
         injected = not verify_manifest_with(local_fetcher(records), v1_10_manifest, quiet=True)
         check('21h', clean and injected,
               'tool calls added to a sealed v1.10 record are reported as unattested')
+
+    return ok
+
+
+# ── Content-stripped Exchange pack: TEST-ONLY vectors ─────────────
+# A five-record chain, sealed in full and then stripped the way the exporter
+# strips it (exchange::strip_record): a v1.1 record with unhashed content and
+# identifiers; a v1.11 record that sealed digests of its prompt, response,
+# findings and tool calls; a v1.12 record whose sealed identity has asserted
+# labels naming an on-behalf-of subject; a v1.2 auth.session_started whose
+# hash covers the user's email, which ships as a hash-only stub; and a v1.1
+# record after it, which links to the stub. TEST-ONLY: synthetic values,
+# never a real chain. EXCHANGE_SELFTEST_HEAD_HASH pins the last record's
+# hash, so a change to any hash path these records cross fails here.
+_EXCHANGE_SELFTEST_TOOL_CALLS = [{'id': 'toolu_1', 'name': 'Read', 'input': {'file_path': '/work/calc.py'}}]
+_EXCHANGE_SELFTEST_ASSERTED = {'agent_name': 'billing-bot', 'on_behalf_of': 'subject-7f3a'}
+_EXCHANGE_SELFTEST_PREFIX = 'audit/chain_tnt_selftest_run_x/'
+_EXCHANGE_SELFTEST_STUB_SEQ = 3
+EXCHANGE_SELFTEST_HEAD_HASH = "f6335bab3e50d9ee957ddaad940e51623046fd44e1b1d56a476975eb4c18205a"
+
+
+def _exchange_selftest_chain():
+    """The TEST-ONLY chain above, sealed in full: (records, shipped records),
+    where the shipped records are stripped and seq 3 is its hash-only stub."""
+    rec = _V1_10_DIGEST_FIXTURE_RECORD
+    tool_digest = sha256_jcs(_EXCHANGE_SELFTEST_TOOL_CALLS)
+    llm = dict(model_requested='gpt-4.1-mini', action='allow', input_tokens=11, output_tokens=7,
+               estimated_cost_usd=0.000123, findings=[])
+    records = [
+        dict(llm, schema_version='v1.1', timestamp_utc='2026-10-01T00:00:00Z', event_id='evt-x0', request_id='req-x0',
+             messages=rec['messages'], response_text=rec['response_text'],
+             raw_request={'messages': rec['messages']}, raw_response={'id': 'resp-1'},
+             end_user_id='user-4411', customer_id='acme-bank', tags_json='{"team":"risk"}'),
+        dict(llm, schema_version='v1.11', timestamp_utc='2026-10-01T00:00:01Z', event_id='evt-x1', request_id='req-x1',
+             messages=rec['messages'], response_text=rec['response_text'], findings=rec['findings'],
+             tool_calls=_EXCHANGE_SELFTEST_TOOL_CALLS, raw_request=None, raw_response=None,
+             content=dict(capture_policy='full',
+                          prompt_sha256_jcs=V1_10_DIGEST_FIXTURE_PROMPT, response_sha256=V1_10_DIGEST_FIXTURE_RESPONSE,
+                          stored_prompt_sha256_jcs=V1_10_DIGEST_FIXTURE_PROMPT,
+                          stored_response_sha256=V1_10_DIGEST_FIXTURE_RESPONSE,
+                          findings_sha256_jcs=V1_10_DIGEST_FIXTURE_FINDINGS,
+                          tool_calls_sha256_jcs=tool_digest, stored_tool_calls_sha256_jcs=tool_digest)),
+        dict(llm, schema_version='v1.12', timestamp_utc='2026-10-01T00:00:02Z', event_id='evt-x2', request_id='req-x2',
+             messages=[], response_text=None, raw_request=None, raw_response=None,
+             identity=dict(agent_id='agt_selftest', tier='t1', credential_kind='agent_key',
+                           credential_kid='a7f3k2m9p4q8r1s6',
+                           asserted_digest=asserted_claims_digest(_EXCHANGE_SELFTEST_ASSERTED),
+                           asserted=dict(_EXCHANGE_SELFTEST_ASSERTED))),
+        dict(schema_version='v1.2', event_kind='auth_session_started', timestamp_utc='2026-10-01T00:00:03Z',
+             event_id='evt-x3', request_id='req-x3', model_requested='', action='allow', input_tokens=0,
+             output_tokens=0, estimated_cost_usd=None, findings=[], messages=[], response_text=None,
+             raw_request=None, raw_response=None, end_user_id='usr-01',
+             auth_session=dict(user_email='ana.lima@bank.example', user_id='usr-01', project_id='proj-01',
+                               proxy_id='pxy_01', session_expires_at=1790812800,
+                               identity_provenance='meilynx-cp-handoff', jti='jti-01', signing_key_fingerprint='ab12')),
+        dict(llm, schema_version='v1.1', timestamp_utc='2026-10-01T00:00:04Z', event_id='evt-x4', request_id='req-x4',
+             messages=[{'role': 'user', 'content': 'after the session'}], response_text='ok'),
+    ]
+    prev = genesis_hash()
+    for seq, record in enumerate(records):
+        record['sequence_number'] = seq
+        record['previous_hash'] = prev
+        record['event_hash'] = recompute_event_hash(record, seq, prev)
+        prev = record['event_hash']
+    shipped = []
+    for record in records:
+        if record['sequence_number'] == _EXCHANGE_SELFTEST_STUB_SEQ:
+            shipped.append({k: record[k] for k in STUB_FIELDS})
+            continue
+        out = json.loads(json.dumps(record))
+        for path in STRIPPED_FIELDS:
+            head, _, rest = path.partition('.')
+            if not rest:
+                out.pop(head, None)
+            elif isinstance(out.get(head), dict):
+                out[head].pop(rest, None)
+        shipped.append(out)
+    return records, shipped
+
+
+_EXCHANGE_SELFTEST_STUB = {'sequence': _EXCHANGE_SELFTEST_STUB_SEQ, 'reason': 'sealed_personal_identifier',
+                           'field': 'auth_session.user_email'}
+
+
+def _exchange_selftest_manifest(records, stubs=(_EXCHANGE_SELFTEST_STUB,)):
+    """A 1.5 manifest (unsigned, window A) over `records`, listing `stubs`."""
+    last = records[-1]['sequence_number']
+    chain = chain_for_prefix(_EXCHANGE_SELFTEST_PREFIX)
+    manifest = {
+        'schema_version': '1.5', 'window': 'A', 'signing_deferred': True, 'hash_version': 'v1',
+        'prefix': _EXCHANGE_SELFTEST_PREFIX, 'from_sequence': 0, 'to_sequence': last,
+        'content': CONTENT_STRIPPED, 'removed_fields': list(STRIPPED_FIELDS),
+        'anchoring': {'state': 'unanchored', 'chains': [{
+            'chain': chain, 'reason': 'no_anchors_found', 'anchored_through_seq': None,
+            'unanchored_tail': {'from_seq': 0, 'to_seq': last}, 'anchors': [], 'seals': []}]},
+        'events': [{'sequence': r['sequence_number'], 'stored_event_hash': r['event_hash'],
+                    'recomputed_event_hash': r['event_hash']} for r in records],
+    }
+    if stubs:
+        manifest['stubs'] = [dict(s) for s in stubs]
+    return manifest
+
+
+def content_carry_forward_self_test():
+    """The stored-content check on every bucket that seals the
+    content digests, and the malformed-input paths that must fail by name:
+    v1.16 and v1.18 records get the v1.12 check (35a, 35b), a content-stripped
+    axis reads the same on all three (35c), a content block on a v1.18 MCP
+    record is refused while v1.12 MCP keeps its behaviour (35d), a trace with
+    no sealed digest or a content block with no capture policy is a FAIL line
+    (35e), and a control-plane sequence_number outside 64 bits is a FAIL line
+    (35f)."""
+    import contextlib
+    import io
+    import tempfile
+
+    ok = True
+
+    def check(label, passed, what, detail=''):
+        nonlocal ok
+        print(f"SELF-TEST assertion {label} {'PASS' if passed else 'FAIL'}: {what}")
+        if not passed:
+            if detail:
+                print(detail, file=sys.stderr)
+            ok = False
+
+    messages = [{'role': 'user', 'content': 'Summarize the Q3 variance memo.'}]
+    response = 'Revenue was 4% under plan, driven by delayed renewals.'
+    calls = [{'id': 'call_1', 'name': 'lookup', 'input': {'account': 'acct-1'}}]
+    content = dict(
+        capture_policy='full',
+        prompt_sha256_jcs=sha256_jcs(messages),
+        response_sha256=hashlib.sha256(response.encode('utf-8')).hexdigest(),
+        stored_prompt_sha256_jcs=sha256_jcs(messages),
+        stored_response_sha256=hashlib.sha256(response.encode('utf-8')).hexdigest(),
+        findings_sha256_jcs=sha256_jcs([]),
+        tool_calls_sha256_jcs=sha256_jcs(calls),
+        stored_tool_calls_sha256_jcs=sha256_jcs(calls),
+    )
+    trace = {'outcomes_sha256_jcs': V1_16_OUTCOMES_DIGEST_FIXTURE,
+             'outcomes': json.loads(json.dumps(_V1_16_OUTCOMES_FIXTURE))}
+
+    def sealed(version):
+        record = dict(
+            schema_version=version, event_kind='llm_request', sequence_number=0,
+            timestamp_utc='2026-10-09T16:21:00Z', event_id='evt-0', request_id='req-0',
+            model_requested='gpt-6-luna', action='allow', input_tokens=12, output_tokens=14,
+            estimated_cost_usd=None, previous_hash=genesis_hash(),
+            messages=json.loads(json.dumps(messages)), response_text=response, findings=[],
+            tool_calls=json.loads(json.dumps(calls)), content=dict(content),
+            evaluation_trace=json.loads(json.dumps(trace)),
+        )
+        if version == 'v1.18':
+            record['customer'] = dict(_V1_18_CUSTOMER_NONE_FIXTURE)
+        record['event_hash'] = recompute_event_hash(record, 0, genesis_hash())
+        return record
+
+    def walk(record, manifest_hash):
+        manifest = {'hash_version': 'v1', 'prefix': 'audit/self-test/',
+                    'events': [{'sequence': 0, 'recomputed_event_hash': manifest_hash}]}
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            records = Path(tmp) / 'records'
+            records.mkdir()
+            (records / record_file_name(0)).write_bytes(json.dumps(record).encode('utf-8'))
+            try:
+                with contextlib.redirect_stdout(out):
+                    passed = verify_manifest_with(local_fetcher(records), manifest)
+            except Exception as exc:  # the assertion is that nothing escapes the walk
+                return None, [f'{type(exc).__name__}: {exc}']
+        return passed, out.getvalue().splitlines()
+
+    # 35a / 35b — intact passes; an edited prompt, response or tool call still
+    # hash-verifies (outside the preimage) and fails the content check; no
+    # content block means no capture policy, as on v1.12.
+    for label, version in (('35a', 'v1.16'), ('35b', 'v1.18')):
+        record = sealed(version)
+        intact, intact_lines = walk(record, record['event_hash'])
+        caught = []
+        for field, edit in (('messages', lambda r: r['messages'][0].update(content='Wire the bonus pool.')),
+                            ('response_text', lambda r: r.update(response_text='Revenue was on plan.')),
+                            ('tool_calls', lambda r: r['tool_calls'][0]['input'].update(account='acct-2'))):
+            edited = json.loads(json.dumps(record))
+            edit(edited)
+            still_hashes = recompute_event_hash(edited, 0, genesis_hash()) == record['event_hash']
+            passed, lines = walk(edited, record['event_hash'])
+            caught.append(still_hashes and passed is False
+                          and any(l.startswith('FAIL seq=0:') and field in l for l in lines))
+        bare = json.loads(json.dumps(record))
+        del bare['content']
+        check(label, intact is True and all(caught) and check_llm_content(bare) == [],
+              f'a {version} record is content-checked as v1.12: intact passes, an edited prompt, response '
+              f'or tool call fails, no content block is not checked',
+              f'intact {intact} {intact_lines}, caught {caught}, bare {check_llm_content(bare)}')
+
+    # 35c — a content-stripped axis is not re-derived on any of the three, and
+    # the kept findings axis is still checked.
+    stripped = frozenset(STRIPPED_FIELDS)
+    verdicts = {}
+    for version in ('v1.12', 'v1.16', 'v1.18'):
+        record = sealed('v1.16')
+        record['schema_version'] = version
+        for field in ('messages', 'response_text', 'tool_calls'):
+            record.pop(field, None)
+        edited_findings = dict(record, findings=[{'validator': 'added-after-sealing'}])
+        verdicts[version] = (check_llm_content(record, stripped), len(check_llm_content(edited_findings, stripped)))
+    check('35c', len(set(map(repr, verdicts.values()))) == 1 and verdicts['v1.12'] == ([], 1),
+          'a content-stripped axis reads the same on v1.12, v1.16 and v1.18; the findings axis is still checked',
+          f'{verdicts}')
+
+    # 35d — a v1.18 MCP record carrying a content block is refused (the MCP
+    # preimage never reads it); a v1.12 MCP record keeps its behaviour.
+    mcp_118 = dict(
+        schema_version='v1.18', event_kind='mcp_tool_call', event_id='evt-tool-call', request_id='req-tool-7',
+        timestamp_utc='2026-10-10T12:00:01Z', model_requested='', action='allow', input_tokens=0, output_tokens=0,
+        mcp_event=dict(_V1_5_MCP_TOOL_CALL_FIXTURE_PAYLOAD), customer=dict(_V1_18_CUSTOMER_NONE_FIXTURE),
+    )
+    mcp_118['event_hash'] = recompute_event_hash(mcp_118, 0, genesis_hash())
+    mcp_118['previous_hash'] = genesis_hash()
+    carrying = dict(mcp_118, content=dict(content), messages=json.loads(json.dumps(messages)))
+    passed, lines = walk(carrying, mcp_118['event_hash'])
+    mcp_112 = dict(
+        schema_version='v1.12', event_kind='mcp_tool_call', event_id='evt-mcp', request_id='req-mcp',
+        timestamp_utc='2026-10-10T12:00:01Z', model_requested='', action='allow', input_tokens=0, output_tokens=0,
+        mcp_event=dict(_V1_12_MCP_TOOL_CALL_FIXTURE_PAYLOAD), identity=dict(_V1_12_IDENTITY_T2_FIXTURE_PAYLOAD),
+    )
+    v112_hash = recompute_event_hash(mcp_112, 0, genesis_hash())
+    v112_admitted = recompute_event_hash(dict(mcp_112, content=dict(content)), 0, genesis_hash()) == v112_hash
+    check('35d', passed is False and v112_admitted
+          and any(l.startswith('FAIL seq=0:') and 'hashed only on the llm_request lane' in l for l in lines),
+          'a content block on a v1.18 MCP record fails as unattested; v1.12 MCP is unchanged',
+          f'passed {passed}, lines {lines}, v1.12 admitted {v112_admitted}')
+
+    # 35e — a trace with no sealed digest, or a content block with no capture
+    # policy, fails by name instead of raising.
+    cases = []
+    record = sealed('v1.16')
+    no_digest = json.loads(json.dumps(record))
+    del no_digest['evaluation_trace']['outcomes_sha256_jcs']
+    cases.append(('outcomes_sha256_jcs', no_digest))
+    cases.append(('outcomes_sha256_jcs', dict(record, evaluation_trace='not a trace')))
+    no_policy = json.loads(json.dumps(record))
+    del no_policy['content']['capture_policy']
+    cases.append(('capture_policy', no_policy))
+    results = []
+    for needle, case in cases:
+        passed, lines = walk(case, record['event_hash'])
+        results.append(passed is False and any(l.startswith('FAIL seq=0:') and needle in l for l in lines))
+    check('35e', all(results),
+          'a trace with no outcomes_sha256_jcs, or a content block with no capture_policy, is a named FAIL',
+          f'{results}')
+
+    # 35f — a control-plane sequence_number outside the signed 64-bit range
+    # the preimage encodes is a named FAIL on the control-plane walk.
+    results = []
+    for seq in ('9223372036854775808', '-9223372036854775809', '18446744073709551616'):
+        text = (_CONTROL_PLANE_V1_VECTORS[0][0]
+                .replace('"sequence_number":0', f'"sequence_number":{seq}', 1))
+        record = load_control_plane_record(text.encode('utf-8'))
+        manifest = {'schema_version': '1.3', 'control_plane': {
+            'chain_family': 'control-plane', 'prefix': 'control-plane/', 'hash_algorithm': 'SHA-256',
+            'hash_version': 'v1', 'genesis_hash': genesis_hash(), 'verified': True, 'records_checked': 1,
+            'events': [{'sequence': 0, 'event_id': record['event_id'], 'stored_event_hash': record['event_hash'],
+                        'recomputed_event_hash': record['event_hash']}]}}
+        lines = []
+        try:
+            passed, _ = verify_control_plane_chain(lambda _seq, text=text: text.encode('utf-8'), manifest, lines.append)
+        except Exception as exc:  # the assertion is that nothing escapes the walk
+            passed, lines = None, [f'{type(exc).__name__}: {exc}']
+        results.append(passed is False and '"sequence_number":0' in _CONTROL_PLANE_V1_VECTORS[0][0]
+                       and any(l.startswith('FAIL control-plane seq=0:') and '64-bit' in l for l in lines))
+    check('35f', all(results),
+          'a control-plane sequence_number outside the signed 64-bit range is a named FAIL', f'{results}')
+    return ok
+
+
+def exchange_self_test():
+    """The content-stripped Exchange pack (manifest 1.5): the
+    content claim and the stub list are read only where 1.5 puts them and only
+    as this verifier's profile; a stripped chain verifies from its sealed
+    digests and links through a hash-only stub without recomputing it; the
+    same records read as a full pack fail; a stripped record that still
+    carries a removed field or a withheld personal identifier cannot be
+    evaluated; the findings a stripped record keeps are still checked; a stub
+    whose hashes break the link, that carries more than its coordinates, that
+    stands for an unreadable record, or that the manifest does not list fails;
+    receipt evidence and an anchor that name a stub are checked by its hash;
+    and the command line prints the content and stub lines, counts the stubs
+    on the verdict, refuses --bucket, and exits 2 on a contradicted claim and
+    1 on a broken stub."""
+    import contextlib
+    import io
+    import subprocess
+    import tempfile
+
+    ok = True
+
+    def check(label, passed, detail=''):
+        nonlocal ok
+        print(f"SELF-TEST assertion {label} {'PASS' if passed else 'FAIL'}{': ' + detail if detail else ''}")
+        ok = ok and passed
+
+    records, shipped = _exchange_selftest_chain()
+    stub_seq = _EXCHANGE_SELFTEST_STUB_SEQ
+    stub = shipped[stub_seq]
+    check('32a', records[-1]['event_hash'] == EXCHANGE_SELFTEST_HEAD_HASH
+          and list(stub) == list(STUB_FIELDS) and stub['event_hash'] == records[stub_seq]['event_hash']
+          and all(recompute_event_hash(s, s['sequence_number'], s['previous_hash']) == s['event_hash']
+                  for s in shipped if s is not stub),
+          'the TEST-ONLY chain recomputes to its pinned head; every stripped record recomputes to its stored hash; '
+          'the stub is the four coordinates of the sealed-email record')
+
+    manifest = _exchange_selftest_manifest(shipped)
+    stub_entry = dict(_EXCHANGE_SELFTEST_STUB)
+    bad = [
+        dict(manifest, content='full'),
+        dict(manifest, removed_fields=list(STRIPPED_FIELDS)[1:]),
+        dict(manifest, removed_fields=list(STRIPPED_FIELDS) + ['findings']),
+        dict(manifest, removed_fields=list(STRIPPED_FIELDS) + ['messages']),
+        {k: v for k, v in manifest.items() if k != 'content'},
+        dict(manifest, schema_version='1.4', evidence_class='sandbox-non-production'),
+        dict(manifest, stubs=[dict(stub_entry, reason='other')]),
+        dict(manifest, stubs=[dict(stub_entry, sequence=9)]),
+        dict(manifest, stubs=[stub_entry, stub_entry]),
+        dict(manifest, stubs=[]),
+        dict(manifest, stubs=[dict(stub_entry, statement='x')]),
+    ]
+    errors = [manifest_content_error(m) for m in bad]
+    good = [manifest, _exchange_selftest_manifest(shipped, stubs=()),
+            dict(manifest, evidence_class='sandbox-non-production'),
+            dict(manifest, removed_fields=sorted(STRIPPED_FIELDS, reverse=True))]
+    good_ok = (all(manifest_content_error(m) is None for m in good)
+               and manifest_evidence_class_error(manifest) is None
+               and manifest_evidence_class_error(good[2]) is None
+               and manifest_evidence_class_error(dict(manifest, evidence_class='production')) is not None
+               and manifest_storage_layout_error(manifest) is None
+               and control_plane_manifest_problem(manifest) is None
+               and manifest_schema_version_error(manifest) is None
+               and manifest_stubs(manifest) == {stub_seq: ('sealed_personal_identifier', 'auth_session.user_email')}
+               and manifest_stubs(dict(manifest, schema_version='1.4')) == {})
+    if not (good_ok and all(errors)):
+        print(f"  {errors!r}", file=sys.stderr)
+    check('32b', good_ok and all(errors),
+          'manifest 1.5: the stripped profile and the stub list are read (evidence_class, storage_layout, '
+          'control_plane and stubs optional); another content value, a removed-field list that is not the profile, '
+          'the fields on 1.4, a stub with an unknown reason, outside the events, repeated or with other keys, '
+          'or an empty stub list, is refused (exit 2)')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        rdir = tmp / 'records'
+        rdir.mkdir()
+
+        def write(recs):
+            for f in rdir.glob('*.bin'):
+                f.unlink()
+            for seq, r in enumerate(recs):
+                (rdir / record_file_name(seq)).write_bytes(json.dumps(r).encode('utf-8'))
+
+        profile = frozenset(STRIPPED_FIELDS)
+
+        def walk(m=manifest, with_stubs=True):
+            problems, out = [], io.StringIO()
+            with contextlib.redirect_stdout(out):
+                passed = verify_manifest_with(local_fetcher(rdir), m, stripped=profile, cannot_evaluate_out=problems,
+                                              stubs=manifest_stubs(m) if with_stubs else {})
+            return passed, problems, out.getvalue()
+
+        write(shipped)
+        clean, problems, out = walk()
+        stub_line = [l for l in out.splitlines() if l.startswith(f'STUB seq={stub_seq} ')]
+        check('32c', clean and not problems and len(stub_line) == 1 and 'auth_session.user_email' in stub_line[0]
+              and 'PASS seq=4 ' in out,
+              'a stripped chain (v1.1, v1.11 with sealed content and tool-call digests, v1.12 with sealed identity) '
+              'verifies from its digests, links through the hash-only stub at seq 3 on its own STUB line, and the '
+              'record after the stub links to it')
+
+        as_full = verify_manifest_with(local_fetcher(rdir), manifest, quiet=True)
+        check('32d', not as_full,
+              'the same records read as a full pack fail the content checks and the stub: the signed claim is what '
+              'lets them verify')
+
+        leaked = json.loads(json.dumps(shipped))
+        leaked[1]['messages'] = records[1]['messages']
+        leaked[stub_seq] = records[stub_seq]
+        write(leaked)
+        passed, problems, _ = walk()
+        named = sorted((seq, p.rsplit(' carries ', 1)[1].split(',')[0]) for seq, p in problems)
+        check('32e', not passed and (1, 'messages') in named and (stub_seq, 'auth_session.user_email') in named,
+              f'a stripped record that keeps a removed field, or a stub that carries the withheld email, is refused '
+              f'by name (got {named})')
+
+        edited = json.loads(json.dumps(shipped))
+        edited[1]['findings'][0]['severity'] = 'low'
+        write(edited)
+        passed, problems, _ = walk()
+        check('32f', not passed and not problems,
+              'findings a stripped record keeps are still checked against their sealed digest')
+
+        broken = {}
+        for label, change in (('hash', lambda s: s.update(event_hash='0' * 64)),
+                              ('link', lambda s: s.update(previous_hash='0' * 64)),
+                              ('body', lambda s: s.update(event_id='evt-x3')),
+                              ('sequence', lambda s: s.update(sequence_number=7))):
+            variant = json.loads(json.dumps(shipped))
+            change(variant[stub_seq])
+            write(variant)
+            passed, _, out = walk()
+            broken[label] = (not passed and f'FAIL seq={stub_seq}: hash-only stub' in out)
+        write(shipped)
+        unreadable = dict(manifest, stubs=[dict(stub_entry, reason='unreadable_record', field='record')])
+        passed, _, out = walk(unreadable)
+        broken['unreadable'] = not passed and f'FAIL seq={stub_seq}: hash-only stub of a record that does not parse' in out
+        unlisted = _exchange_selftest_manifest(shipped, stubs=())
+        passed, _, out = walk(unlisted)
+        broken['unlisted'] = not passed and f'FAIL seq={stub_seq}: hash recomputation disagrees' in out
+        if not all(broken.values()):
+            print(f"  {broken!r}", file=sys.stderr)
+        check('32g', all(broken.values()),
+              'a stub whose event_hash is not the signed one, whose previous_hash breaks the link, that carries '
+              'more than its coordinates or another sequence, that stands for an unreadable record, or that the '
+              'manifest does not list, fails (exit 1)')
+
+        held = {stub_seq: (STUB_EVENT_ID, stub['event_hash'])}
+        cite = {'chain_id': chain_for_prefix(_EXCHANGE_SELFTEST_PREFIX), 'sequence_number': stub_seq, 'event_id': 'evt-x3', 'event_hash': stub['event_hash'],
+                'role': 'ai_contribution'}
+        pack_chain = chain_for_prefix(_EXCHANGE_SELFTEST_PREFIX)
+        good_fail, good_warn = receipt_evidence_findings(9, {'receipt_id': 'r', 'evidence': [cite]}, pack_chain, held,
+                                                         {stub_seq})
+        bad_fail, _ = receipt_evidence_findings(9, {'receipt_id': 'r', 'evidence': [dict(cite, event_hash='1' * 64)]},
+                                                pack_chain, held, {stub_seq})
+        anchored, recomputed = _read_record(local_fetcher(rdir), stub_seq, frozenset({stub_seq}))
+        try:
+            _, not_stub = _read_record(local_fetcher(rdir), stub_seq)
+        except AnchorFailure:
+            not_stub = None
+        check('32h', not good_fail and len(good_warn) == 1 and 'cites a hash-only stub' in good_warn[0]
+              and len(bad_fail) == 1 and recomputed == stub['event_hash'] and not_stub != stub['event_hash'],
+              'receipt evidence that cites a stub is checked by its hash (its event_id is not in the pack), and an '
+              'anchor on a stub reads the hash the chain links, never a recompute of the missing body')
+
+        # 32i — the command line, end to end.
+        write(shipped)
+        (tmp / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+
+        def cli(*extra):
+            run = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--manifest',
+                                  str(tmp / 'manifest.json'), *extra], capture_output=True, text=True)
+            return run.returncode, run.stdout + run.stderr
+
+        code, out = cli('--records', str(rdir), '--allow-unsigned')
+        before = (out.find('CONTENT: stripped') < out.find('STUBS: 1 record(s)') < out.find('PASS seq=0')
+                  and f'STUB seq={stub_seq} ' in out)
+        verdict = out.splitlines()[-1]
+        verdict_ok = ('5 events verified, 1 of them as hash-only stubs' in verdict
+                      and verdict.endswith('[content: stripped; 1 hash-only stub]'))
+        kept_prompt = json.loads(json.dumps(shipped))
+        kept_prompt[1]['messages'] = records[1]['messages']
+        write(kept_prompt)
+        leaked_code, leaked_out = cli('--records', str(rdir), '--allow-unsigned')
+        tampered = json.loads(json.dumps(shipped))
+        tampered[stub_seq]['event_hash'] = '0' * 64
+        write(tampered)
+        broken_code, broken_out = cli('--records', str(rdir), '--allow-unsigned')
+        bucket_code, bucket_out = cli('--bucket', 'meilynx-audit-selftest-invalid', '--allow-unsigned')
+    cli_ok = (code == EXIT_OK and before and verdict_ok
+              and leaked_code == EXIT_CANNOT_EVALUATE and 'CANNOT EVALUATE seq=1' in leaked_out
+              and broken_code == EXIT_FAIL and f'FAIL seq={stub_seq}: hash-only stub' in broken_out
+              and bucket_code == EXIT_CANNOT_EVALUATE and '--records' in bucket_out)
+    if not cli_ok:
+        print(out + leaked_out + broken_out + bucket_out, file=sys.stderr)
+    check('32i', cli_ok,
+          '--records: a stripped pack with a stub exits 0, prints its content and stub lines before the records, '
+          'and counts the stub on the verdict; one that still carries a removed field exits 2; a stub with a '
+          'broken hash exits 1; --bucket on it exits 2')
+
+    return ok
+
+
+# ── Customer-conditions verdict: TEST-ONLY vectors ────────────────
+# A holder's control-plane chain that receives and then accepts one condition
+# set, and a proxy chain around the acceptance: a model request before it; an
+# MCP call right after it still under the old MCP bundle (a gap); a v1.16
+# model request whose sealed evaluation trace ran the set's instance; a v1.10
+# model request whose policy_version names the compiled governance version
+# (stored, not hashed) and whose digest-bound findings name the instance (an
+# exception); and an MCP call under the compiled MCP bundle. TEST-ONLY:
+# synthetic digests and ids, never a real set, relationship or chain.
+CONDITIONS_SELFTEST_SET = hashlib.sha256(b'TEST-ONLY customer condition set').hexdigest()
+_CONDITIONS_SELFTEST_RELATIONSHIP = '0a1b2c3d-4e5f-4061-8273-94a5b6c7d8e9'
+_CONDITIONS_SELFTEST_SUFFIX = 'cust_0a1b2c3d4e5f'
+_CONDITIONS_SELFTEST_GOVERNANCE = hashlib.sha256(b'TEST-ONLY compiled governance bundle').hexdigest()
+_CONDITIONS_SELFTEST_MCP = hashlib.sha256(b'TEST-ONLY compiled MCP bundle').hexdigest()
+_CONDITIONS_SELFTEST_OLD_GOVERNANCE = hashlib.sha256(b'TEST-ONLY earlier governance bundle').hexdigest()
+_CONDITIONS_SELFTEST_OLD_MCP = hashlib.sha256(b'TEST-ONLY earlier MCP bundle').hexdigest()
+CONDITIONS_SELFTEST_ACCEPTANCE_HASH = "d4a4d9c852850ab6b486a0bcefb0c0dd363aa2e450e592c453dfad9560381ece"
+CONDITIONS_SELFTEST_HEAD_HASH = "f624f780c5b43d9d940f67f03174a0fd24ba06eb3eed5911ccb608dbd5c3259d"
+
+
+def _conditions_selftest_control_plane():
+    """The TEST-ONLY control-plane chain, as stored text, sealed from genesis."""
+    def payload(**extra):
+        base = {'relationship_id': _CONDITIONS_SELFTEST_RELATIONSHIP,
+                'holder_project_id': '5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b',
+                'subscriber_organization_id': '9f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a',
+                'version': ControlPlaneNumber('1'), 'conditions_sha256': CONDITIONS_SELFTEST_SET,
+                'condition_ids': ['approved-providers', 'sensitive-data']}
+        base.update(extra)
+        return base
+    records = [
+        dict(event_kind='exchange.conditions_received', occurred_at='2026-10-16T10:00:00.0000000Z',
+             event_id='1c2d3e4f-5a6b-4c7d-8e9f-0a1b2c3d4e5f', payload=payload(actorRole='owner')),
+        dict(event_kind=CONDITIONS_ACCEPTED_KIND, occurred_at='2026-10-16T10:05:00.0000000Z',
+             event_id='2d3e4f5a-6b7c-4d8e-9fa0-1b2c3d4e5f6a',
+             payload=payload(compiled_governance_sha256=_CONDITIONS_SELFTEST_GOVERNANCE,
+                             compiled_mcp_sha256=_CONDITIONS_SELFTEST_MCP,
+                             compiled_artifacts_sha256=hashlib.sha256(b'TEST-ONLY artifacts').hexdigest(),
+                             scope_kind='dedicated', acting_via_organization_id=None, supersedes_version=None,
+                             actorRole='owner')),
+    ]
+    texts, prev = [], genesis_hash()
+    for seq, r in enumerate(records):
+        r.update(schema_version='v1', sequence_number=ControlPlaneNumber(str(seq)), previous_hash=prev,
+                 actor_user_id='11111111-2222-4333-8444-555555555555',
+                 correlation_id='3e4f5a6b-7c8d-4e9f-8a0b-1c2d3e4f5a6b',
+                 project_id='5e6f7a8b-9c0d-4e1f-8a2b-3c4d5e6f7a8b',
+                 target_resource_id=_CONDITIONS_SELFTEST_RELATIONSHIP)
+        r['event_hash'] = control_plane_event_hash_v1(r)
+        prev = r['event_hash']
+        texts.append(control_plane_canonical(r))
+    return texts
+
+
+def _conditions_selftest_records():
+    """The TEST-ONLY proxy chain, sealed from genesis, as record dicts."""
+    instance = f'pii-detection@{_CONDITIONS_SELFTEST_SUFFIX}'
+    trace = {'v': 1, 'rules': [
+        {'rule_id': 'pii-detection', 'rule_name': 'PII detection', 'stage': 'pre_request',
+         'validator_kind': 'builtin', 'outcome': 'clean', 'action': 'allow'},
+        {'rule_id': instance, 'rule_name': 'PII detection (customer condition)', 'stage': 'pre_request',
+         'validator_kind': 'builtin', 'outcome': 'clean', 'action': 'allow'},
+    ], 'deciding_rule_id': None, 'delivery': {'mode': 'non_streaming', 'outcome': 'delivered'}}
+    finding = [{'validator': instance, 'severity': 'high', 'message': 'SSN detected', 'code': 'pii-ssn',
+                'category': 'pii'}]
+    llm = dict(model_requested='gpt-6-luna', action='allow', input_tokens=40, output_tokens=8,
+               estimated_cost_usd=None, findings=[])
+    mcp = lambda bundle: dict(_V1_5_MCP_BARE_AGENT_FIXTURE_PAYLOAD, mcp_bundle_sha256=bundle)
+    records = [
+        dict(llm, schema_version='v1.1', timestamp_utc='2026-10-16T10:00:30Z', event_id='evt-c0', request_id='req-c0',
+             policy_version=_CONDITIONS_SELFTEST_OLD_GOVERNANCE, messages=[{'role': 'user', 'content': 'hi'}]),
+        dict(schema_version='v1.5', event_kind='mcp_tool_call', timestamp_utc='2026-10-16T10:05:30Z',
+             event_id='evt-c1', request_id='req-c1', model_requested='', action='allow', input_tokens=0,
+             output_tokens=0, findings=[], mcp_event=mcp(_CONDITIONS_SELFTEST_OLD_MCP)),
+        dict(llm, schema_version='v1.16', timestamp_utc='2026-10-16T10:06:00Z', event_id='evt-c2', request_id='req-c2',
+             policy_version=_CONDITIONS_SELFTEST_GOVERNANCE,
+             evaluation_trace={'outcomes_sha256_jcs': sha256_jcs(trace), 'outcomes': trace,
+                               'timing': {'stages': [], 'rules': []}}),
+        dict(llm, schema_version='v1.10', timestamp_utc='2026-10-16T10:07:00Z', event_id='evt-c3', request_id='req-c3',
+             action='block', policy_version=_CONDITIONS_SELFTEST_GOVERNANCE, findings=finding,
+             content={'capture_policy': 'hash_only', 'prompt_sha256_jcs': 'd' * 64,
+                      'findings_sha256_jcs': sha256_jcs(finding)}),
+        dict(schema_version='v1.5', event_kind='mcp_tool_call', timestamp_utc='2026-10-16T10:08:00Z',
+             event_id='evt-c4', request_id='req-c4', model_requested='', action='allow', input_tokens=0,
+             output_tokens=0, findings=[], mcp_event=mcp(_CONDITIONS_SELFTEST_MCP)),
+    ]
+    prev = genesis_hash()
+    for seq, r in enumerate(records):
+        r['sequence_number'] = seq
+        r['previous_hash'] = prev
+        r['event_hash'] = recompute_event_hash(r, seq, prev)
+        prev = r['event_hash']
+    return records
+
+
+def conditions_self_test():
+    """The customer-conditions verdict: on a pack
+    that carries the holder's control-plane chain it finds the acceptance,
+    counts the window's records sealed under the compiled set, names each gap
+    and exception by its coordinates, and keeps an unsealed policy_version
+    apart; the same verdict holds on the records stripped for an Exchange
+    pack; a pack without the acceptance cannot evaluate it (exit 2) and still
+    names the instances it holds; an acceptance supplied outside the pack is
+    recomputed and a rewritten one fails; another set's digest is not
+    accepted; and the command line prints the verdict line and combines its
+    exit code."""
+    import subprocess
+    import tempfile
+
+    ok = True
+
+    def check(label, passed, detail=''):
+        nonlocal ok
+        print(f"SELF-TEST assertion {label} {'PASS' if passed else 'FAIL'}{': ' + detail if detail else ''}")
+        ok = ok and passed
+
+    cp_texts = _conditions_selftest_control_plane()
+    cp_loaded = [load_control_plane_record(t.encode('utf-8')) for t in cp_texts]
+    records = _conditions_selftest_records()
+    check('33a', cp_loaded[1]['event_hash'] == CONDITIONS_SELFTEST_ACCEPTANCE_HASH
+          and records[-1]['event_hash'] == CONDITIONS_SELFTEST_HEAD_HASH
+          and conditions_instance_suffix(_CONDITIONS_SELFTEST_RELATIONSHIP) == _CONDITIONS_SELFTEST_SUFFIX
+          and all(control_plane_event_hash_v1(r) == r['event_hash'] for r in cp_loaded),
+          'the TEST-ONLY chains recompute to their pinned hashes; the instance suffix is cust_ + 12 hex of the '
+          'relationship id')
+
+    cp_records = {seq: (r, True) for seq, r in enumerate(cp_loaded)}
+    by_seq = {r['sequence_number']: r for r in records}
+    lines = []
+    status = conditions_verdict(CONDITIONS_SELFTEST_SET, {}, by_seq, cp_records, report=lines.append)
+    expected = (f"conditions: set {CONDITIONS_SELFTEST_SET} accepted at seq 1; 2 of 4 records in the window "
+                f"sealed under a governance version carrying it; 1 exceptions; compiled by the holder's "
+                f"control plane")
+    in_pack_ok = (status == PASSED and lines[-1] == expected
+                  and sum(l.startswith('GAP seq=1 ') for l in lines) == 1
+                  and not any(l.startswith('GAP seq=') and not l.startswith('GAP seq=1 ') for l in lines)
+                  and any(l.startswith('NOTE: 1 model request(s) in the window (seq 3)') for l in lines)
+                  and any(l.startswith('EXCEPTION seq=3 ') and 'bound by content.findings_sha256_jcs' in l
+                          for l in lines))
+    if not in_pack_ok:
+        print('\n'.join(lines), file=sys.stderr)
+    check('33b', in_pack_ok,
+          'acceptance in the pack: 2 of 4 window records sealed under the set, the stale MCP bundle a gap at '
+          'seq 1, an unsealed policy_version kept apart, one digest-bound exception at seq 3')
+
+    def strip(record):
+        out = json.loads(json.dumps(record))
+        for path in STRIPPED_FIELDS:
+            head, _, rest = path.partition('.')
+            if not rest:
+                out.pop(head, None)
+            elif isinstance(out.get(head), dict):
+                out[head].pop(rest, None)
+        return out
+
+    stripped = {seq: strip(r) for seq, r in by_seq.items()}
+    lines = []
+    status = conditions_verdict(CONDITIONS_SELFTEST_SET, {}, stripped, cp_records, report=lines.append)
+    check('33c', status == PASSED and lines[-1] == expected and 'messages' not in stripped[0],
+          'the same verdict on the records of a content-stripped pack')
+
+    lines = []
+    status = conditions_verdict(CONDITIONS_SELFTEST_SET, {}, by_seq, {}, report=lines.append)
+    absent_ok = (status == CANNOT_EVALUATE
+                 and any('acceptance not in this pack' in l for l in lines)
+                 and lines[-1].startswith(f"conditions: set {CONDITIONS_SELFTEST_SET} acceptance not in this pack;")
+                 and '1 records name a customer-condition instance' in lines[-1]
+                 and any(l.startswith('INSTANCE seq=3:') for l in lines))
+    if not absent_ok:
+        print('\n'.join(lines), file=sys.stderr)
+    check('33d', absent_ok,
+          'no control-plane chain and no acceptance supplied: acceptance not in this pack, cannot evaluate '
+          '(exit 2), the instances the pack names are still listed')
+
+    lines = []
+    supplied_status = conditions_verdict(CONDITIONS_SELFTEST_SET, {}, stripped, {},
+                                         supplied=(cp_loaded[1], 'acceptance.json'), report=lines.append)
+    supplied_ok = supplied_status == PASSED and lines[-1] == expected and any(
+        'supplied outside this pack' in l for l in lines)
+    rewritten = json.loads(cp_texts[1])
+    rewritten['payload']['compiled_mcp_sha256'] = _CONDITIONS_SELFTEST_OLD_MCP
+    lines_bad = []
+    bad_status = conditions_verdict(
+        CONDITIONS_SELFTEST_SET, {}, stripped, {},
+        supplied=(load_control_plane_record(json.dumps(rewritten).encode('utf-8')), 'acceptance.json'),
+        report=lines_bad.append)
+    other_set = hashlib.sha256(b'TEST-ONLY another set').hexdigest()
+    lines_other = []
+    other_status = conditions_verdict(other_set, {}, by_seq, cp_records, report=lines_other.append)
+    check('33e', supplied_ok and bad_status == FAILED
+          and any('does not recompute to its event_hash' in l for l in lines_bad)
+          and other_status == CANNOT_EVALUATE
+          and any("holds no acceptance of the set" in l for l in lines_other),
+          'an acceptance supplied outside the pack is recomputed and read (verdict unchanged, residual named); '
+          'a rewritten one fails; a set the chain never accepted cannot be evaluated')
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        rdir = tmp / 'records'
+        (rdir / 'control-plane').mkdir(parents=True)
+        for r in records:
+            (rdir / record_file_name(r['sequence_number'])).write_bytes(json.dumps(r).encode('utf-8'))
+        for seq, text in enumerate(cp_texts):
+            (rdir / 'control-plane' / control_plane_record_name(seq)).write_text(text, encoding='utf-8')
+        prefix = 'audit/chain_tnt_conditions_run_x/'
+        manifest = {
+            'schema_version': '1.3', 'window': 'A', 'signing_deferred': True, 'hash_version': 'v1',
+            'prefix': prefix, 'from_sequence': 0, 'to_sequence': len(records) - 1,
+            'anchoring': {'state': 'unanchored', 'chains': [{
+                'chain': chain_for_prefix(prefix), 'reason': 'no_anchors_found', 'anchored_through_seq': None,
+                'unanchored_tail': {'from_seq': 0, 'to_seq': len(records) - 1}, 'anchors': [], 'seals': []}]},
+            'control_plane': {
+                'chain_family': 'control-plane', 'prefix': 'control-plane/', 'hash_algorithm': 'SHA-256',
+                'hash_version': 'v1', 'genesis_hash': genesis_hash(), 'verified': True,
+                'records_checked': len(cp_loaded),
+                'events': [{'sequence': n, 'event_id': r['event_id'], 'stored_event_hash': r['event_hash'],
+                            'recomputed_event_hash': r['event_hash']} for n, r in enumerate(cp_loaded)]},
+            'events': [{'sequence': r['sequence_number'], 'recomputed_event_hash': r['event_hash']} for r in records],
+        }
+        (tmp / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+        (tmp / 'acceptance.json').write_text(cp_texts[1], encoding='utf-8')
+        without = dict(manifest, schema_version='1.1')
+        without.pop('control_plane')
+        (tmp / 'without.json').write_text(json.dumps(without), encoding='utf-8')
+
+        def cli(manifest_name, *extra):
+            run = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--records', str(rdir),
+                                  '--manifest', str(tmp / manifest_name), '--allow-unsigned', *extra],
+                                 capture_output=True, text=True)
+            return run.returncode, run.stdout + run.stderr
+
+        code, out = cli('manifest.json', '--conditions-sha256', CONDITIONS_SELFTEST_SET)
+        absent_code, absent_out = cli('without.json', '--conditions-sha256', CONDITIONS_SELFTEST_SET)
+        supplied_code, supplied_out = cli('without.json', '--conditions-sha256', CONDITIONS_SELFTEST_SET,
+                                          '--conditions-acceptance', str(tmp / 'acceptance.json'))
+        bad_arg_code, _ = cli('manifest.json', '--conditions-sha256', 'ABC')
+        plain_code, plain_out = cli('manifest.json')
+    cli_ok = (code == EXIT_OK and expected in out
+              and absent_code == EXIT_CANNOT_EVALUATE and 'acceptance not in this pack' in absent_out
+              and supplied_code == EXIT_OK and expected in supplied_out
+              and bad_arg_code == EXIT_CANNOT_EVALUATE
+              and plain_code == EXIT_OK and 'conditions:' not in plain_out)
+    if not cli_ok:
+        print(out + absent_out + supplied_out + plain_out, file=sys.stderr)
+    check('33f', cli_ok,
+          '--records: the verdict line on a pack with the control-plane chain exits 0; without it exits 2 '
+          '(acceptance not in this pack) unless --conditions-acceptance supplies it; a malformed digest is a '
+          'usage error; without --conditions-sha256 nothing changes')
+
+    # 33g — a stub in a stripped pack is named and counted nowhere.
+    stub_manifest = {'schema_version': '1.5', 'content': CONTENT_STRIPPED,
+                     'stubs': [{'sequence': 1, 'reason': 'email_address', 'field': 'mcp_event.reason'}]}
+    without_stub = {seq: r for seq, r in stripped.items() if seq != 1}
+    lines = []
+    stub_status = conditions_verdict(CONDITIONS_SELFTEST_SET, stub_manifest, without_stub, cp_records,
+                                     report=lines.append)
+    check('33g', stub_status == PASSED
+          and any(l.startswith('NOTE: 1 hash-only stub(s) (seq 1)') for l in lines)
+          and '2 of 3 records in the window' in lines[-1],
+          'a hash-only stub in a stripped pack is named and not placed in the window (2 of 3 without it)')
 
     return ok
 
@@ -6866,6 +10797,158 @@ _SELFTEST_SIGNATURE_VECTORS = {
         "{\"keyId\":\"pIdAtgmNH6Fr/ATdjpQQKG5cR/b+kGJsY28Z+DigQas=\"},\"logIndex\":\"2\"}"
         "]}}"
     ),
+    "per_tenant_identity": "ps-selftest00@selftest-invalid.iam.gserviceaccount.com",
+    "per_tenant_manifest": (
+        "ewogICJzY2hlbWFfdmVyc2lvbiI6ICIxLjQiLAogICJwYWNrX2lkIjogIjAwMDAwMDAwLTAw"
+        "MDAtNDAwMC04MDAwLTAwMDAwMDAwMjc0OSIsCiAgIndpbmRvdyI6ICJCIiwKICAic2lnbmlu"
+        "Z19kZWZlcnJlZCI6IGZhbHNlLAogICJnZW5lcmF0ZWRfYXQiOiAiMjAyNi0wOS0yMVQxNDox"
+        "MzowMFoiLAogICJnZW5lcmF0b3JfdmVyc2lvbiI6ICJ0ZXN0LW9ubHkiLAogICJzdWJzdHJh"
+        "dGVfbmFtZSI6ICJtZWlseW54LXZlcmlmeSBzZWxmLXRlc3QgKFRFU1QtT05MWSkiLAogICJi"
+        "dWNrZXQiOiAic2VsZnRlc3QuaW52YWxpZCIsCiAgInByZWZpeCI6ICJhdWRpdC9zZWxmLXRl"
+        "c3QvIiwKICAiZnJvbV9zZXF1ZW5jZSI6IDAsCiAgInRvX3NlcXVlbmNlIjogMSwKICAiaGFz"
+        "aF9hbGdvcml0aG0iOiAic2hhMjU2IiwKICAiaGFzaF92ZXJzaW9uIjogInYxIiwKICAiZ2Vu"
+        "ZXNpc19oYXNoIjogImMyOTg5NDAzY2Y4OTdkYWNjZDgyNWNjNDEzNzdiODA0MzQzYzVhNDg1"
+        "MWVhYzFkYWYzMmI1OGViMWZhNGVkZjgiLAogICJ2ZXJpZmllZCI6IHRydWUsCiAgInJlY29y"
+        "ZHNfY2hlY2tlZCI6IDIsCiAgImZpcnN0X3NlcXVlbmNlIjogMCwKICAibGFzdF9zZXF1ZW5j"
+        "ZSI6IDEsCiAgImJyZWFrX2F0X3NlcXVlbmNlIjogbnVsbCwKICAidmlvbGF0aW9uX2tpbmQi"
+        "OiBudWxsLAogICJlcnJvciI6IG51bGwsCiAgInNpZ25hdHVyZSI6IHsKICAgICJtZXRob2Qi"
+        "OiAiY29zaWduLXNpZ3N0b3JlLWtleWxlc3MiLAogICAgInNpZ25lZF9hcnRpZmFjdCI6ICJt"
+        "YW5pZmVzdC5qc29uIiwKICAgICJzaWduYXR1cmVfZmlsZSI6ICJtYW5pZmVzdC5qc29uLnNp"
+        "Z3N0b3JlLmpzb24iLAogICAgImJ1bmRsZV9maWxlIjogbnVsbCwKICAgICJ0cmFuc3BhcmVu"
+        "Y3lfbG9nIjogInJla29yIgogIH0sCiAgImV2ZW50cyI6IFsKICAgIHsKICAgICAgInNlcXVl"
+        "bmNlIjogMCwKICAgICAgInRpbWVzdGFtcF91dGMiOiAiMjAyNi0wOS0yMVQxNDowMDowMCsw"
+        "MDowMCIsCiAgICAgICJhY3Rpb24iOiAiYWxsb3ciLAogICAgICAibW9kZWxfcmVxdWVzdGVk"
+        "IjogImdwdC00LjEtbWluaSIsCiAgICAgICJwcm9qZWN0X2lkIjogbnVsbCwKICAgICAgInJl"
+        "cXVlc3RfaWQiOiAicmVxLXNlbGZ0ZXN0LTAiLAogICAgICAiZXZlbnRfaWQiOiAiZXZ0LXNl"
+        "bGZ0ZXN0LTAiLAogICAgICAic3RvcmVkX2V2ZW50X2hhc2giOiAiYjIyZjIyYzgyYjI5ZmNh"
+        "MjE0MjZkNzkzNzdmYTIwNTEyYTQzNjA3NjAwZWRmMDNmYmZlMGJmOGEwYWVmMGQyOSIsCiAg"
+        "ICAgICJyZWNvbXB1dGVkX2V2ZW50X2hhc2giOiAiYjIyZjIyYzgyYjI5ZmNhMjE0MjZkNzkz"
+        "NzdmYTIwNTEyYTQzNjA3NjAwZWRmMDNmYmZlMGJmOGEwYWVmMGQyOSIsCiAgICAgICJoYXNo"
+        "X21hdGNoIjogdHJ1ZSwKICAgICAgInByZXZpb3VzX2hhc2hfbWF0Y2giOiB0cnVlCiAgICB9"
+        "LAogICAgewogICAgICAic2VxdWVuY2UiOiAxLAogICAgICAidGltZXN0YW1wX3V0YyI6ICIy"
+        "MDI2LTA5LTIxVDE0OjAwOjAxKzAwOjAwIiwKICAgICAgImFjdGlvbiI6ICJhbGxvdyIsCiAg"
+        "ICAgICJtb2RlbF9yZXF1ZXN0ZWQiOiAiZ3B0LTQuMS1taW5pIiwKICAgICAgInByb2plY3Rf"
+        "aWQiOiBudWxsLAogICAgICAicmVxdWVzdF9pZCI6ICJyZXEtc2VsZnRlc3QtMSIsCiAgICAg"
+        "ICJldmVudF9pZCI6ICJldnQtc2VsZnRlc3QtMSIsCiAgICAgICJzdG9yZWRfZXZlbnRfaGFz"
+        "aCI6ICIyZjVkYTVmZDM4YTQ0OWU1NWFjZDgzMTY5MmZkMzNhMWExYWU2MDQ3NDQyOTY0ZTdk"
+        "NDFmMDk1ODgzMGM5ZWRlIiwKICAgICAgInJlY29tcHV0ZWRfZXZlbnRfaGFzaCI6ICIyZjVk"
+        "YTVmZDM4YTQ0OWU1NWFjZDgzMTY5MmZkMzNhMWExYWU2MDQ3NDQyOTY0ZTdkNDFmMDk1ODgz"
+        "MGM5ZWRlIiwKICAgICAgImhhc2hfbWF0Y2giOiB0cnVlLAogICAgICAicHJldmlvdXNfaGFz"
+        "aF9tYXRjaCI6IHRydWUKICAgIH0KICBdLAogICJldmlkZW5jZV9jbGFzcyI6ICJzYW5kYm94"
+        "LW5vbi1wcm9kdWN0aW9uIiwKICAiYW5jaG9yaW5nIjogewogICAgInN0YXRlIjogInVuYW5j"
+        "aG9yZWQiLAogICAgImNoYWlucyI6IFsKICAgICAgewogICAgICAgICJjaGFpbiI6ICJzZWxm"
+        "LXRlc3QiLAogICAgICAgICJyZWFzb24iOiAibm9fYW5jaG9yc19mb3VuZCIsCiAgICAgICAg"
+        "ImFuY2hvcmVkX3Rocm91Z2hfc2VxIjogbnVsbCwKICAgICAgICAidW5hbmNob3JlZF90YWls"
+        "IjogewogICAgICAgICAgImZyb21fc2VxIjogMCwKICAgICAgICAgICJ0b19zZXEiOiAxCiAg"
+        "ICAgICAgfSwKICAgICAgICAiYW5jaG9ycyI6IFtdLAogICAgICAgICJzZWFscyI6IFtdCiAg"
+        "ICAgIH0KICAgIF0KICB9Cn0K"
+    ),
+    "bundle_per_tenant": (
+        "{\"mediaType\":\"application/vnd.dev.sigstore.bundle.v0.3+json\",\"messageSig"
+        "nature\":{\"messageDigest\":{\"algorithm\":\"SHA2_256\",\"digest\":\"KMxDLjhPFb0sI"
+        "zobSfhsZ6JY/BIqJExQ2UhaqhG36LQ=\"},\"signature\":\"MEUCIBMkgpIAM20u/pSCjNB21"
+        "2S0qESddP7c9w1RUgd9c8cEAiEA7wmpyfnAaz/tqoEce2X7H/e2nNR0usf2RX0GyCvgEMs=\""
+        "},\"verificationMaterial\":{\"certificate\":{\"rawBytes\":\"MIICHzCCAaagAwIBAgI"
+        "CCr0wCgYIKoZIzj0EAwMwSTEhMB8GA1UECgwYbWVpbHlueC12ZXJpZnkgc2VsZi10ZXN0MSQ"
+        "wIgYDVQQDDBtURVNULU9OTFkgQ0EtQSBpbnRlcm1lZGlhdGUwHhcNMjYwOTIxMTQxMjIwWhc"
+        "NMjYwOTIxMTQyMjIwWjAAMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEdpmEw7v0OCAwg/1"
+        "OJW1xmMiUEf2YOGDyspnHKbbB6jdgHMAnyWpI4ZDd3dnmt4zOP9kj5FzBV6rHhpmllqShoKO"
+        "BxjCBwzAOBgNVHQ8BAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwMwRAYDVR0RAQH/BDo"
+        "wOIE2cHMtc2VsZnRlc3QwMEBzZWxmdGVzdC1pbnZhbGlkLmlhbS5nc2VydmljZWFjY291bnQ"
+        "uY29tMCkGCisGAQQBg78wAQEEG2h0dHBzOi8vYWNjb3VudHMuZ29vZ2xlLmNvbTArBgorBgE"
+        "EAYO/MAEIBB0MG2h0dHBzOi8vYWNjb3VudHMuZ29vZ2xlLmNvbTAKBggqhkjOPQQDAwNnADB"
+        "kAjAtd8GfPxm99Xbfu9j43ZZAp7gly1HtTKnD6qmDBzYJt+lEltYYuMaTWadWIiV1a2ECMAc"
+        "4wuGB+3IzT1VzPPjIoDbT5HVagpRgYMZPvYE+7UXDP8g7Xz629dkZnvRlS3dfsQ==\"},\"tlo"
+        "gEntries\":[{\"canonicalizedBody\":\"eyJhcGlWZXJzaW9uIjoiMC4wLjEiLCJraW5kIjo"
+        "iaGFzaGVkcmVrb3JkIiwic3BlYyI6eyJkYXRhIjp7Imhhc2giOnsiYWxnb3JpdGhtIjoic2h"
+        "hMjU2IiwidmFsdWUiOiIyOGNjNDMyZTM4NGYxNWJkMmMyMzNhMWI0OWY4NmM2N2EyNThmYzE"
+        "yMmEyNDRjNTBkOTQ4NWFhYTExYjdlOGI0In19LCJzaWduYXR1cmUiOnsiY29udGVudCI6Ik1"
+        "FVUNJQk1rZ3BJQU0yMHUvcFNDak5CMjEyUzBxRVNkZFA3Yzl3MVJVZ2Q5YzhjRUFpRUE3d21"
+        "weWZuQWF6L3Rxb0VjZTJYN0gvZTJuTlIwdXNmMlJYMEd5Q3ZnRU1zPSIsInB1YmxpY0tleSI"
+        "6eyJjb250ZW50IjoiTFMwdExTMUNSVWRKVGlCRFJWSlVTVVpKUTBGVVJTMHRMUzB0Q2sxSlN"
+        "VTklla05EUVdGaFowRjNTVUpCWjBsRFEzSXdkME5uV1VsTGIxcEplbW93UlVGM1RYZFRWRVZ"
+        "vVFVJNFIwRXhWVVZEWjNkWllsZFdjR0pJYkhVS1pVTXhNbHBZU25CYWJtdG5ZekpXYzFwcE1"
+        "UQmFXRTR3VFZOUmQwbG5XVVJXVVZGRVJFSjBWVkpXVGxWTVZUbFBWRVpyWjFFd1JYUlJVMEp"
+        "3WW01U2JBcGpiVEZzV2tkc2FHUkhWWGRJYUdOT1RXcFpkMDlVU1hoTlZGRjRUV3BKZDFkb1k"
+        "wNU5hbGwzVDFSSmVFMVVVWGxOYWtsM1YycEJRVTFHYTNkRmQxbElDa3R2V2tsNmFqQkRRVkZ"
+        "aU1V0dldrbDZhakJFUVZGalJGRm5RVVZrY0cxRmR6ZDJNRTlEUVhkbkx6RlBTbGN4ZUcxTmF"
+        "WVkZaakpaVDBkRWVYTndia2dLUzJKaVFqWnFaR2RJVFVGdWVWZHdTVFJhUkdRelpHNXRkRFI"
+        "2VDFBNWEybzFSbnBDVmpaeVNHaHdiV3hzY1ZOb2IwdFBRbmhxUTBKM2VrRlBRbWRPVmdwSVV"
+        "UaENRV1k0UlVKQlRVTkNORUYzUlhkWlJGWlNNR3hDUVhkM1EyZFpTVXQzV1VKQ1VWVklRWGR"
+        "OZDFKQldVUldVakJTUVZGSUwwSkViM2RQU1VVeUNtTklUWFJqTWxaeldtNVNiR016VVhkTlJ"
+        "VSjZXbGQ0YldSSFZucGtRekZ3WW01YWFHSkhiR3RNYld4b1lsTTFibU15Vm5sa2JXeHFXbGR"
+        "HYWxreU9URUtZbTVSZFZreU9YUk5RMnRIUTJselIwRlJVVUpuTnpoM1FWRkZSVWN5YURCa1N"
+        "FSjZUMms0ZGxsWFRtcGlNMVoxWkVoTmRWb3lPWFphTW5oc1RHMU9kZ3BpVkVGeVFtZHZja0p"
+        "uUlVWQldVOHZUVUZGU1VKQ01FMUhNbWd3WkVoQ2VrOXBPSFpaVjA1cVlqTldkV1JJVFhWYU1"
+        "qbDJXako0YkV4dFRuWmlWRUZMQ2tKblozRm9hMnBQVUZGUlJFRjNUbTVCUkVKclFXcEJkR1E"
+        "0UjJaUWVHMDVPVmhpWm5VNWFqUXpXbHBCY0RkbmJIa3hTSFJVUzI1RU5uRnRSRUo2V1VvS2R"
+        "DdHNSV3gwV1ZsMVRXRlVWMkZrVjBscFZqRmhNa1ZEVFVGak5IZDFSMElyTTBsNlZERldlbEJ"
+        "RYWtsdlJHSlVOVWhXWVdkd1VtZFpUVnBRZGxsRkt3bzNWVmhFVURobk4xaDZOakk1Wkd0YWJ"
+        "uWlNiRk16WkdaelVUMDlDaTB0TFMwdFJVNUVJRU5GVWxSSlJrbERRVlJGTFMwdExTMEsifX1"
+        "9fQ==\",\"inclusionPromise\":{\"signedEntryTimestamp\":\"MEUCIEMe+jJS2y5MfTsAf"
+        "nntkINIOX/BQhi8/z4u6DqFbylpAiEAwTqJiBcaUP0yNPp2ITfm3ZBPcErmvN7lkpyu+yG7x"
+        "eo=\"},\"inclusionProof\":{\"checkpoint\":{\"envelope\":\"selftest.invalid - 1\\n"
+        "2\\nDEPFjKdNLcjGOcHIxTVu4FzxQ1JjIZNOq5Qe02cnJYU=\\n\\n\\u2014 selftest.inval"
+        "id pIdAtjBFAiBjkj9LS2PsJMqrZ4ySlwBF0PYTJU+F3i9cHynyBJjmXQIhANH0JjfClpPU6"
+        "slfimtxGuneBL7CVXaVgZWkAWGaHBQH\\n\"},\"hashes\":[\"hFBUv7btFXw2SOlMXOAqy4u5B"
+        "ocZxl4OHHEij3KxFBI=\"],\"logIndex\":\"0\",\"rootHash\":\"DEPFjKdNLcjGOcHIxTVu4Fz"
+        "xQ1JjIZNOq5Qe02cnJYU=\",\"treeSize\":\"2\"},\"integratedTime\":\"1790000000\",\"ki"
+        "ndVersion\":{\"kind\":\"hashedrekord\",\"version\":\"0.0.1\"},\"logId\":{\"keyId\":\"p"
+        "IdAtgmNH6Fr/ATdjpQQKG5cR/b+kGJsY28Z+DigQas=\"},\"logIndex\":\"0\"}]}}"
+    ),
+    "bundle_per_tenant_uri_san": (
+        "{\"mediaType\":\"application/vnd.dev.sigstore.bundle.v0.3+json\",\"messageSig"
+        "nature\":{\"messageDigest\":{\"algorithm\":\"SHA2_256\",\"digest\":\"KMxDLjhPFb0sI"
+        "zobSfhsZ6JY/BIqJExQ2UhaqhG36LQ=\"},\"signature\":\"MEUCIQCjCh6HJ7sc332Mdl82q"
+        "FtwHYBCUB/0XqZHLtyg79sO7gIgG/zMGmtE9LxxOk9DtI4Bi7WZ61DU1s/mmMXsR69KSJg=\""
+        "},\"verificationMaterial\":{\"certificate\":{\"rawBytes\":\"MIICIDCCAaagAwIBAgI"
+        "CCr4wCgYIKoZIzj0EAwMwSTEhMB8GA1UECgwYbWVpbHlueC12ZXJpZnkgc2VsZi10ZXN0MSQ"
+        "wIgYDVQQDDBtURVNULU9OTFkgQ0EtQSBpbnRlcm1lZGlhdGUwHhcNMjYwOTIxMTQxMjIwWhc"
+        "NMjYwOTIxMTQyMjIwWjAAMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEh4HYkOZZYzCPShf"
+        "/066xzXd5nwIQ4HuoeHuMWCXmXoXt8v+iuZImc57DamqMVGX0oFpMAWLXmvfdo7N5yS4+X6O"
+        "BxjCBwzAOBgNVHQ8BAf8EBAMCB4AwEwYDVR0lBAwwCgYIKwYBBQUHAwMwRAYDVR0RAQH/BDo"
+        "wOIY2cHMtc2VsZnRlc3QwMEBzZWxmdGVzdC1pbnZhbGlkLmlhbS5nc2VydmljZWFjY291bnQ"
+        "uY29tMCkGCisGAQQBg78wAQEEG2h0dHBzOi8vYWNjb3VudHMuZ29vZ2xlLmNvbTArBgorBgE"
+        "EAYO/MAEIBB0MG2h0dHBzOi8vYWNjb3VudHMuZ29vZ2xlLmNvbTAKBggqhkjOPQQDAwNoADB"
+        "lAjEA0Sa8Mr4UKNo899P4b6pxdO88tv0+eJj3lN2oC6L84+8d+iLB15/BwMTq7i3FeBQnAjB"
+        "+sx1yKb32aG4BAmNBKecRh+7KF09Y8qb2OvML/Bb7WI8ZIe0r5wADrmLRV+mAuFk=\"},\"tlo"
+        "gEntries\":[{\"canonicalizedBody\":\"eyJhcGlWZXJzaW9uIjoiMC4wLjEiLCJraW5kIjo"
+        "iaGFzaGVkcmVrb3JkIiwic3BlYyI6eyJkYXRhIjp7Imhhc2giOnsiYWxnb3JpdGhtIjoic2h"
+        "hMjU2IiwidmFsdWUiOiIyOGNjNDMyZTM4NGYxNWJkMmMyMzNhMWI0OWY4NmM2N2EyNThmYzE"
+        "yMmEyNDRjNTBkOTQ4NWFhYTExYjdlOGI0In19LCJzaWduYXR1cmUiOnsiY29udGVudCI6Ik1"
+        "FVUNJUUNqQ2g2SEo3c2MzMzJNZGw4MnFGdHdIWUJDVUIvMFhxWkhMdHlnNzlzTzdnSWdHL3p"
+        "NR210RTlMeHhPazlEdEk0Qmk3V1o2MURVMXMvbW1NWHNSNjlLU0pnPSIsInB1YmxpY0tleSI"
+        "6eyJjb250ZW50IjoiTFMwdExTMUNSVWRKVGlCRFJWSlVTVVpKUTBGVVJTMHRMUzB0Q2sxSlN"
+        "VTkpSRU5EUVdGaFowRjNTVUpCWjBsRFEzSTBkME5uV1VsTGIxcEplbW93UlVGM1RYZFRWRVZ"
+        "vVFVJNFIwRXhWVVZEWjNkWllsZFdjR0pJYkhVS1pVTXhNbHBZU25CYWJtdG5ZekpXYzFwcE1"
+        "UQmFXRTR3VFZOUmQwbG5XVVJXVVZGRVJFSjBWVkpXVGxWTVZUbFBWRVpyWjFFd1JYUlJVMEp"
+        "3WW01U2JBcGpiVEZzV2tkc2FHUkhWWGRJYUdOT1RXcFpkMDlVU1hoTlZGRjRUV3BKZDFkb1k"
+        "wNU5hbGwzVDFSSmVFMVVVWGxOYWtsM1YycEJRVTFHYTNkRmQxbElDa3R2V2tsNmFqQkRRVkZ"
+        "aU1V0dldrbDZhakJFUVZGalJGRm5RVVZvTkVoWmEwOWFXbGw2UTFCVGFHWXZNRFkyZUhwWVp"
+        "EVnVkMGxSTkVoMWIyVklkVTBLVjBOWWJWaHZXSFE0ZGl0cGRWcEpiV00xTjBSaGJYRk5Wa2R"
+        "ZTUc5R2NFMUJWMHhZYlhabVpHODNUalY1VXpRcldEWlBRbmhxUTBKM2VrRlBRbWRPVmdwSVV"
+        "UaENRV1k0UlVKQlRVTkNORUYzUlhkWlJGWlNNR3hDUVhkM1EyZFpTVXQzV1VKQ1VWVklRWGR"
+        "OZDFKQldVUldVakJTUVZGSUwwSkViM2RQU1ZreUNtTklUWFJqTWxaeldtNVNiR016VVhkTlJ"
+        "VSjZXbGQ0YldSSFZucGtRekZ3WW01YWFHSkhiR3RNYld4b1lsTTFibU15Vm5sa2JXeHFXbGR"
+        "HYWxreU9URUtZbTVSZFZreU9YUk5RMnRIUTJselIwRlJVVUpuTnpoM1FWRkZSVWN5YURCa1N"
+        "FSjZUMms0ZGxsWFRtcGlNMVoxWkVoTmRWb3lPWFphTW5oc1RHMU9kZ3BpVkVGeVFtZHZja0p"
+        "uUlVWQldVOHZUVUZGU1VKQ01FMUhNbWd3WkVoQ2VrOXBPSFpaVjA1cVlqTldkV1JJVFhWYU1"
+        "qbDJXako0YkV4dFRuWmlWRUZMQ2tKblozRm9hMnBQVUZGUlJFRjNUbTlCUkVKc1FXcEZRVEJ"
+        "UWVRoTmNqUlZTMDV2T0RrNVVEUmlObkI0WkU4NE9IUjJNQ3RsU21vemJFNHliME0yVERnS05"
+        "DczRaQ3RwVEVJeE5TOUNkMDFVY1RkcE0wWmxRbEZ1UVdwQ0szTjRNWGxMWWpNeVlVYzBRa0Z"
+        "0VGtKTFpXTlNhQ3MzUzBZd09WazRjV0l5VDNaTlRBb3ZRbUkzVjBrNFdrbGxNSEkxZDBGRWN"
+        "tMU1VbFlyYlVGMVJtczlDaTB0TFMwdFJVNUVJRU5GVWxSSlJrbERRVlJGTFMwdExTMEsifX1"
+        "9fQ==\",\"inclusionPromise\":{\"signedEntryTimestamp\":\"MEUCIQC0wfpU7nwfAG4GU"
+        "+ph5O5hCNOtTi6t0RfmEjCIc/0yKwIgZKskzo979doBAJGmgdM7mKHoAx5oSyI11rP/LuUus"
+        "XY=\"},\"inclusionProof\":{\"checkpoint\":{\"envelope\":\"selftest.invalid - 1\\n"
+        "2\\nDEPFjKdNLcjGOcHIxTVu4FzxQ1JjIZNOq5Qe02cnJYU=\\n\\n\\u2014 selftest.inval"
+        "id pIdAtjBFAiBjkj9LS2PsJMqrZ4ySlwBF0PYTJU+F3i9cHynyBJjmXQIhANH0JjfClpPU6"
+        "slfimtxGuneBL7CVXaVgZWkAWGaHBQH\\n\"},\"hashes\":[\"motnOIkPCUEtE2P+bHTSFrwKo"
+        "ydr2PiTkEvOV+B8AXk=\"],\"logIndex\":\"1\",\"rootHash\":\"DEPFjKdNLcjGOcHIxTVu4Fz"
+        "xQ1JjIZNOq5Qe02cnJYU=\",\"treeSize\":\"2\"},\"integratedTime\":\"1790000000\",\"ki"
+        "ndVersion\":{\"kind\":\"hashedrekord\",\"version\":\"0.0.1\"},\"logId\":{\"keyId\":\"p"
+        "IdAtgmNH6Fr/ATdjpQQKG5cR/b+kGJsY28Z+DigQas=\"},\"logIndex\":\"1\"}]}}"
+    ),
 }
 # END GENERATED SIGNATURE VECTORS
 
@@ -7114,7 +11197,7 @@ _SELFTEST_SIGSTORE_INTEROP = {
 
 
 def signature_self_test():
-    """MEI-922: the signed-pack checks. ECDSA edge cases from Wycheproof; a
+    """The signed-pack checks. ECDSA edge cases from Wycheproof; a
     synthetic signed pack (test-only CA, log and signer from
     fixtures/generate-signature-vectors.py) that must verify, with one
     tampered variant per failure reason, each rejected for exactly that
@@ -7339,10 +11422,105 @@ def signature_self_test():
           and signed_code == EXIT_OK and "SIGNATURE OK" in signed_out,
           "--records: a stripped, relabelled signed pack exits 3; with --allow-unsigned 0 and the notice; signed 0")
 
+    # 20s-20x: the per-tenant signer class, and the manifest 1.4 evidence
+    # label.
+    tenant_identity = vectors["per_tenant_identity"]
+    tenant_bytes = base64.b64decode(vectors["per_tenant_manifest"])
+    tenant_manifest = json.loads(tenant_bytes)
+
+    def tenant_outcome(key, identity=tenant_identity, issuer=GOOGLE_OIDC_ISSUER, supplied=True):
+        body = vectors[key].encode("utf-8")
+        try:
+            check_pack_signature(tenant_manifest, tenant_bytes,
+                                 lambda name: body if name == "manifest.json.sigstore.json" else None,
+                                 identity, issuer, trust, identity_supplied=supplied)
+            return "verified"
+        except SignatureInvalid as exc:
+            return exc.reason
+        except SignerIdentityRequired as exc:
+            return ("identity required", tuple(exc.identities))
+
+    check("20s", tenant_outcome("bundle_per_tenant") == "verified",
+          "a per-tenant pack (Google issuer, service-account email SAN) verifies against the identity the reader supplies")
+    check("20t", tenant_outcome("bundle_per_tenant", PINNED_SIGNER_IDENTITY, PINNED_OIDC_ISSUER, supplied=False)
+          == ("identity required", (tenant_identity,))
+          and outcome(fresh(), expect_identity=identity, expect_issuer=issuer) == "verified",
+          "a per-tenant pack checked with no reader-supplied identity cannot be evaluated (exit 2), naming its "
+          "signer; the workflow class still verifies against the default")
+    check("20u", tenant_outcome("bundle_per_tenant", "ps-other0000@selftest-invalid.iam.gserviceaccount.com")
+          == REASON_IDENTITY_MISMATCH
+          and tenant_outcome("bundle_per_tenant", issuer=PINNED_OIDC_ISSUER) == REASON_ISSUER_MISMATCH,
+          "another tenant's identity fails as 'signer identity mismatch', and another issuer as 'OIDC issuer mismatch'")
+    check("20v", tenant_outcome("bundle_per_tenant_uri_san") == REASON_IDENTITY_MISMATCH,
+          "a per-tenant certificate that names the email as a URI SAN, not an rfc822Name, does not match")
+    resolved = [
+        expected_signer(None, None),
+        expected_signer(tenant_identity, None),
+        expected_signer("https://example.invalid/workflow", None),
+        expected_signer(tenant_identity, "https://other.invalid"),
+    ]
+    check("20w", resolved == [
+        (PINNED_SIGNER_IDENTITY, PINNED_OIDC_ISSUER, False),
+        (tenant_identity, GOOGLE_OIDC_ISSUER, True),
+        ("https://example.invalid/workflow", PINNED_OIDC_ISSUER, True),
+        (tenant_identity, "https://other.invalid", True),
+    ], "no identity means the signing workflow; an email identity means Google's issuer unless one is given")
+    label_errors = [
+        manifest_evidence_class_error(tenant_manifest),
+        manifest_evidence_class_error(dict(tenant_manifest, evidence_class="production")),
+        manifest_evidence_class_error({k: v for k, v in tenant_manifest.items() if k != "evidence_class"}),
+        manifest_evidence_class_error(dict(tenant_manifest, schema_version="1.1")),
+        manifest_evidence_class_error({"schema_version": "1.1"}),
+        manifest_storage_layout_error({"schema_version": "1.4"}),
+        manifest_storage_layout_error({"schema_version": "1.4", "storage_layout": "segmented-v9"}),
+        control_plane_manifest_problem({"schema_version": "1.4"}),
+    ]
+    labels_ok = (label_errors[0] is None and all(e is not None for e in label_errors[1:4])
+                 and label_errors[4] is None and label_errors[5] is None and label_errors[6] is not None
+                 and label_errors[7] is None)
+    if not labels_ok:
+        print(f"  {label_errors!r}", file=sys.stderr)
+    check("20x", labels_ok,
+          "manifest 1.4: a known evidence_class is read; an unknown or missing one, or one on 1.1, is refused "
+          "(exit 2); storage_layout and control_plane are optional as in 1.3")
+
+    # 20y: the per-tenant class and the label end to end at the command line.
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        (tmp / "records" / "anchors").mkdir(parents=True)
+        for seq_no, raw in records.items():
+            (tmp / "records" / record_file_name(seq_no)).write_text(raw)
+        (tmp / "trusted_root.json").write_text(vectors["trusted_root"])
+        (tmp / "pack").mkdir()
+        (tmp / "pack" / "manifest.json").write_bytes(tenant_bytes)
+        (tmp / "pack" / "manifest.json.sigstore.json").write_text(vectors["bundle_per_tenant"])
+
+        def tenant_cli(*extra):
+            run = subprocess.run(
+                [sys.executable, str(Path(__file__).resolve()), "--records", str(tmp / "records"),
+                 "--manifest", str(tmp / "pack" / "manifest.json"),
+                 "--trusted-root", str(tmp / "trusted_root.json"), *extra],
+                capture_output=True, text=True,
+            )
+            return run.returncode, run.stdout + run.stderr
+
+        named_code, named_out = tenant_cli("--certificate-identity", tenant_identity)
+        bare_code, bare_out = tenant_cli()
+    cli_ok = (named_code == EXIT_OK and "per-tenant signer" in named_out
+              and "EVIDENCE CLASS: sandbox-non-production" in named_out
+              and "manifest signature verified. [evidence class: sandbox-non-production]" in named_out
+              and bare_code == EXIT_CANNOT_EVALUATE and tenant_identity in bare_out
+              and "[evidence class: sandbox-non-production]" in bare_out)
+    if not cli_ok:
+        print(named_out + bare_out, file=sys.stderr)
+    check("20y", cli_ok,
+          "--records: a 1.4 per-tenant pack exits 0 with the supplied identity and prints its evidence class on "
+          "the verdict; without an identity it exits 2 naming the signer")
+
     return ok
 
 
-# ── anchor self-test data (MEI-2758) ──────────────────────────────────────
+# ── anchor self-test data ──────────────────────────────────────
 # RSA-2048 public key (SPKI) for the known-answer vectors below; OpenSSL-generated.
 _KAT_RSA_SPKI = (
     "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA99gXa1HWWgLdl8EYk3o7Aoo9ZnNnxxuDDmT/2Dm1U8IOT8VpukeT",
@@ -7508,7 +11686,7 @@ _REAL_GLOBALSIGN_TSR = (
 
 
 def anchor_self_test():
-    """MEI-2758 — chain-head anchors. RSA known-answer vectors (PKCS#1 v1.5,
+    """Chain-head anchors. RSA known-answer vectors (PKCS#1 v1.5,
     PSS over SHA-256 and SHA-384), the pinned roots' fingerprints, the two
     real witness tokens captured in the 2026-10-02 interop probe (each passes
     against its own pinned root and fails against the other's, or when
@@ -7796,6 +11974,483 @@ def _tsa_certificates(resp):
     return [resp[c[3]:c[2]] for c in _der_children(resp, certs[1], certs[2])]
 
 
+
+# ---------------------------------------------------------------------------
+# OCSF evidence export
+# ---------------------------------------------------------------------------
+
+# Where each digest an exported event carries lives on the pack record.
+_OCSF_DIGEST_SOURCES = {
+    'prompt_sha256_jcs': ('content',),
+    'response_sha256': ('content',),
+    'stored_prompt_sha256_jcs': ('content',),
+    'stored_response_sha256': ('content',),
+    'findings_sha256_jcs': ('content',),
+    'tool_calls_sha256_jcs': ('content',),
+    'stored_tool_calls_sha256_jcs': ('content',),
+    'payload_sha256_jcs': ('mcp_event',),
+    'redacted_payload_sha256_jcs': ('mcp_event',),
+    'redaction_pre_sha256_jcs': ('mcp_event',),
+    'redaction_post_sha256_jcs': ('mcp_event',),
+    'mcp_bundle_sha256': ('mcp_event',),
+    'evidence_set_sha256': ('decision_receipt',),
+    'registry_digest': ('decision_receipt',),
+    'outcomes_sha256_jcs': ('evaluation_trace',),
+    'asserted_digest': ('identity',),
+}
+
+
+def _jwk_to_point(jwk):
+    """A P-256 public JWK ({kty: EC, crv: P-256, x, y}) -> the affine point."""
+    if not isinstance(jwk, dict) or jwk.get('kty') != 'EC' or jwk.get('crv') != 'P-256':
+        raise ValueError('ocsf public key must be a P-256 EC JWK')
+
+    def b64url(v):
+        v = v + '=' * (-len(v) % 4)
+        return base64.urlsafe_b64decode(v)
+
+    x = int.from_bytes(b64url(jwk['x']), 'big')
+    y = int.from_bytes(b64url(jwk['y']), 'big')
+    point = (x, y)
+    if not _on_curve(P256, point):
+        raise ValueError('ocsf public key is not on P-256')
+    return point
+
+
+def verify_ocsf_manifest_signature(manifest_bytes, signature_b64, public_point):
+    """True iff `signature_b64` (64 raw bytes r || s, standard base64) is a
+    valid ECDSA P-256 signature over SHA-256 of `manifest_bytes`."""
+    try:
+        raw = base64.b64decode(signature_b64.strip(), validate=True)
+    except (binascii.Error, ValueError):
+        return False
+    if len(raw) != 64:
+        return False
+    r = int.from_bytes(raw[:32], 'big')
+    s_ = int.from_bytes(raw[32:], 'big')
+    return ecdsa_verify(P256, public_point, hashlib.sha256(manifest_bytes).digest(), r, s_)
+
+
+def load_ocsf_export(path):
+    """The export manifests `path` names: a `.manifest.json` file, a day's
+    `index.json` (its `manifests` keys resolved against the sink root that
+    holds them), or a directory searched for `*.manifest.json`. Returns
+    [(manifest_path, manifest_bytes, manifest)] sorted by chain and
+    first sequence."""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(f"ocsf export not found at {path}")
+    manifest_paths = []
+    if path.is_dir():
+        manifest_paths = sorted(path.rglob('*.manifest.json'))
+    elif path.name == 'index.json':
+        index = json.loads(path.read_bytes())
+        keys = index.get('manifests') or []
+        if not isinstance(keys, list):
+            raise ValueError(f"{path}: index.json has no manifests list")
+        for key in keys:
+            # The key is sink-relative (`ocsf/v1/...`); find the ancestor of
+            # the index that holds it.
+            resolved = None
+            for ancestor in [path.parent, *path.parent.parents]:
+                candidate = ancestor / key
+                if candidate.exists():
+                    resolved = candidate
+                    break
+            manifest_paths.append(resolved if resolved is not None else path.parent / Path(key).name)
+    else:
+        manifest_paths = [path]
+    out = []
+    for mp in manifest_paths:
+        if not Path(mp).exists():
+            raise FileNotFoundError(f"ocsf export manifest not found: {mp}")
+        raw = Path(mp).read_bytes()
+        try:
+            doc = json.loads(raw)
+        except ValueError as exc:
+            raise ValueError(f"{mp}: manifest is not valid JSON: {exc}") from exc
+        out.append((Path(mp), raw, doc))
+    out.sort(key=lambda t: (str(t[2].get('chain_id', '')), int(t[2].get('first_sequence', 0) or 0)))
+    return out
+
+
+def verify_ocsf_export(entries, pack_chain, pack_records, public_point=None, quiet=False):
+    """Check an OCSF export against the pack. `entries` is what
+    load_ocsf_export returned; `pack_chain` the pack's chain name;
+    `pack_records` sequence -> the pack record (as verify_manifest_with
+    read it). Returns (content_status, signature_status): content is
+    PASSED, FAILED or CANNOT_EVALUATE; signature is PASSED (every manifest
+    signed and verified), FAILED (a signature did not verify, or a manifest
+    says it is signed and has no `.sig`), UNSIGNED (at least one manifest
+    unsigned, or signed with no public key given), or CANNOT_EVALUATE."""
+    import gzip
+
+    def report(line):
+        if not quiet:
+            print(line)
+
+    if not entries:
+        report("WARN: no OCSF export manifest found — nothing to check.")
+        return PASSED, UNSIGNED
+    content_ok = True
+    cannot = False
+    sig_statuses = []
+    last_by_chain = {}
+    events_checked = 0
+    outside = 0
+    for mpath, mbytes, m in entries:
+        label = m.get('object') or mpath.name
+        version = str(m.get('mapping_version', ''))
+        if version not in SUPPORTED_OCSF_MAPPING_VERSIONS:
+            report(f"CANNOT EVALUATE {label}: ocsf mapping_version {version!r} is not one this verifier reads "
+                   f"{SUPPORTED_OCSF_MAPPING_VERSIONS}")
+            cannot = True
+            continue
+        chain_id = str(m.get('chain_id', ''))
+        first_seq = m.get('first_sequence')
+        last_seq = m.get('last_sequence')
+        if not isinstance(first_seq, int) or not isinstance(last_seq, int):
+            report(f"FAIL {label}: manifest first_sequence/last_sequence are not integers")
+            content_ok = False
+            continue
+        # Gaps between consecutive manifests of one chain.
+        prev_last = last_by_chain.get(chain_id)
+        if prev_last is not None and first_seq != prev_last + 1:
+            if first_seq > prev_last + 1:
+                report(f"WARN export_gap chain={chain_id}: sequences {prev_last + 1}..{first_seq - 1} "
+                       f"have no export manifest between the previous object and {label}")
+            else:
+                report(f"WARN export_overlap chain={chain_id}: {label} starts at {first_seq}, "
+                       f"below the previous object's last sequence {prev_last}")
+        last_by_chain[chain_id] = max(last_seq, prev_last if prev_last is not None else last_seq)
+
+        # Signature.
+        sig_path = mpath.with_name(mpath.name[:-len('.manifest.json')] + '.manifest.sig') \
+            if mpath.name.endswith('.manifest.json') else mpath.with_suffix('.sig')
+        if m.get('signed'):
+            if not sig_path.exists():
+                report(f"FAIL {label}: manifest says it is signed but {sig_path.name} is missing")
+                sig_statuses.append(FAILED)
+            elif public_point is None:
+                report(f"UNSIGNED-CHECK {label}: manifest is signed (key id {m.get('public_key_id')!r}) but no "
+                       f"--ocsf-public-key was given; authenticity not established")
+                sig_statuses.append(UNSIGNED)
+            else:
+                sig_b64 = sig_path.read_text(encoding='utf-8')
+                if verify_ocsf_manifest_signature(mbytes, sig_b64, public_point):
+                    report(f"OK   {label}: manifest signature verified (key id {m.get('public_key_id')!r})")
+                    sig_statuses.append(PASSED)
+                else:
+                    report(f"FAIL {label}: manifest signature does not verify under the given key")
+                    sig_statuses.append(FAILED)
+        else:
+            report(f"UNSIGNED {label}: manifest carries no signature; authenticity not established")
+            sig_statuses.append(UNSIGNED)
+
+        # Object bytes.
+        object_path = mpath.with_name(Path(str(m.get('object', ''))).name)
+        if not object_path.exists():
+            report(f"FAIL {label}: object {object_path.name} is missing beside its manifest")
+            content_ok = False
+            continue
+        obj = object_path.read_bytes()
+        digest = hashlib.sha256(obj).hexdigest()
+        if digest != m.get('object_sha256'):
+            report(f"FAIL {label}: object_sha256 mismatch (manifest {m.get('object_sha256')}, object {digest})")
+            content_ok = False
+            continue
+        try:
+            text = gzip.decompress(obj).decode('utf-8')
+        except (OSError, EOFError, UnicodeDecodeError) as exc:
+            report(f"FAIL {label}: object is not gzip NDJSON: {exc}")
+            content_ok = False
+            continue
+        lines = [ln for ln in text.split('\n') if ln.strip()]
+        if len(lines) != m.get('event_count'):
+            report(f"FAIL {label}: event_count mismatch (manifest {m.get('event_count')}, object {len(lines)})")
+            content_ok = False
+        sequences = set()
+        for n, line in enumerate(lines, start=1):
+            try:
+                ev = json.loads(line)
+            except ValueError as exc:
+                report(f"FAIL {label} line {n}: not JSON: {exc}")
+                content_ok = False
+                continue
+            chain = ((ev.get('meilynx') or {}).get('chain')) or {}
+            ev_chain = chain.get('chain_id')
+            seq = chain.get('sequence_number')
+            if ev_chain != chain_id:
+                report(f"FAIL {label} line {n}: field meilynx.chain.chain_id is {ev_chain!r}, "
+                       f"manifest chain is {chain_id!r}")
+                content_ok = False
+                continue
+            if not isinstance(seq, int) or not (first_seq <= seq <= last_seq):
+                report(f"FAIL {label} line {n}: field meilynx.chain.sequence_number {seq!r} is outside "
+                       f"the manifest range {first_seq}..{last_seq}")
+                content_ok = False
+                continue
+            sequences.add(seq)
+            if chain_id != pack_chain or seq not in pack_records:
+                outside += 1
+                continue
+            record = pack_records[seq]
+            problems = []
+            if chain.get('event_id') != record.get('event_id'):
+                problems.append(f"meilynx.chain.event_id {chain.get('event_id')!r} != pack {record.get('event_id')!r}")
+            if chain.get('event_hash') != record.get('event_hash'):
+                problems.append(f"meilynx.chain.event_hash {chain.get('event_hash')!r} != pack {record.get('event_hash')!r}")
+            if chain.get('previous_hash') is not None and chain.get('previous_hash') != record.get('previous_hash'):
+                problems.append("meilynx.chain.previous_hash differs from the pack record")
+            digests = (ev.get('meilynx') or {}).get('digests') or {}
+            for key, value in digests.items():
+                if value is None:
+                    continue
+                source = _OCSF_DIGEST_SOURCES.get(key)
+                if source is None:
+                    problems.append(f"meilynx.digests.{key} is not a digest this verifier knows")
+                    continue
+                holder = record.get(source[0]) or {}
+                if holder.get(key) != value:
+                    problems.append(f"meilynx.digests.{key} {value!r} != pack {holder.get(key)!r}")
+            if problems:
+                for problem in problems:
+                    report(f"FAIL {label} line {n} seq={seq}: {problem}")
+                content_ok = False
+            else:
+                events_checked += 1
+        if len(sequences) != m.get('record_count'):
+            report(f"FAIL {label}: record_count mismatch (manifest {m.get('record_count')}, object holds "
+                   f"{len(sequences)} distinct sequences)")
+            content_ok = False
+        if sequences and (min(sequences) != first_seq or max(sequences) != last_seq):
+            report(f"FAIL {label}: object sequences span {min(sequences)}..{max(sequences)}, manifest says "
+                   f"{first_seq}..{last_seq}")
+            content_ok = False
+    if outside:
+        report(f"WARN export_record_outside_pack: {outside} exported event(s) name a chain or sequence the pack "
+               f"does not hold; not checked")
+    report(f"OCSF export: {events_checked} event(s) checked against the pack across {len(entries)} manifest(s).")
+    if cannot and content_ok:
+        content_status = CANNOT_EVALUATE
+    else:
+        content_status = PASSED if content_ok else FAILED
+    if FAILED in sig_statuses:
+        signature_status = FAILED
+    elif UNSIGNED in sig_statuses or not sig_statuses:
+        signature_status = UNSIGNED
+    else:
+        signature_status = PASSED
+    return content_status, signature_status
+
+
+def _exit_code_rank(code):
+    return {EXIT_FAIL: 3, EXIT_CANNOT_EVALUATE: 2, EXIT_UNSIGNED: 1, EXIT_OK: 0}[code]
+
+
+def _ec_mul(c, k, point):
+    """k * point on curve c, affine, for the self-test's signer."""
+    acc = _INFINITY
+    base = (point[0], point[1], 1)
+    for i in range(k.bit_length() - 1, -1, -1):
+        acc = _jacobian_double(c, acc)
+        if (k >> i) & 1:
+            acc = _jacobian_add(c, acc, base)
+    x, y, z = acc
+    if z == 0:
+        raise ValueError('point at infinity')
+    zinv = pow(z, -1, c.p)
+    return (x * zinv * zinv % c.p, y * zinv * zinv * zinv % c.p)
+
+
+def ocsf_export_self_test():
+    """The export check end to end on a synthetic
+    two-record chain and a synthetic export: a clean signed export verifies
+    (34a); an edited line fails naming the line and the field (34b); a
+    deleted object fails naming the object (34c); a manifest missing between
+    two others is WARN export_gap and still verifies (34d); an unsigned
+    manifest lands at UNSIGNED (34e); the wrong key fails (34f); a mapping
+    version this verifier does not read is CANNOT EVALUATE (34g); an event
+    on a sequence the pack does not hold is a WARN, not a failure (34h)."""
+    import gzip
+    import io
+    import tempfile
+
+    genesis = genesis_hash()
+
+    def make_event(seq, prev, input_tokens):
+        event = {
+            'schema_version': 'v1',
+            'sequence_number': seq,
+            'timestamp_utc': f'2026-01-01T00:00:0{seq}+00:00',
+            'event_id': f'evt-{seq}',
+            'request_id': f'req-{seq}',
+            'model_requested': 'gpt-4.1-mini',
+            'action': 'allow',
+            'input_tokens': input_tokens,
+            'output_tokens': 7,
+            'total_tokens': input_tokens + 7,
+            'cache_creation_input_tokens': None,
+            'cache_read_input_tokens': None,
+            'cached_input_tokens': None,
+            'reasoning_tokens': None,
+            'estimated_cost_usd': 0.000123,
+            'previous_hash': prev,
+        }
+        event['event_hash'] = recompute_event_hash(event, seq, prev)
+        # The export check compares digests against the pack record as read;
+        # a v1 record hashes no content block, so it is attached after the
+        # hash for the comparison only (the records are never re-hashed here).
+        event['content'] = {'capture_policy': 'hash_only', 'prompt_sha256_jcs': 'd' * 64}
+        return event
+
+    chain = 'chain_tnt_selftest_proxy'
+    first = make_event(0, genesis, 11)
+    second = make_event(1, first['event_hash'], 13)
+    third = make_event(2, second['event_hash'], 17)
+    records = {0: first, 1: second, 2: third}
+    # A test signing key (not a secret of anything): d and Q = d*G.
+    d = 0x1F2E3D4C5B6A79880123456789ABCDEF0123456789ABCDEF0123456789ABCDE1
+    q = _ec_mul(P256, d, P256.g)
+
+    def sign(canonical_bytes):
+        e = int.from_bytes(hashlib.sha256(canonical_bytes).digest(), 'big')
+        k = 0x6A1B2C3D4E5F60718293A4B5C6D7E8F90A1B2C3D4E5F60718293A4B5C6D7E8F9 % P256.n
+        r = _ec_mul(P256, k, P256.g)[0] % P256.n
+        s_ = pow(k, -1, P256.n) * (e + r * d) % P256.n
+        return base64.b64encode(r.to_bytes(32, 'big') + s_.to_bytes(32, 'big')).decode('ascii')
+
+    def ocsf_event(ev):
+        return {
+            'class_uid': 6003, 'category_uid': 6, 'activity_id': 1, 'type_uid': 600301, 'severity_id': 1,
+            'time': 0, 'metadata': {'version': '1.5.0', 'uid': ev['event_id']},
+            'meilynx': {
+                'chain': {'chain_id': chain, 'sequence_number': ev['sequence_number'], 'event_id': ev['event_id'],
+                          'event_hash': ev['event_hash'], 'previous_hash': ev['previous_hash']},
+                'digests': {'prompt_sha256_jcs': ev['content']['prompt_sha256_jcs'], 'response_sha256': None},
+            },
+        }
+
+    def write_export(root, events, first_seq, last_seq, signed=True, key_d=None, mapping_version='1'):
+        name = f'{first_seq:020d}-{last_seq:020d}.ndjson.gz'
+        buf = io.BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode='wb', mtime=0) as gz:
+            gz.write(('\n'.join(json.dumps(ocsf_event(e)) for e in events) + '\n').encode('utf-8'))
+        obj = buf.getvalue()
+        object_key = f'ocsf/v1/pxy_selftest/{chain}/2026/01/01/{name}'
+        manifest = {
+            'export_id': 'exp_selftest', 'proxy_external_id': 'pxy_selftest', 'chain_id': chain,
+            'first_sequence': first_seq, 'last_sequence': last_seq, 'record_count': len(events),
+            'event_count': len(events), 'object': object_key, 'object_sha256': hashlib.sha256(obj).hexdigest(),
+            'ocsf_version': '1.5.0', 'semconv_version': '1.37.0', 'mapping_version': mapping_version,
+            'generated_at': '2026-01-01T00:00:10Z', 'proxy_version': '0.0.0-selftest', 'image_digest': None,
+            'chain_head': {'sequence': last_seq}, 'anchor': None, 'signed': signed, 'public_key_id': 'k1' if signed else None,
+            'last_record': {'sequence': last_seq, 'event_id': events[-1]['event_id'], 'event_hash': events[-1]['event_hash']},
+        }
+        mbytes = jcs_dumps(manifest).encode('utf-8')
+        day = root / 'ocsf' / 'v1' / 'pxy_selftest' / chain / '2026' / '01' / '01'
+        day.mkdir(parents=True, exist_ok=True)
+        (day / name).write_bytes(obj)
+        (day / f'{name}.manifest.json').write_bytes(mbytes)
+        if signed:
+            (day / f'{name}.manifest.sig').write_text(sign(mbytes), encoding='utf-8')
+        return day, name
+
+    def check(tag, cond, text):
+        print(f"SELF-TEST assertion {tag} {'PASS' if cond else 'FAIL'}: {text}")
+        return cond
+
+    ok = True
+    jwk_point = q
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        day, name_a = write_export(root, [first, second], 0, 1)
+        entries = load_ocsf_export(day / f'{name_a}.manifest.json')
+        content, sig = verify_ocsf_export(entries, chain, records, public_point=jwk_point, quiet=True)
+        ok = check('34a', (content, sig) == (PASSED, PASSED), "a clean signed export verifies against the pack") and ok
+
+        # 29b: an edited line names the line and the field.
+        tampered_lines = [json.dumps(ocsf_event(first)), json.dumps(ocsf_event(second)).replace(second['event_hash'], 'f' * 64)]
+        buf = io.BytesIO()
+        with gzip.GzipFile(fileobj=buf, mode='wb', mtime=0) as gz:
+            gz.write(('\n'.join(tampered_lines) + '\n').encode('utf-8'))
+        tampered_obj = buf.getvalue()
+        m = json.loads((day / f'{name_a}.manifest.json').read_bytes())
+        m['object_sha256'] = hashlib.sha256(tampered_obj).hexdigest()
+        mbytes = jcs_dumps(m).encode('utf-8')
+        tdir = root / 'tampered'
+        tdir.mkdir()
+        (tdir / name_a).write_bytes(tampered_obj)
+        (tdir / f'{name_a}.manifest.json').write_bytes(mbytes)
+        (tdir / f'{name_a}.manifest.sig').write_text(sign(mbytes), encoding='utf-8')
+        captured = []
+        real_print = print
+        try:
+            import builtins
+            builtins.print = lambda *a, **k: captured.append(' '.join(str(x) for x in a))
+            content, sig = verify_ocsf_export(load_ocsf_export(tdir), chain, records, public_point=jwk_point)
+        finally:
+            builtins.print = real_print
+        named = any('line 2' in c and 'meilynx.chain.event_hash' in c and c.startswith('FAIL') for c in captured)
+        ok = check('34b', content == FAILED and sig == PASSED and named,
+                   "an edited exported line fails, naming the line and the field") and ok
+
+        # 29c: a deleted object names the object.
+        (day / name_a).unlink()
+        captured.clear()
+        try:
+            builtins.print = lambda *a, **k: captured.append(' '.join(str(x) for x in a))
+            content, _ = verify_ocsf_export(load_ocsf_export(day / f'{name_a}.manifest.json'), chain, records, public_point=jwk_point)
+        finally:
+            builtins.print = real_print
+        ok = check('34c', content == FAILED and any(c.startswith('FAIL') and name_a in c and 'missing' in c for c in captured),
+                   "a deleted export object fails, naming the object") and ok
+
+        # 29d: a gap between manifests is a WARN and still verifies; 29h: a
+        # sequence the pack does not hold is a WARN, not a failure.
+        gap_root = root / 'gap'
+        gap_root.mkdir()
+        write_export(gap_root, [first], 0, 0)
+        fourth = make_event(3, third['event_hash'], 19)
+        gday, _ = write_export(gap_root, [third, fourth], 2, 3)
+        captured.clear()
+        try:
+            builtins.print = lambda *a, **k: captured.append(' '.join(str(x) for x in a))
+            content, sig = verify_ocsf_export(load_ocsf_export(gap_root), chain, records, public_point=jwk_point)
+        finally:
+            builtins.print = real_print
+        ok = check('34d', content == PASSED and any('WARN export_gap' in c and '1..1' in c for c in captured),
+                   "a manifest missing between two others is WARN export_gap and still verifies") and ok
+        ok = check('34h', any('WARN export_record_outside_pack: 1' in c for c in captured),
+                   "an exported event on a sequence the pack does not hold is a WARN, not a failure") and ok
+
+        # 29e: unsigned lands at UNSIGNED; 29f: the wrong key fails.
+        uroot = root / 'unsigned'
+        uroot.mkdir()
+        uday, uname = write_export(uroot, [first, second], 0, 1, signed=False)
+        content, sig = verify_ocsf_export(load_ocsf_export(uday / f'{uname}.manifest.json'), chain, records, public_point=jwk_point, quiet=True)
+        ok = check('34e', (content, sig) == (PASSED, UNSIGNED), "an unsigned manifest verifies its content and lands at UNSIGNED") and ok
+        wrong = _ec_mul(P256, d + 1, P256.g)
+        content, sig = verify_ocsf_export(load_ocsf_export(gday / f'{gday.name and sorted(p.name for p in gday.glob("*.manifest.json"))[0]}'), chain, records, public_point=wrong, quiet=True)
+        ok = check('34f', sig == FAILED, "a manifest signed with another key fails") and ok
+        content, sig = verify_ocsf_export(load_ocsf_export(gap_root), chain, records, public_point=None, quiet=True)
+        ok = check('34i', sig == UNSIGNED and content == PASSED, "a signed manifest with no public key given is not verified, and says so") and ok
+
+        # 29g: a mapping version this verifier does not read.
+        vroot = root / 'version'
+        vroot.mkdir()
+        vday, vname = write_export(vroot, [first], 0, 0, mapping_version='9')
+        content, _ = verify_ocsf_export(load_ocsf_export(vday / f'{vname}.manifest.json'), chain, records, public_point=jwk_point, quiet=True)
+        ok = check('34g', content == CANNOT_EVALUATE, "an unknown ocsf mapping_version is CANNOT EVALUATE, never a pass") and ok
+
+        # The index.json route resolves sink-relative keys.
+        index = gday / 'index.json'
+        index.write_text(json.dumps({'manifests': [f'ocsf/v1/pxy_selftest/{chain}/2026/01/01/{p.name}' for p in sorted(gday.glob('*.manifest.json'))]}), encoding='utf-8')
+        ok = check('34j', len(load_ocsf_export(index)) == 2, "a day's index.json resolves its manifests against the sink root") and ok
+    ok = check('34k', 'ocsf-export-v1' in VERIFIER_CAPABILITIES, "VERIFIER_CAPABILITIES advertises ocsf-export-v1") and ok
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Meilynx Integrity Pack reproducer — independently verifies GCS WORM audit chain.'
@@ -7833,15 +12488,22 @@ def main():
     )
     parser.add_argument(
         '--certificate-identity',
-        default=PINNED_SIGNER_IDENTITY,
+        default=None,
         metavar='IDENTITY',
-        help=f'Signer identity a signed pack must carry. Default: {PINNED_SIGNER_IDENTITY}',
+        help=(
+            f'Signer identity a signed pack must carry. Default: {PINNED_SIGNER_IDENTITY}. '
+            f'A pack signed by a per-tenant signer needs the exact service-account email the '
+            f'evidence holder published for the project; without it the pack cannot be evaluated.'
+        ),
     )
     parser.add_argument(
         '--certificate-oidc-issuer',
-        default=PINNED_OIDC_ISSUER,
+        default=None,
         metavar='ISSUER',
-        help=f'OIDC issuer a signed pack must carry. Default: {PINNED_OIDC_ISSUER}',
+        help=(
+            f'OIDC issuer a signed pack must carry. Default: {PINNED_OIDC_ISSUER}, or '
+            f'{GOOGLE_OIDC_ISSUER} when --certificate-identity is an email address.'
+        ),
     )
     parser.add_argument(
         '--trusted-root',
@@ -7864,6 +12526,39 @@ def main():
         ),
     )
     parser.add_argument(
+        '--ocsf-export',
+        metavar='PATH',
+        help=(
+            'Also check an OCSF evidence export against this pack: a .manifest.json, '
+            'a day\'s index.json, or a directory of manifests, with objects and .manifest.sig files '
+            'beside them. Object digests, manifest signatures (with --ocsf-public-key), and every '
+            'exported event\'s chain coordinates and digests against the pack record.'
+        ),
+    )
+    parser.add_argument(
+        '--ocsf-public-key',
+        metavar='JWK',
+        help='The proxy\'s export signing public key as a P-256 EC JWK file, for --ocsf-export.',
+    )
+    parser.add_argument(
+        '--conditions-sha256',
+        metavar='HEX',
+        help=(
+            'Also give the customer-conditions verdict for the condition set whose SHA-256 you '
+            'hold: its acceptance on the holder\'s control-plane chain, the records after it sealed under a '
+            'governance version carrying it, and the exceptions its instances recorded.'
+        ),
+    )
+    parser.add_argument(
+        '--conditions-acceptance',
+        metavar='FILE',
+        help=(
+            'The exchange.conditions_accepted control-plane record (control-plane/<seq:020d>.json, as stored), '
+            'for a pack that does not carry the control-plane chain. Its hash is recomputed; its link into '
+            'the chain is not in the pack, and the verdict says so.'
+        ),
+    )
+    parser.add_argument(
         '--allow-unsigned',
         action='store_true',
         help=(
@@ -7880,13 +12575,30 @@ def main():
         ok = segment_self_test() and ok
         ok = attribution_self_test() and ok
         ok = content_self_test() and ok
+        ok = receipt_self_test() and ok
+        ok = control_plane_self_test() and ok
         ok = tool_calls_self_test() and ok
+        ok = content_carry_forward_self_test() and ok
+        ok = exchange_self_test() and ok
+        ok = conditions_self_test() and ok
         ok = signature_self_test() and ok
         ok = anchor_self_test() and ok
+        ok = ocsf_export_self_test() and ok
         sys.exit(0 if ok else 1)
 
     if not (args.bucket or args.records) or not args.manifest:
         parser.error("--manifest plus one of --bucket / --records is required (or use --self-test)")
+    if args.conditions_sha256 is not None and not _SHA256_HEX.fullmatch(args.conditions_sha256):
+        parser.error("--conditions-sha256 must be 64 lowercase hex characters")
+    if args.conditions_acceptance and args.conditions_sha256 is None:
+        parser.error("--conditions-acceptance needs --conditions-sha256")
+    supplied_acceptance = None
+    if args.conditions_acceptance:
+        try:
+            supplied_acceptance = (load_control_plane_record(Path(args.conditions_acceptance).read_bytes()),
+                                   args.conditions_acceptance)
+        except (OSError, ValueError) as exc:
+            parser.error(f"--conditions-acceptance: cannot read a control-plane record ({exc})")
     if args.export_records and args.records:
         if not Path(args.records).is_dir():
             parser.error("--export-records with --records needs a records directory")
@@ -7907,9 +12619,23 @@ def main():
         print(f"ERROR: manifest is not valid JSON: {exc}", file=sys.stderr)
         sys.exit(EXIT_FAIL)
 
-    version_error = manifest_schema_version_error(manifest) or manifest_storage_layout_error(manifest)
+    version_error = (manifest_schema_version_error(manifest) or manifest_storage_layout_error(manifest)
+                     or manifest_evidence_class_error(manifest) or manifest_content_error(manifest))
     if version_error:
         print(f"ERROR: {version_error}", file=sys.stderr)
+        sys.exit(EXIT_CANNOT_EVALUATE)
+    if evidence_class_suffix(manifest):
+        print(f"EVIDENCE CLASS: {manifest['evidence_class']} ({EVIDENCE_CLASSES[manifest['evidence_class']]}).")
+    # A stripped Exchange pack says so before the records and on
+    # every verdict line, and is verified from its own records only.
+    label = evidence_class_suffix(manifest) + content_suffix(manifest)
+    for line in content_lines(manifest):
+        print(line)
+    stripped = frozenset(STRIPPED_FIELDS) if pack_is_stripped(manifest) else frozenset()
+    if stripped and args.bucket:
+        print("ERROR: this pack's records are content-stripped (manifest 1.5); --bucket would read the holder's "
+              "full records, which are not what the manifest describes. Verify the pack's own records with "
+              "--records.", file=sys.stderr)
         sys.exit(EXIT_CANNOT_EVALUATE)
     try:
         tsa_roots = load_tsa_roots(args.tsa_root)
@@ -7932,6 +12658,7 @@ def main():
         anchors_dir = Path(args.records) / 'anchors'
         anchor_source = DirectoryAnchorSource(anchors_dir) if Path(args.records).is_dir() else None
         holders = None
+        control_plane_fetch = control_plane_local_fetcher(args.records)
     else:
         try:
             from google.cloud import storage as gcs
@@ -7949,15 +12676,19 @@ def main():
         holders = fetch.holders
         anchor_chain = chain_for_prefix(manifest.get('prefix', 'audit/'))
         anchor_source = BucketAnchorSource(args.bucket, anchor_chain, client) if anchor_chain else None
+        control_plane_fetch = control_plane_gcs_fetcher(args.bucket, client)
     if args.export_records:
         fetch = exporting_fetcher(fetch, args.export_records)
         if anchor_source is not None:
             anchor_source = ExportingAnchorSource(anchor_source, args.export_records)
+        control_plane_fetch = control_plane_exporting_fetcher(control_plane_fetch, args.export_records)
 
     record_times = {}
     fetch = timestamp_recording_fetcher(fetch, record_times)
 
     hash_version = manifest.get('hash_version', '')
+    pack_full_records = {}
+    control_plane_records = {}
     if hash_version not in SUPPORTED_HASH_VERSIONS:
         print(
             f"ERROR: This reproducer supports hash_version {SUPPORTED_HASH_VERSIONS}. "
@@ -7967,35 +12698,105 @@ def main():
         chain_status = CANNOT_EVALUATE
         anchor_status = CANNOT_EVALUATE
     else:
-        passed = verify_manifest_with(fetch, manifest, require_manifest_hash=signed, holders=holders)
+        receipts = {}
+        stripped_problems = []
+        passed = verify_manifest_with(fetch, manifest, require_manifest_hash=signed, holders=holders,
+                                      receipts_out=receipts, records_out=pack_full_records,
+                                      stripped=stripped, cannot_evaluate_out=stripped_problems,
+                                      stubs=manifest_stubs(manifest))
+        # The control-plane chain a 1.3 pack carries, then each
+        # decision receipt's anchor against it.
+        if 'control_plane' in manifest or manifest.get('schema_version') == '1.3':
+            print()
+            passed = verify_control_plane_section(manifest, receipts, control_plane_fetch,
+                                                  records_out=control_plane_records) and passed
         chain_status = PASSED if passed else FAILED
+        # A record that contradicts the signed content claim makes
+        # the pack one this verifier cannot evaluate as what it says it is.
+        if stripped_problems and chain_status == PASSED:
+            chain_status = CANNOT_EVALUATE
         print()
         anchor_status = verify_anchors(manifest, fetch, anchor_source, tsa_roots.get, record_times)
     count = len(manifest.get('events', []))
+    # The verdict counts the hash-only stubs it linked through.
+    stub_count = len(manifest_stubs(manifest))
+    stubbed = (f", {stub_count} of them as hash-only stubs (linked, hash not recomputed)" if stub_count else "")
     code = final_exit_code(combine_with_anchor_status(chain_status, anchor_status), signature_status,
                            bool(args.allow_unsigned))
+    # The OCSF export beside the pack. Its verdict
+    # combines with the pack's by the same precedence (1 > 2 > 3 > 0).
+    if args.ocsf_export:
+        print()
+        export_code = EXIT_CANNOT_EVALUATE
+        if chain_status == CANNOT_EVALUATE:
+            print("CANNOT EVALUATE: the OCSF export cannot be checked against a pack this verifier cannot evaluate.")
+        else:
+            try:
+                public_point = None
+                if args.ocsf_public_key:
+                    public_point = _jwk_to_point(json.loads(Path(args.ocsf_public_key).read_text(encoding='utf-8')))
+                entries = load_ocsf_export(args.ocsf_export)
+            except (OSError, ValueError, KeyError) as exc:
+                print(f"ERROR: unusable --ocsf-export / --ocsf-public-key ({exc})", file=sys.stderr)
+                entries = None
+            if entries is not None:
+                export_content, export_signature = verify_ocsf_export(
+                    entries, chain_for_prefix(manifest.get('prefix', 'audit/')), pack_full_records,
+                    public_point=public_point)
+                export_code = final_exit_code(export_content, export_signature, bool(args.allow_unsigned))
+                if export_content == FAILED:
+                    print("\nFAIL: the OCSF export does not match the pack (see above).", file=sys.stderr)
+                elif export_signature == FAILED:
+                    print("\nFAIL: an OCSF export manifest signature did not verify (see above).", file=sys.stderr)
+                elif export_code == EXIT_UNSIGNED:
+                    print("\nOCSF EXPORT OK, AUTHENTICITY NOT ESTABLISHED: the export matches the pack, but a manifest "
+                          "is unsigned or its key was not given.", file=sys.stderr)
+                elif export_code == EXIT_OK:
+                    print("\nOK: the OCSF export matches the pack" + (" and its manifests are signed." if export_signature == PASSED else "."))
+        if _exit_code_rank(export_code) > _exit_code_rank(code):
+            code = export_code
+
+    # The customer-conditions verdict, when asked
+    # for. Its code combines with the pack's by the same precedence.
+    conditions_status = None
+    if args.conditions_sha256 is not None:
+        print()
+        if chain_status == CANNOT_EVALUATE and not pack_full_records:
+            print("CANNOT EVALUATE conditions: the records of a pack this verifier cannot evaluate were not read.")
+            conditions_status = CANNOT_EVALUATE
+        else:
+            conditions_status = conditions_verdict(args.conditions_sha256, manifest, pack_full_records,
+                                                   control_plane_records, supplied_acceptance, label=label)
+        conditions_code = final_exit_code(conditions_status, PASSED, True)
+        if _exit_code_rank(conditions_code) > _exit_code_rank(code):
+            code = conditions_code
 
     if code == EXIT_FAIL:
+        if conditions_status == FAILED:
+            print(f"\nFAIL: the customer-conditions verdict failed (see above).{label}", file=sys.stderr)
         if chain_status == FAILED:
-            print("\nFAIL: one or more events failed verification.", file=sys.stderr)
+            print(f"\nFAIL: one or more events failed verification.{label}", file=sys.stderr)
         if anchor_status == FAILED:
-            print("\nFAIL: chain-head anchor verification failed (see above).", file=sys.stderr)
+            print(f"\nFAIL: chain-head anchor verification failed (see above).{label}", file=sys.stderr)
         if signature_status == FAILED:
-            print("\nFAIL: the manifest signature did not verify (see above).", file=sys.stderr)
+            print(f"\nFAIL: the manifest signature did not verify (see above).{label}", file=sys.stderr)
+    elif code == EXIT_CANNOT_EVALUATE and conditions_status == CANNOT_EVALUATE and chain_status != CANNOT_EVALUATE:
+        print(f"\nCANNOT EVALUATE: the customer-conditions verdict cannot be evaluated from this pack "
+              f"(see above).{label}", file=sys.stderr)
     elif code == EXIT_CANNOT_EVALUATE:
-        print("\nCANNOT EVALUATE: this verifier does not support part of this pack (see above).",
+        print(f"\nCANNOT EVALUATE: this verifier does not support part of this pack (see above).{label}",
               file=sys.stderr)
     elif signature_status == PASSED:
-        print(f"\nOK: all {count} events verified, and the manifest signature verified.")
+        print(f"\nOK: all {count} events verified{stubbed}, and the manifest signature verified.{label}")
     else:
         print(f"\n{UNSIGNED_NOTICE}")
         if code == EXIT_OK:
-            print(f"OK: all {count} events verified. Authenticity not established (unsigned pack, "
-                  f"accepted with --allow-unsigned).")
+            print(f"OK: all {count} events verified{stubbed}. Authenticity not established (unsigned pack, "
+                  f"accepted with --allow-unsigned).{label}")
         else:
             print(
-                f"CHAIN OK, AUTHENTICITY NOT ESTABLISHED: all {count} events verified, but the pack "
-                f"is unsigned. Pass --allow-unsigned to accept an unsigned pack.",
+                f"CHAIN OK, AUTHENTICITY NOT ESTABLISHED: all {count} events verified{stubbed}, but the pack "
+                f"is unsigned. Pass --allow-unsigned to accept an unsigned pack.{label}",
                 file=sys.stderr,
             )
     sys.exit(code)
