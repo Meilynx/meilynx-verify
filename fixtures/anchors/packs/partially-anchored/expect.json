@@ -8,8 +8,7 @@
         "test-ec=roots/ec-root.der"
       ],
       "contains": [
-        "anchored_through=2",
-        "NOTICE: unanchored tail seq=3..4"
+        "ANCHORS OK: verified through seq=2, 2/2 witnesses; seq=3..4 not yet anchored"
       ],
       "exit": 0
     }

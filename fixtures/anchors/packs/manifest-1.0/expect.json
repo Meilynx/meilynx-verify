@@ -3,7 +3,7 @@
     {
       "args": [],
       "contains": [
-        "NOTICE: UNANCHORED — this pack predates"
+        "ANCHORS: none (manifest 1.0 predates anchoring)"
       ],
       "exit": 0
     }

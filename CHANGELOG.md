@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.9.1 (2026-10-20)
+
+- `verify-pack.py` from meilynx-proxy `1e5eb4d`.
+- Anchoring is reported as one status line next to the other results:
+  `ANCHORS OK: verified through seq=N, a/b witnesses` (with `; seq=A..B not
+  yet anchored` for an unanchored tail) or `ANCHORS: none`. A seal is named
+  on the same line. The separate `UNANCHORED` notice, the seal notice and the
+  note on what an anchor shows are no longer printed; SPEC §6.1 describes
+  what an anchor shows.
+- The record-clock notice reads `NOTICE: N record(s) carry a timestamp more
+  than 5 min after the anchor covering them (first seq=…)`.
+- Exit codes and verdicts are unchanged. A script that matched
+  `ANCHORS OK: chain=… anchored_through=…` should match the new line.
+
 ## 0.9.0 (2026-10-19)
 
 - `verify-pack.py` from meilynx-proxy `647bb71`.
