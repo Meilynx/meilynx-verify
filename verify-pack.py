@@ -8348,8 +8348,7 @@ def verify_anchors(manifest, record_fetch, source, roots_for, record_times=None)
     chain walk already read."""
     version = manifest.get("schema_version", "1.0")
     if version == "1.0":
-        print("NOTICE: UNANCHORED — this pack predates chain-head anchoring (manifest 1.0). The chain "
-              "check shows the records are intact and linked; it does not show when they existed.")
+        print("ANCHORS: none (manifest 1.0 predates anchoring)")
         return PASSED
     check = _AnchorCheck()
     anchoring = manifest.get("anchoring")
@@ -8433,6 +8432,7 @@ def _verify_listed_and_found(anchoring, entry, listed, seals, window, record_fet
         if outside:
             print(f"NOTICE: {outside} anchor(s) outside this pack's window {lo}..{hi} were not judged")
 
+    seal_notes = []
     for seal in seals:
         try:
             event, recomputed = _read_record(record_fetch, seal["seq"], stubs)
@@ -8445,15 +8445,14 @@ def _verify_listed_and_found(anchoring, entry, listed, seals, window, record_fet
             if recomputed != seal["event_hash"]:
                 check.fail(f"FAIL anchoring seal seq={seal['seq']}: the hash-only stub is not the listed seal")
             else:
-                print(f"NOTICE: chain {chain} carries the seal {seal['action_type']} at seq={seal['seq']} "
-                      f"(a hash-only stub: its hash matches; its action type is the manifest's)")
+                seal_notes.append(_seal_note(seal['action_type'], seal['seq']) + " (hash-only stub)")
             continue
         action = (event.get("admin_action") or {}).get("action_type")
         if (recomputed != seal["event_hash"] or event.get("event_hash") != recomputed
                 or event.get("event_kind") != "admin_action" or action != seal["action_type"]):
             check.fail(f"FAIL anchoring seal seq={seal['seq']}: the record is not the listed seal")
             continue
-        print(f"NOTICE: chain {chain} carries the seal {action} at seq={seal['seq']}")
+        seal_notes.append(_seal_note(action, seal['seq']))
 
     anchored_through = max(covered) if covered else None
     state = ("unanchored" if anchored_through is None
@@ -8487,24 +8486,27 @@ def _verify_listed_and_found(anchoring, entry, listed, seals, window, record_fet
     ahead, first, unreadable = records_clock_ahead(covering, lo, record_epoch)
     if ahead:
         seq, when, gen_time = first
-        print(f"NOTICE: record clock ahead of anchor — {ahead} record(s) in chain {chain} carry a timestamp more "
-              f"than {ANCHOR_CLOCK_TOLERANCE_SECONDS // 60} min after the genTime of the earliest anchor covering "
-              f"them (first seq={seq}: record {_iso(when)}, anchor genTime {_iso(gen_time)}); the anchor's "
-              f"genTime is the authoritative 'existed by' time")
+        print(f"NOTICE: {ahead} record(s) carry a timestamp more than {ANCHOR_CLOCK_TOLERANCE_SECONDS // 60} min "
+              f"after the anchor covering them (first seq={seq}: record {_iso(when)}, anchor {_iso(gen_time)})")
     if unreadable:
         print(f"NOTICE: the clock of {unreadable} anchored record(s) could not be read and was not compared")
+    # One status line: what an anchor does and does not show is in SPEC §6.1.
     if state == "unanchored":
-        print(f"NOTICE: UNANCHORED — chain {chain} ({reason}): no chain-head anchor covers this pack's "
-              f"records, so nothing here shows when they existed.")
+        line = "ANCHORS: none" + (f" ({'; '.join(seal_notes)})" if seal_notes else "")
     else:
-        print(f"ANCHORS OK: chain={chain} anchored_through={anchored_through} "
-              f"witnesses={witness_count[0]}/{witness_count[1]}")
+        line = (f"ANCHORS OK: verified through seq={anchored_through}, "
+                f"{witness_count[0]}/{witness_count[1]} witnesses")
         if state == "partially_anchored":
-            print(f"NOTICE: unanchored tail seq={anchored_through + 1}..{hi}: these records are not yet "
-                  f"covered by a chain-head anchor")
-    print("NOTE: an anchor shows a record existed no later than the token's genTime and is unchanged "
-          "since; it does not show the chain is complete.")
+            line += f"; seq={anchored_through + 1}..{hi} not yet anchored"
+        if seal_notes:
+            line += "; " + "; ".join(seal_notes)
+    print(line)
     return PASSED
+
+
+def _seal_note(action_type, seq):
+    what = "turned off" if action_type == "audit_anchoring_disabled" else "misconfigured"
+    return f"anchoring {what} at seq={seq}"
 
 
 def manifest_schema_version_error(manifest):
@@ -11894,12 +11896,12 @@ def anchor_self_test():
             return status, out.getvalue()
 
         status, output = run(manifest_with(unanchored))
-        check("25o", status == PASSED and "NOTICE: UNANCHORED" in output,
-              "a 1.1 pack with state unanchored passes with an UNANCHORED notice", output)
+        check("25o", status == PASSED and output == "ANCHORS: none\n",
+              "a 1.1 pack with state unanchored passes with one ANCHORS: none line", output)
 
         status, output = run(dict(manifest_with(None, version="1.0")))
-        check("25p", status == PASSED and "NOTICE: UNANCHORED" in output and "manifest 1.0" in output,
-              "a 1.0 pack passes with an UNANCHORED notice", output)
+        check("25p", status == PASSED and output == "ANCHORS: none (manifest 1.0 predates anchoring)\n",
+              "a 1.0 pack passes with one ANCHORS: none line", output)
 
         status, output = run(manifest_with(anchored))
         check("25q", status == FAILED and "FAIL anchor seq=2: statement object is missing" in output,

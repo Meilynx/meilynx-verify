@@ -84,7 +84,7 @@ CASES = [
         "anchored": True,
         "export_matches_legacy": True,
         "runs": [{"args": TSA_ARGS, "exit": 0,
-                  "contains": ["PASS seq=4", "ANCHORS OK: chain=chain_tnt_fixture_run_a anchored_through=4",
+                  "contains": ["PASS seq=4", "ANCHORS OK: verified through seq=4, 2/2 witnesses",
                                "OK: all 5 events verified"],
                   "absent": ["WARN", "FAIL"]}],
     },

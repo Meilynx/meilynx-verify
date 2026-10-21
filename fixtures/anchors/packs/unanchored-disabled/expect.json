@@ -3,8 +3,7 @@
     {
       "args": [],
       "contains": [
-        "carries the seal audit_anchoring_disabled at seq=0",
-        "NOTICE: UNANCHORED — chain chain_tnt_fixture_run_a (disabled)"
+        "ANCHORS: none (anchoring turned off at seq=0)"
       ],
       "exit": 0
     }

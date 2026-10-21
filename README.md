@@ -49,8 +49,8 @@ ESTABLISHED" and relies on `--allow-unsigned` for its `0`. Without the flag it
 exits `3`. The first sample is a request chain (model calls and MCP tool
 calls, including records that seal the caller's identity); the second is a
 coverage chain. The third, under `fixtures/anchors/`, is a chain whose heads
-are anchored (see "Chain-head anchors" below); its output ends with
-`ANCHORS OK`.
+are anchored (see "Chain-head anchors" below); its output includes an
+`ANCHORS OK` line.
 
 Try it on a tampered copy:
 
@@ -169,11 +169,12 @@ manifest lists and every anchor it finds next to the records:
   trusted root valid at the token's time; SHA-1 is refused everywhere;
 - the manifest's coverage summary agrees with the anchors that verified.
 
-A pass prints `ANCHORS OK` with the anchored sequence range and the number of
-witnesses that verified. Records after the last anchor are reported as an
-unanchored tail. A pack with no anchors still passes its chain check, and
-prints a prominent `UNANCHORED` notice so nobody reads a chain check as
-proof of time.
+A pass prints `ANCHORS OK` with the sequence the anchors verify through and
+the number of witnesses that verified. Records after the last anchor are
+reported on the same line as not yet anchored. A pack with no anchors still
+passes its chain check and prints `ANCHORS: none`. An anchor shows that the
+covered records existed no later than the token's time and are unchanged
+since (SPEC §6.1).
 
 The roots of the two public witnesses are pinned in `verify-pack.py` with
 their SHA-256 fingerprints and trust windows. A deployment that uses its own

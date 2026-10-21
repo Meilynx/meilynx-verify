@@ -743,7 +743,7 @@ explains an unanchored chain.
 
 | Finding | Verdict |
 |---|---|
-| Manifest 1.0, or 1.1 with `state: unanchored` and no anchors | Pass, with a prominent `UNANCHORED` notice |
+| Manifest 1.0, or 1.1 with `state: unanchored` and no anchors | Pass, with the status line `ANCHORS: none` |
 | A listed anchor whose statement or token object is missing, or whose bytes differ from the manifest's SHA-256 | Fail (exit 1), naming the chain, the sequence and the reason |
 | A statement that is not canonical, or does not name this chain at this sequence | Fail (exit 1) |
 | The anchored `event_hash` differs from the record's recomputed hash, or from the hash the record stores | Fail (exit 1): the record changed after it was anchored |
@@ -751,11 +751,16 @@ explains an unanchored chain.
 | An anchor found in the records directory or bucket that the manifest does not list | Verified like a listed one; a pass is reported as a NOTICE, a failure fails the pack |
 | The manifest's `state`, `reason`, `anchored_through_seq` or `unanchored_tail` disagree with the anchors that verified | Fail (exit 1) |
 | A listed seal that is not the `admin_action` record it claims to be | Fail (exit 1) |
-| A record whose `timestamp_utc` is more than five minutes after the `genTime` of the earliest anchor covering it | Pass, with a `record clock ahead of anchor` notice; the token's `genTime` is the authoritative time |
+| A record whose `timestamp_utc` is more than five minutes after the `genTime` of the earliest anchor covering it | Pass, with a NOTICE naming the first such record; the token's `genTime` is the authoritative time |
 | No trust root for a witness, an unparseable token, or a manifest `schema_version` this verifier does not know | Cannot evaluate (exit 2) |
 
-A pass prints `ANCHORS OK: chain=<name> anchored_through=<seq>
-witnesses=<verified>/<listed>`. An anchor shows that the covered records
+The verifier prints one anchoring status line. A pass prints
+`ANCHORS OK: verified through seq=<seq>, <verified>/<listed> witnesses`,
+followed by `; seq=<from>..<to> not yet anchored` for an unanchored tail. A
+pack with no anchors prints `ANCHORS: none`. A seal adds `anchoring turned
+off at seq=<n>` or `anchoring misconfigured at seq=<n>` to the line, and a
+manifest 1.0 pack prints `ANCHORS: none (manifest 1.0 predates anchoring)`.
+An anchor shows that the covered records
 existed no later than the token's `genTime` and are unchanged since. It does
 not show that the chain is complete (§8).
 
@@ -1115,8 +1120,8 @@ since; the chain hashes attest the records.
   the proxy's clock and nothing in the chain shows that clock was right. A
   chain-head anchor (§6.1) shows that a record existed no later than the
   witness's `genTime`, and the verifier flags a record clock that runs ahead
-  of its anchor. A pack without anchors shows nothing about time, and says
-  so with an `UNANCHORED` notice. The same holds for a decision receipt's
+  of its anchor. A pack without anchors shows nothing about time, and the
+  verifier prints `ANCHORS: none`. The same holds for a decision receipt's
   clock fields and a control-plane record's `occurred_at`: the sealed
   arithmetic is checked (§4.3), the clock behind it is not.
 
