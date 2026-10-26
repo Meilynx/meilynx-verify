@@ -1,0 +1,48 @@
+{
+  "bucket": "fixture-bucket",
+  "events": [
+    {
+      "event_id": "evt-0",
+      "recomputed_event_hash": "59362e099a86de1fcb022a2f59877431f7d5d011226c161b890592f449b49518",
+      "sequence": 0,
+      "stored_event_hash": "59362e099a86de1fcb022a2f59877431f7d5d011226c161b890592f449b49518"
+    },
+    {
+      "event_id": "evt-1",
+      "recomputed_event_hash": "4fa87bcc77a7575de1b4a6cec5971eda0f1fb896c1f98fd7d447119053d3a0a1",
+      "sequence": 1,
+      "stored_event_hash": "4fa87bcc77a7575de1b4a6cec5971eda0f1fb896c1f98fd7d447119053d3a0a1"
+    },
+    {
+      "event_id": "evt-2",
+      "recomputed_event_hash": "309eff28761ebdcbe6e535c6910e046a500e105dee27a8e609e38077ac4189c3",
+      "sequence": 2,
+      "stored_event_hash": "309eff28761ebdcbe6e535c6910e046a500e105dee27a8e609e38077ac4189c3"
+    },
+    {
+      "event_id": "evt-3",
+      "recomputed_event_hash": "2d15a78caf2e8f16c99ecb5fac23adb269848f5c18a0249d79f1776882ca4938",
+      "sequence": 3,
+      "stored_event_hash": "2d15a78caf2e8f16c99ecb5fac23adb269848f5c18a0249d79f1776882ca4938"
+    },
+    {
+      "event_id": "evt-4",
+      "recomputed_event_hash": "726c9ac6a6a2993a2819507ff9ebc44bc7d01bb4815e754983785474293eab71",
+      "sequence": 4,
+      "stored_event_hash": "726c9ac6a6a2993a2819507ff9ebc44bc7d01bb4815e754983785474293eab71"
+    },
+    {
+      "event_id": "evt-5",
+      "recomputed_event_hash": "8785974d7e381214181f190794e3a98d308b00a5dd68a1cef28660b5f24210a4",
+      "sequence": 5,
+      "stored_event_hash": "8785974d7e381214181f190794e3a98d308b00a5dd68a1cef28660b5f24210a4"
+    }
+  ],
+  "first_sequence": 0,
+  "hash_algorithm": "SHA-256",
+  "hash_version": "v1",
+  "last_sequence": 5,
+  "prefix": "audit/chain_tnt_fixture_proxy/",
+  "schema_version": "1.0",
+  "signing_deferred": true
+}

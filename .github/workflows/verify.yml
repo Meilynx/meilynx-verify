@@ -118,6 +118,8 @@ jobs:
           diff -r /tmp/regen/coverage fixtures/coverage
           python fixtures/gen-segment-fixtures.py /tmp/regen/segments
           diff -r /tmp/regen/segments fixtures/segments
+      - name: Record signatures; each writer-sealed case exits with its verdict
+        run: python fixtures/run-record-sig-cases.py
       - name: Embedded signature test vectors match their generator
         run: python fixtures/generate-signature-vectors.py --check
       - name: Every tampered signed pack fails with its exit code and reason

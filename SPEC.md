@@ -5,12 +5,12 @@ enough that a verifier can be written from it without reading Meilynx code.
 `verify-pack.py` in this repository is one such verifier; its `--self-test`
 pins the values below against fixture hashes.
 
-Status: describes chain records with `schema_version` v1 through v1.18, the
+Status: describes chain records with `schema_version` v1 through v1.19, the
 per-record and segment storage layouts, pack manifest `schema_version` 1.0
 through 1.5, the control-plane chain a 1.3 manifest carries, the per-tenant
-pack signature, the export copy a pack can be checked against (§9) and the
-customer-conditions verdict (§10), as read by `verify-pack.py` from
-meilynx-proxy commit `647bb71` (2026-10-19). A chain written before the
+pack signature, the export copy a pack can be checked against (§9), the
+customer-conditions verdict (§10) and record signatures (§11), as read by
+`verify-pack.py` from meilynx-proxy commit `f3d9d29` (2026-10-25). A chain written before the
 segment rollout is per-record, and its packs carry manifest 1.0 or 1.1.
 
 ## 1. Records
@@ -93,7 +93,7 @@ Every record carries at least these fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.18"`). Absent means `"v1"`. |
+| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.19"`). Absent means `"v1"`. |
 | `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`, `decision_receipt`). Absent means `llm_request`. |
 | `sequence_number` | integer | Position in the chain, starting at 0. |
 | `timestamp_utc` | string | RFC 3339 UTC timestamp, nanosecond precision, `Z` suffix. |
@@ -106,15 +106,17 @@ Every record carries at least these fields:
 | `estimated_cost_usd` | number or null | Estimated cost. |
 | `previous_hash` | string | Hex SHA-256 of the previous record, or the genesis hash for sequence 0. |
 | `event_hash` | string | Hex SHA-256 of this record's preimage (§3). |
+| `record_sig` | string or absent | Ed25519 signature over the record's chain coordinates, 128 lowercase hex characters (§11). Absent on a record sealed before the proxy had a chain signing key. Outside the preimage. |
 
 Kind-specific payloads live under `admin_action`, `auth_session`,
 `mcp_event`, `coverage`, `coverage_key_inventory`, `decision_receipt`,
 `join_context`, `content`, `identity`, `evaluation_trace` and `customer`.
 LLM records also carry
 `messages`, `response_text`, `findings`, `policy_version`,
-`raw_request`/`raw_response` and routing metadata; **only the fields listed
-in the preimage tables (§4) are covered by `event_hash`**. From v1.10 the
-content of an LLM record is bound through digests (§4.4).
+`model_executed`, `raw_request`/`raw_response` and routing metadata; **only
+the fields listed in the preimage tables (§4) are covered by `event_hash`**.
+From v1.10 the content of an LLM record is bound through digests (§4.4).
+From v1.19 `policy_version` and `model_executed` are in the preimage (§4.3).
 
 ## 2. Chain linkage and genesis
 
@@ -136,7 +138,8 @@ A missing sequence number is a failure, never a skip. A record whose
 
 The preimage is the concatenation, in the order given by the field table for
 the record's version and kind, of each field encoded as follows. There are
-no separators and no length prefixes.
+no separators, and no length prefixes except where an encoding below gives
+one.
 
 | Kind of field | Encoding |
 |---|---|
@@ -144,6 +147,7 @@ no separators and no length prefixes.
 | optional string | one byte `0x00` if absent/null; otherwise `0x01` followed by the UTF-8 bytes. |
 | u64 | 8 bytes little-endian. |
 | u32 | 4 bytes little-endian. |
+| length-prefixed string | the string's UTF-8 byte length as a u32, then the UTF-8 bytes. Used from v1.19 (§4.3). |
 | i64 | 8 bytes little-endian, two's complement. |
 | optional u64 | one byte `0x00` if absent/null; otherwise `0x01` followed by 8 bytes little-endian. |
 | optional i64 | one byte `0x00` if absent/null; otherwise `0x01` followed by 8 bytes little-endian. |
@@ -388,7 +392,7 @@ record with both is v1.18): the per-rule
 outcomes of the governance evaluation and the request's delivery outcome,
 stored as an object under `evaluation_trace.outcomes` and bound by that
 digest, which the verifier recomputes (RFC 8785). The trace's timing fields
-are stored but not hashed. A trace on any version other than v1.16 or v1.18,
+are stored but not hashed. A trace on any version other than v1.16, v1.18 or v1.19,
 a v1.16 record without one, a trace whose `outcomes_sha256_jcs` is not a
 string, or v1.16 on any kind other than `llm_request`, is invalid and fails
 verification. A v1.16 record's `content` block, when present, is checked as
@@ -428,10 +432,31 @@ the presence bytes and the customer block's leading tag byte, when
 `mcp.policy_decision`, as in v1.17. A `content` block on a v1.18 MCP record
 is invalid and fails verification: the MCP preimage never reads one.
 
-A record is v1.18 exactly when it carries a `customer` block, on either
-lane. A `customer` block on any other version, a v1.18 record without one,
-a block whose shape is not as §4.6 gives, or v1.18 on any kind other than
-`llm_request` and the MCP kinds, is invalid and fails verification.
+An MCP record is v1.18 exactly when it carries a `customer` block, and so
+is an `llm_request` sealed before v1.19. A `customer` block on any version
+other than v1.18 or v1.19, a v1.18 record without one, a block whose shape
+is not as §4.6 gives, or v1.18 on any kind other than `llm_request` and the
+MCP kinds, is invalid and fails verification.
+
+**v1.19 `llm_request`** — the v1.18 `llm_request` layout with the sealed
+customer presence-tagged: `0x00` when the record carries no `customer`
+block, else the sealed customer (§3, §4.6), whose leading `0x01` is its tag.
+Then `policy_version` (length-prefixed string, §3), then `0x00` when the
+record carries no `model_executed`, else `0x01` followed by
+`model_executed` (length-prefixed string). 44 entries counting the four
+presence bytes and the customer block's leading tag byte, when `content`,
+`identity`, `evaluation_trace`, `customer` and `model_executed` are all
+present. `policy_version` names the governance version in force when the
+request was decided: a bundle's SHA-256, or `empty`,
+`fail-closed-no-bundle` or `none-applied` when no bundle applied.
+`model_executed` is the model the provider served; it is absent when none
+was served (a block, a refusal). Both fields were stored but not hashed in
+every earlier version. On a v1.19 record an edit to either, or adding or
+removing `model_executed`, breaks the chain at that record. v1.19 is
+defined only for `llm_request` and is stamped exactly when the record
+carries a `policy_version`; a v1.19 record without one, or v1.19 on any
+other kind, is invalid and fails verification. The trace, content,
+identity and customer, when present, are checked as for v1.18.
 
 MCP kinds are: `mcp.tool_call`, `mcp.policy_decision`, `mcp.tool_result`,
 `mcp.tools_list.served`, `mcp.error`, `mcp.catalog_drift`. Any MCP hasher
@@ -442,14 +467,13 @@ Scheme (RFC 8785) serialization of the payload in question. For MCP records
 the verifier checks that the digest string is what the record hashed; it does
 not recompute the digest from a payload, because the payload is not part of
 the record. For LLM records with a `content` block (v1.10, v1.11, v1.12,
-v1.16, v1.18) it also recomputes the stored-content digests (§4.4), for
-v1.12, v1.14, v1.17 and v1.18 records with an identity the asserted-claims
-digest (§4.5), for v1.16 and
-v1.18 records the evaluation outcome digest, for v1.15 records the
-evidence-set digest (§4.3), and for v1.18 records the customer label digest
-(§4.6).
+v1.16, v1.18, v1.19) it also recomputes the stored-content digests (§4.4),
+for v1.12, v1.14, v1.17, v1.18 and v1.19 records with an identity the
+asserted-claims digest (§4.5), for v1.16, v1.18 and v1.19 records the
+evaluation outcome digest, for v1.15 records the evidence-set digest (§4.3),
+and for v1.18 and v1.19 records the customer label digest (§4.6).
 
-### 4.4 LLM content attestation (v1.10, v1.11, v1.12, v1.16, v1.18)
+### 4.4 LLM content attestation (v1.10, v1.11, v1.12, v1.16, v1.18, v1.19)
 
 `capture_policy` names what the record retains:
 
@@ -474,7 +498,7 @@ The six `content` fields:
 
 Because the digests are in the preimage and the content they describe is in
 the record, a verifier checks, for every v1.10 and v1.11 record and every
-v1.12, v1.16 or v1.18 record that carries a `content` block:
+v1.12, v1.16, v1.18 or v1.19 record that carries a `content` block:
 
 1. `stored_prompt_sha256_jcs`, when present, equals SHA-256(JCS(`messages`));
    when absent, `messages` is empty.
@@ -490,7 +514,7 @@ content is outside the preimage) and fails these checks. `prompt_sha256_jcs`
 and `response_sha256` cover content the record may no longer hold: whoever
 holds the original can show it is what the record was sealed over.
 
-A v1.12, v1.16 or v1.18 record with no `content` block was sealed with no
+A v1.12, v1.16, v1.18 or v1.19 record with no `content` block was sealed with no
 capture policy. Its prompt and response are stored but not bound, as before
 v1.10, and are not checked.
 
@@ -505,10 +529,10 @@ whitespace, strings escaped as in RFC 8785 §3.2.2.2, numbers in ECMAScript
 form (`1.0` → `1`, `1e-7` → `1e-7`, `1e21` → `1e+21`). A plain sorted-keys
 JSON dump differs on numbers and must not be used.
 
-### 4.5 Sealed identity (v1.12, v1.14, v1.16, v1.17, v1.18)
+### 4.5 Sealed identity (v1.12, v1.14, v1.16, v1.17, v1.18, v1.19)
 
 A v1.12 record carries an `identity` block naming who called the proxy (a
-v1.14, v1.16, v1.17 or v1.18 record carries it too, when the proxy resolved
+v1.14, v1.16, v1.17, v1.18 or v1.19 record carries it too, when the proxy resolved
 one):
 
 | Field | Hashed | Meaning |
@@ -524,7 +548,7 @@ one):
 The asserted labels are stored beside their digest rather than hashed, so a
 reader sees the values and the digest proves they are the ones the proxy
 saw. A verifier therefore checks, for every v1.12 record and every v1.14,
-v1.17 or v1.18 record that carries an identity, that
+v1.17, v1.18 or v1.19 record that carries an identity, that
 `asserted_digest` equals SHA-256(JCS(`asserted`)). A label rewritten after
 sealing leaves the chain hash intact and fails this check. The labels are
 claims a caller made, never evidence of who it was; only the hashed fields
@@ -535,10 +559,11 @@ asserted-label digest is not re-derived by this release; a v1.16 label
 rewritten after sealing is not caught until the record is checked by a
 release that does.
 
-### 4.6 Sealed customer (v1.18)
+### 4.6 Sealed customer (v1.18, v1.19)
 
 A v1.18 record carries a `customer` block naming which of the proxy
-operator's customers the call was made for:
+operator's customers the call was made for. A v1.19 record carries one when
+the proxy resolved a customer:
 
 | Field | Hashed | Meaning |
 |---|---|---|
@@ -552,7 +577,7 @@ nor a kid; `asserted` carries a digest and no kid; `credential` carries a
 digest and a non-blank kid. A block of any other shape, or a `source` not
 listed, is invalid and fails verification.
 
-A verifier checks, for every v1.18 record whose `source` is `asserted` and
+A verifier checks, for every v1.18 or v1.19 record whose `source` is `asserted` and
 which stores a non-empty `customer_id`, that `label_sha256` equals
 SHA-256(UTF-8(`customer_id`)). A label rewritten after sealing leaves the
 chain hash intact and fails this check. A missing `customer_id` is not a
@@ -1100,11 +1125,12 @@ since; the chain hashes attest the records.
   `on_behalf_of_attestation` marker is stored but not hashed; the hashed
   `delegated_human` must agree with it. On v1.15 records the `evidence`
   list is stored but not hashed; `evidence_set_sha256` binds it (§4.3). On
-  v1.16 and v1.18 records the evaluation trace's timing is stored but not
-  hashed; its outcomes are bound by `outcomes_sha256_jcs` (§4.3). On v1.18
-  records the plain `customer_id` is stored but not hashed; `label_sha256`
-  binds it only when `source` is `asserted` (§4.6). On every LLM record
-  `policy_version` is stored but not hashed, and on every MCP record
+  v1.16, v1.18 and v1.19 records the evaluation trace's timing is stored
+  but not hashed; its outcomes are bound by `outcomes_sha256_jcs` (§4.3). On
+  v1.18 and v1.19 records the plain `customer_id` is stored but not hashed;
+  `label_sha256` binds it only when `source` is `asserted` (§4.6). On LLM
+  records before v1.19 `policy_version` and `model_executed` are stored but
+  not hashed (v1.19 binds both, §4.3), and on every MCP record
   `mcp_event.finding_summary` is; the customer-conditions verdict (§10) says
   which of its findings rest on them.
 - **Export copies.** An export of the chain to another format (§9) is a
@@ -1114,8 +1140,10 @@ since; the chain hashes attest the records.
 - **Whether a detector missed something.** Under `redacted`, only spans a
   detector located are masked. The stored copy can still contain sensitive
   text no detector recognized.
-- **Authorship of the chain.** Only a signed pack (§7) binds an identity to
-  a window.
+- **Authorship of the chain.** A signed pack (§7) binds an identity to a
+  window. A record signature (§11) binds each record to the proxy's chain
+  signing key, not to a person or organisation, and whoever holds both that
+  key and the records could sign a rewritten chain.
 - **When a record was written.** `timestamp_utc` is hashed, but it comes from
   the proxy's clock and nothing in the chain shows that clock was right. A
   chain-head anchor (§6.1) shows that a record existed no later than the
@@ -1212,10 +1240,10 @@ the same relationship), before that record's `occurred_at`. A hash-only stub
 
 **Sealed under the set.** A record counts only by sealed evidence: an MCP
 record whose hashed `mcp_event.mcp_bundle_sha256` equals
-`compiled_mcp_sha256`, or an `llm_request` (v1.16 or v1.18) whose
+`compiled_mcp_sha256`, or an `llm_request` (v1.16, v1.18 or v1.19) whose
 digest-bound `evaluation_trace.outcomes.rules[].rule_id` includes one ending
 in `@cust_<12 hex>` for this relationship. Every other record in the window
-is a `GAP` line with its sequence and hash. An `llm_request` whose unhashed
+is a `GAP` line with its sequence and hash. An `llm_request` whose
 `policy_version` equals `compiled_governance_sha256` is counted in a
 separate NOTE, never as sealed.
 
@@ -1235,3 +1263,56 @@ compiled by the holder's control plane`. The last clause is what the pack
 cannot show: the compile runs in the holder's control plane, and the pack
 carries bundle digests, not bundles. The verdict's code ranks against the
 pack's as in §7.3; the verdict never changes the chain's own verdict.
+
+## 11. Record signatures
+
+A proxy configured with a chain signing key signs every record it seals, on
+every chain and lane. The signature is Ed25519 (RFC 8032) over
+
+```
+"meilynx.audit.record_sig.v1" 0x00
+|| u32 LE byte length of chain_id || chain_id (UTF-8)
+|| u64 LE sequence_number
+|| event_hash (64 lowercase hex characters, as ASCII)
+```
+
+and is stored on the record as `record_sig`, 128 lowercase hex characters.
+`chain_id` is the chain the record belongs to, from its `source`: `proxy`
+for `proxy` (or no `source`), `shadow` for `shadow_browser`, `coverage` for
+`coverage`. A signed record with any other `source` fails verification. The
+signature sits outside the preimage, so signing changes no record version.
+Because `event_hash` commits to every earlier hash, a valid signature on a
+record also vouches for the chain before it.
+
+The proxy announces its key with an `admin_action` record whose
+`action_type` is `chain_signing_started`, sealed when it starts with a key
+configured. Its `metadata_json` carries `algorithm` (`ed25519`), `public_key` (the
+32-byte key as 64 lowercase hex characters) and `public_key_fingerprint`
+(`sha256:` followed by the hex SHA-256 of the raw key). A boundary whose key
+is malformed, or whose fingerprint is not that key's, fails verification.
+The proxy also publishes the key on its `/readyz` endpoint
+(`chain_signing_public_key`).
+
+A verifier walks the signatures with the hashes, in sequence order:
+
+1. Records before the first signed record are the unsigned prefix: sealed
+   before signing started, verified by hash only, and reported as such.
+2. A record's signature is checked under the key the latest
+   `chain_signing_started` boundary announced, else under the key the
+   reader supplied. A signature that does not verify fails at that record:
+   the record was edited and every hash after it recomputed without the key.
+3. An unsigned record after a signed one fails: the chain was rewritten and
+   its signatures stripped.
+4. When the reader supplies the key (`--chain-signing-key`), the newest
+   signed record must verify under it. A chain re-signed under another key,
+   even one that announces that key with a boundary of its own, fails there.
+   Without a supplied key the verdict says the signatures were checked under
+   the key the chain announces.
+5. Signed records with neither a boundary in the pack nor a supplied key are
+   counted as not checked.
+
+The verdict prints one `SIGNATURES` line: `signed=true` when every record is
+signed, `signed=partial` when an unsigned prefix comes first, and
+`signed=false` when no record carries a signature. A pack whose records
+carry no signature still verifies by hash. `record-signatures-v1` in
+`VERIFIER_CAPABILITIES` declares this check.

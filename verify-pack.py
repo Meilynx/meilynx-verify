@@ -113,6 +113,22 @@ Content-stripped Exchange pack (manifest 1.5):
     own records (--records); --bucket would read the holder's full records
     and is refused (exit 2).
 
+Record signatures:
+    A proxy configured with a chain signing key signs every record it seals:
+    Ed25519 over (chain_id, sequence_number, event_hash), stored on the
+    record as `record_sig`. The verifier checks each one over the hash it
+    just recomputed. Records sealed before signing started carry none: they
+    are the unsigned prefix, verified by hash only and printed as such. The
+    boundary is a `chain_signing_started` admin record carrying the public
+    key and its fingerprint; an unsigned record after it fails (signatures
+    stripped), and so does a signature that does not verify (a record edited
+    and every hash after it recomputed without the key). Pass the key the
+    proxy publishes on /readyz (`chain_signing_public_key`) to bind the chain
+    to it; without it, signatures are checked under the key the chain
+    announces, and the SIGNATURES line says so.
+        python verify-pack.py --records ./records --manifest manifest.json \\
+            --chain-signing-key <64 hex characters>
+
 Customer conditions verdict:
     A bank that proposed conditions a vendor accepted holds the SHA-256 of
     its condition set. `--conditions-sha256 HEX` adds one verdict line:
@@ -296,10 +312,15 @@ EVIDENCE_CLASSES = {
 # customer-conditions verdict for `--conditions-sha256`: the acceptance on
 # the control-plane chain, the window's records sealed under the compiled
 # set, its gaps and its exceptions.
+# `record-signatures-v1` checks every record's Ed25519 `record_sig` over
+# (chain_id, sequence_number, event_hash), labels the unsigned prefix sealed
+# before `chain_signing_started`, and with --chain-signing-key requires the
+# newest signature to be the pinned key's.
 VERIFIER_CAPABILITIES = frozenset(
     {"chain-anchors-v1", "segmented-records-v1", "decision-receipts-v1", "evaluation-trace-v1",
      "data-reach-evidence-v1", "control-plane-chain-v1", "ocsf-export-v1", "customer-scope-v1",
-     "per-tenant-signer-v1", "evidence-class-v1", "content-stripped-v1", "customer-conditions-v1"}
+     "per-tenant-signer-v1", "evidence-class-v1", "content-stripped-v1", "customer-conditions-v1",
+     "record-signatures-v1"}
 )
 # The stripped profile of a manifest 1.5 Exchange pack. Mirror of
 # `exchange::STRIPPED_FIELDS` / `WITHHELD_FIELDS` / `STUB_FIELDS` /
@@ -1761,7 +1782,7 @@ def _trace_rules(record):
     """(rule ids, deciding rule id) of a sealed evaluation trace, else ((), None)."""
     trace = record.get('evaluation_trace')
     outcomes = trace.get('outcomes') if isinstance(trace, dict) else None
-    if record.get('schema_version') not in ('v1.16', 'v1.18') or not isinstance(outcomes, dict):
+    if record.get('schema_version') not in ('v1.16', 'v1.18', 'v1.19') or not isinstance(outcomes, dict):
         return (), None
     rules = outcomes.get('rules')
     ids = tuple(r.get('rule_id') for r in rules if isinstance(r, dict)) if isinstance(rules, list) else ()
@@ -2280,9 +2301,9 @@ def check_sealed_identity(event, stripped=frozenset()):
     the hash and is not re-derived."""
     version = event.get('schema_version') or 'v1'
     identity = event.get('identity')
-    if version in ('v1.14', 'v1.17', 'v1.18') and identity is None:
+    if version in ('v1.14', 'v1.17', 'v1.18', 'v1.19') and identity is None:
         return []
-    if version not in ('v1.12', 'v1.14', 'v1.17', 'v1.18'):
+    if version not in ('v1.12', 'v1.14', 'v1.17', 'v1.18', 'v1.19'):
         return []
     if not isinstance(identity, dict):
         return [f"{version} record has no identity block"]
@@ -2457,15 +2478,18 @@ def check_customer_scope(event):
     label's. A rewritten label leaves the chain hash intact; this check is
     what catches it. A pack produced for one customer carries other
     customers' records as hash-only stubs with no label, so a missing
-    `customer_id` is not a problem. Returns a list of problems."""
+    `customer_id` is not a problem. Returns a list of problems.
+
+    A v1.19 record carries the block forward, presence-tagged:
+    checked when present, and whole without one."""
     version = event.get('schema_version') or 'v1'
     customer = event.get('customer')
-    if version != 'v1.18':
+    if version not in ('v1.18', 'v1.19'):
         if customer is not None:
-            return [f'{version} record carries a customer block; it is hashed only in the v1.18 bucket']
+            return [f'{version} record carries a customer block; it is hashed only in the v1.18 and v1.19 buckets']
         return []
     if customer is None:
-        return ['v1.18 record has no customer block']
+        return [] if version == 'v1.19' else ['v1.18 record has no customer block']
     problem = customer_shape_problem(customer)
     if problem is not None:
         return [f'malformed customer block: {problem}']
@@ -2531,6 +2555,81 @@ def compute_event_hash_v1_18_llm_request(
     return h.hexdigest()
 
 
+def encode_len_prefixed_str(s):
+    """A u32 little-endian byte length, then the UTF-8 bytes. Mirror of
+    `feed_len_prefixed_str` in sqlite.rs."""
+    raw = s.encode('utf-8')
+    return struct.pack('<I', len(raw)) + raw
+
+
+def compute_event_hash_v1_19_llm_request(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    join_context, content, identity, evaluation_trace, customer,
+    policy_version, model_executed,
+):
+    """v1.19 llm_request hash: the v1.18 layout with the customer block
+    presence-tagged, then `policy_version` (required, length-prefixed) and
+    `model_executed` (a presence byte, then length-prefixed when present), so
+    editing either field, or adding or removing the served model, moves the
+    hash. Both fields were stored-not-hashed in every earlier version. Mirror
+    of `compute_event_hash_v1_19_llm_request` in sqlite.rs. The v1.18 feeds
+    are duplicated, not shared."""
+    if not isinstance(policy_version, str):
+        raise ValueError('schema_version v1.19 requires a policy_version string')
+    if model_executed is not None and not isinstance(model_executed, str):
+        raise ValueError('model_executed must be a string when present')
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_LLM_REQUEST.encode('utf-8'))
+    join = join_context or {}
+    h.update(encode_optional_str(join.get('correlation_id')))
+    h.update(encode_optional_str(join.get('session_id')))
+    h.update(encode_optional_str(join.get('agent_name')))
+    if content is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(content['capture_policy'].encode('utf-8'))
+        h.update(encode_optional_str(content.get('prompt_sha256_jcs')))
+        h.update(encode_optional_str(content.get('response_sha256')))
+        h.update(encode_optional_str(content.get('stored_prompt_sha256_jcs')))
+        h.update(encode_optional_str(content.get('stored_response_sha256')))
+        h.update(encode_optional_str(content.get('findings_sha256_jcs')))
+        h.update(encode_optional_str(content.get('tool_calls_sha256_jcs')))
+        h.update(encode_optional_str(content.get('stored_tool_calls_sha256_jcs')))
+    if identity is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(encode_sealed_identity(identity))
+    if evaluation_trace is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(evaluation_trace['outcomes_sha256_jcs'].encode('utf-8'))
+    # The customer block is presence-tagged in v1.19 (v1.18 required it);
+    # encode_sealed_customer writes its own 1 tag.
+    if customer is None:
+        h.update(b'\x00')
+    else:
+        h.update(encode_sealed_customer(customer))
+    # The v1.19 additions.
+    h.update(encode_len_prefixed_str(policy_version))
+    if model_executed is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(encode_len_prefixed_str(model_executed))
+    return h.hexdigest()
+
+
 def check_evaluation_trace(event):
     """A v1.16 record's hash covers the digest of its
     evaluation outcomes, not the outcomes themselves. Recompute the digest from
@@ -2540,14 +2639,14 @@ def check_evaluation_trace(event):
     `check_evaluation_trace` in meilynx-audit/src/evaluation_trace.rs."""
     version = event.get('schema_version') or 'v1'
     trace = event.get('evaluation_trace')
-    if version not in ('v1.16', 'v1.18'):
+    if version not in ('v1.16', 'v1.18', 'v1.19'):
         if trace is not None:
-            return [f'{version} record carries an evaluation_trace; it is hashed only in the v1.16 and v1.18 buckets']
+            return [f'{version} record carries an evaluation_trace; it is hashed only in the v1.16, v1.18 and v1.19 buckets']
         return []
     if trace is None:
-        # v1.18 presence-tags the trace: a refusal sealed before
+        # v1.18 and v1.19 presence-tag the trace: a refusal sealed before
         # evaluation carries none and is whole.
-        return [] if version == 'v1.18' else ['v1.16 record has no evaluation_trace']
+        return [] if version in ('v1.18', 'v1.19') else ['v1.16 record has no evaluation_trace']
     sealed = trace.get('outcomes_sha256_jcs')
     if not isinstance(sealed, str):
         return ['evaluation_trace has no outcomes_sha256_jcs']
@@ -2891,13 +2990,13 @@ def _on_behalf_of_is_verified(mcp_event):
 # v1.12, v1.16 and v1.18 ones that carry it forward. Mirror of the Rust guard
 # in meilynx-audit/src/sqlite.rs (`llm_schema_version_with_content`); a new
 # llm_request bucket that hashes `content.*` is added here and there together,
-# and self-test assertion 31e pins the v1.18 member. `check_llm_content` reads
+# and self-test assertion 31e pins the v1.18 member (36d the v1.19 one). `check_llm_content` reads
 # the same tuple, so a bucket that seals the digests is also one whose stored
 # content is re-derived from them (assertions 35a-35c).
-CONTENT_ATTESTATION_VERSIONS = ('v1.10', 'v1.11', 'v1.12', 'v1.16', 'v1.18')
+CONTENT_ATTESTATION_VERSIONS = ('v1.10', 'v1.11', 'v1.12', 'v1.16', 'v1.18', 'v1.19')
 # The members whose preimage presence-tags the content block: a record sealed
 # with no capture policy carries none and stores its content unhashed.
-CONTENT_PRESENCE_TAGGED_VERSIONS = ('v1.12', 'v1.16', 'v1.18')
+CONTENT_PRESENCE_TAGGED_VERSIONS = ('v1.12', 'v1.16', 'v1.18', 'v1.19')
 
 
 def compute_event_hash_dispatch(
@@ -2909,7 +3008,7 @@ def compute_event_hash_dispatch(
     event_kind=EVENT_KIND_LLM_REQUEST, auth_session=None, admin_action=None,
     mcp_event=None, coverage=None, join_context=None, content=None,
     identity=None, coverage_key_inventory=None, decision_receipt=None,
-    evaluation_trace=None, customer=None,
+    evaluation_trace=None, customer=None, policy_version=None, model_executed=None,
 ):
     """Python mirror of compute_event_hash_dispatch in sqlite.rs.
 
@@ -2922,13 +3021,17 @@ def compute_event_hash_dispatch(
     # v1.18 preimage (both lanes); anywhere else it would ride the record
     # unhashed, and a v1.18 tag without it has no defined preimage. A block the
     # resolver never produces is refused at the same point.
+    # v1.19 carries the block forward on the LLM lane.
     if customer is not None:
-        if schema_version != 'v1.18' or not (
-            event_kind == EVENT_KIND_LLM_REQUEST or event_kind in MCP_EVENT_KINDS
-        ):
+        lane_bucket = (
+            (schema_version == 'v1.18' and (event_kind == EVENT_KIND_LLM_REQUEST or event_kind in MCP_EVENT_KINDS))
+            or (schema_version == 'v1.19' and event_kind == EVENT_KIND_LLM_REQUEST)
+        )
+        if not lane_bucket:
             raise ValueError(
                 f"customer block present on a {schema_version!r} {event_kind!r} "
-                f"event — it is hashed only in the v1.18 bucket on the LLM and MCP lanes."
+                f"event — it is hashed only in the v1.18 bucket on the LLM and MCP lanes "
+                f"and the v1.19 bucket on the LLM lane."
             )
         problem = customer_shape_problem(customer)
         if problem is not None:
@@ -2938,7 +3041,7 @@ def compute_event_hash_dispatch(
     # carries it forward, presence-tagged); anywhere else the trace would sit
     # on the record unhashed.
     if evaluation_trace is not None and (
-        schema_version not in ('v1.16', 'v1.18') or event_kind != EVENT_KIND_LLM_REQUEST
+        schema_version not in ('v1.16', 'v1.18', 'v1.19') or event_kind != EVENT_KIND_LLM_REQUEST
     ):
         raise ValueError(
             f"evaluation_trace present on a {schema_version!r} "
@@ -3007,7 +3110,7 @@ def compute_event_hash_dispatch(
         raise ValueError("content attestation has no capture_policy, so the record has no defined preimage.")
     # And the tool-call digests only in v1.11: the v1.10 hash does
     # not read them, so a v1.10 record carrying one would present it unhashed.
-    if _has_tool_call_digests(content) and schema_version not in ('v1.11', 'v1.12', 'v1.16', 'v1.18'):
+    if _has_tool_call_digests(content) and schema_version not in ('v1.11', 'v1.12', 'v1.16', 'v1.18', 'v1.19'):
         raise ValueError(
             f"tool-call digests present on a {schema_version!r} event — "
             f"they are hashed only in the v1.11, v1.12, v1.16 and v1.18 buckets."
@@ -3015,7 +3118,7 @@ def compute_event_hash_dispatch(
     # Fail closed. The sealed identity enters only the
     # v1.12 preimage (both lanes); on any other version it would sit on the
     # record unhashed, rewritable without breaking the chain.
-    if identity is not None and schema_version not in ('v1.12', 'v1.14', 'v1.16', 'v1.17', 'v1.18'):
+    if identity is not None and schema_version not in ('v1.12', 'v1.14', 'v1.16', 'v1.17', 'v1.18', 'v1.19'):
         raise ValueError(
             f"identity block present on a {schema_version!r} event — "
             f"it is hashed only in the v1.12 bucket (and the MCP v1.14 and v1.17, "
@@ -3051,7 +3154,7 @@ def compute_event_hash_dispatch(
                 "identity.delegated_human disagrees with the principal chain's "
                 "on_behalf_of_attestation — the two must agree"
             )
-    if join_context is not None and schema_version not in ('v1.9', 'v1.10', 'v1.11', 'v1.12', 'v1.14', 'v1.16', 'v1.17', 'v1.18'):
+    if join_context is not None and schema_version not in ('v1.9', 'v1.10', 'v1.11', 'v1.12', 'v1.14', 'v1.16', 'v1.17', 'v1.18', 'v1.19'):
         raise ValueError(
             f"join_context present on a {schema_version!r} event — "
             f"caller-asserted join keys are hashed only in the v1.9, v1.10, v1.11, v1.12, "
@@ -3451,6 +3554,28 @@ def compute_event_hash_dispatch(
         raise ValueError(
             f"schema_version v1.18 is defined only for llm_request and mcp.* "
             f"events; got event_kind {event_kind!r}"
+        )
+    if schema_version == 'v1.19':
+        # The LLM bucket that binds the policy version in force and the
+        # served model: the v1.18 llm_request preimage (customer block
+        # presence-tagged), then both fields. Stamped exactly when the record
+        # carries a policy version.
+        if event_kind != EVENT_KIND_LLM_REQUEST:
+            raise ValueError(
+                f"schema_version v1.19 is defined only for llm_request events; got event_kind {event_kind!r}"
+            )
+        if policy_version is None:
+            raise ValueError(
+                "schema_version v1.19 requires a policy_version; a record "
+                "sealed without one must stay in its pre-v1.19 bucket."
+            )
+        return compute_event_hash_v1_19_llm_request(
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            join_context, content, identity, evaluation_trace, customer,
+            policy_version, model_executed,
         )
     raise ValueError(
         f"unknown schema_version {schema_version!r} — "
@@ -4774,6 +4899,104 @@ def run_self_test():
             print(f'SELF-TEST assertion 31e FAIL: only {refused} of 3 buckets without content.* in their preimage refused a content attestation', file=sys.stderr)
         ok = False
 
+    # Assertion 36a — the v1.19 llm_request fixtures (direct fn): an
+    # evaluated, credential-bound request with a served model; a budget block
+    # (no identity, no trace, no served model); a pre-bundle refusal with no
+    # customer block. Paired with mei2774_policy_binding_chain_round_trip.rs.
+    got = [
+        compute_event_hash_v1_19_llm_request(
+            *_V1_16_FIXTURE_ARGS, None, None, _V1_16_IDENTITY_FIXTURE, fixture_trace,
+            _V1_18_CUSTOMER_CREDENTIAL_FIXTURE, V1_19_POLICY_VERSION_FIXTURE, V1_19_MODEL_EXECUTED_FIXTURE,
+        ),
+        compute_event_hash_v1_19_llm_request(
+            *_V1_16_FIXTURE_ARGS, None, None, None, None, _V1_18_CUSTOMER_NONE_FIXTURE,
+            V1_19_POLICY_VERSION_FIXTURE, None,
+        ),
+        compute_event_hash_v1_19_llm_request(
+            *_V1_16_FIXTURE_ARGS, None, None, None, None, None, 'fail-closed-no-bundle', None,
+        ),
+    ]
+    expected = [V1_19_LLM_FULL_FIXTURE_HASH, V1_19_LLM_BUDGET_BLOCK_FIXTURE_HASH, V1_19_LLM_NO_CUSTOMER_FIXTURE_HASH]
+    if got == expected and len(set(got)) == 3:
+        print('SELF-TEST assertion 36a PASS: v1.19 fixture hashes match')
+    else:
+        print(f'SELF-TEST assertion 36a FAIL: v1.19 fixture drift: {got} != {expected}', file=sys.stderr)
+        ok = False
+
+    # Assertion 36b — the production recompute path (recompute_event_hash over
+    # an exported record) binds both fields: editing policy_version, editing
+    # model_executed, adding it and removing it each move the hash.
+    v119 = dict(
+        schema_version='v1.19', event_id='evt-v116-fixture', request_id='req-v116-fixture',
+        timestamp_utc='2026-10-09T16:21:00Z', model_requested='gpt-6-luna', action='block',
+        input_tokens=452, output_tokens=70, total_tokens=522,
+        identity=dict(_V1_16_IDENTITY_FIXTURE), evaluation_trace=dict(fixture_trace),
+        customer=dict(_V1_18_CUSTOMER_CREDENTIAL_FIXTURE),
+        policy_version=V1_19_POLICY_VERSION_FIXTURE, model_executed=V1_19_MODEL_EXECUTED_FIXTURE,
+    )
+    base = recompute_event_hash(v119, 7, 'deadbeef' * 8)
+    removed = dict(v119)
+    del removed['model_executed']
+    budget = dict(v119, identity=None, evaluation_trace=None, customer=dict(_V1_18_CUSTOMER_NONE_FIXTURE))
+    del budget['model_executed']
+    tampered = [
+        dict(v119, policy_version='6a' * 32),
+        dict(v119, model_executed='gpt-6-luna-2026-10-14'),
+        removed,
+        dict(v119, model_executed=None),
+    ]
+    added = dict(budget, model_executed='gpt-6-luna-2026-09-30')
+    moved = [recompute_event_hash(t, 7, 'deadbeef' * 8) != base for t in tampered]
+    budget_hash = recompute_event_hash(budget, 7, 'deadbeef' * 8)
+    if (base == V1_19_LLM_FULL_FIXTURE_HASH and all(moved)
+            and budget_hash == V1_19_LLM_BUDGET_BLOCK_FIXTURE_HASH
+            and recompute_event_hash(added, 7, 'deadbeef' * 8) != budget_hash):
+        print('SELF-TEST assertion 36b PASS: v1.19 binds policy_version and model_executed (edit, add and remove are caught)')
+    else:
+        print(f'SELF-TEST assertion 36b FAIL: base {base}, moved {moved}, budget {budget_hash}', file=sys.stderr)
+        ok = False
+
+    # Assertion 36c — fail closed: v1.19 without a policy version, and v1.19
+    # on a kind other than llm_request.
+    cases = [
+        dict(event_kind=EVENT_KIND_LLM_REQUEST, customer=_V1_18_CUSTOMER_NONE_FIXTURE),
+        dict(event_kind=EVENT_KIND_ADMIN_ACTION, policy_version=V1_19_POLICY_VERSION_FIXTURE),
+        dict(event_kind=EVENT_KIND_MCP_TOOL_CALL, mcp_event=_V1_5_MCP_TOOL_CALL_FIXTURE_PAYLOAD,
+             policy_version=V1_19_POLICY_VERSION_FIXTURE),
+        dict(event_kind=EVENT_KIND_MCP_TOOL_CALL, mcp_event=_V1_5_MCP_TOOL_CALL_FIXTURE_PAYLOAD,
+             customer=_V1_18_CUSTOMER_NONE_FIXTURE, policy_version=V1_19_POLICY_VERSION_FIXTURE),
+    ]
+    rejected = 0
+    for kwargs in cases:
+        try:
+            compute_event_hash_dispatch('v1.19', 7, '2026-10-10T12:00:01+00:00', 'e', 'r', '', 'allow',
+                                        0, 0, None, None, None, None, None, None, 'deadbeef' * 8, **kwargs)
+        except ValueError as e:
+            rejected += 'v1.19' in str(e)
+    if rejected == len(cases):
+        print(f'SELF-TEST assertion 36c PASS: all {len(cases)} v1.19 records without a policy version or off the LLM lane are rejected')
+    else:
+        print(f'SELF-TEST assertion 36c FAIL: only {rejected} of {len(cases)} fail-closed cases rejected', file=sys.stderr)
+        ok = False
+
+    # Assertion 36d — a v1.19 llm_request keeps its content attestation and
+    # join keys (the v1.19 preimage hashes both).
+    try:
+        compute_event_hash_dispatch('v1.19', 7, '2026-10-10T12:00:01+00:00', 'e', 'r', 'gpt-4.1-mini', 'allow',
+                                    0, 0, None, None, None, None, None, None, 'deadbeef' * 8,
+                                    event_kind=EVENT_KIND_LLM_REQUEST, identity=_V1_16_IDENTITY_FIXTURE,
+                                    content=dict(_V1_12_CONTENT_FIXTURE_PAYLOAD),
+                                    join_context=_V1_9_JOIN_CONTEXT_FIXTURE_PAYLOAD,
+                                    policy_version=V1_19_POLICY_VERSION_FIXTURE)
+        admitted = 'v1.19' in CONTENT_ATTESTATION_VERSIONS and 'v1.19' in CONTENT_PRESENCE_TAGGED_VERSIONS
+    except ValueError as e:
+        admitted = False
+        print(f'SELF-TEST assertion 36d FAIL: a v1.19 llm_request with content and join keys was refused: {e}', file=sys.stderr)
+    if admitted:
+        print('SELF-TEST assertion 36d PASS: a v1.19 llm_request keeps its content attestation and join keys')
+    else:
+        ok = False
+
     # Assertion 17e — the fail-closed invariant: a join_context on any
     # bucket other than v1.9 is a hard error, not a silently-unhashed field.
     # Mirror of the Rust dispatcher guard. This is the assertion that would
@@ -5295,6 +5518,14 @@ _V1_18_MCP_CUSTOMER_CREDENTIAL_FIXTURE = {
 }
 V1_18_MCP_MATCHED_CREDENTIAL_FIXTURE_HASH = "1545ab0c02e19d6651d9ba2d4c9041c4482903fb7f7a41ebd590b7c93c700194"
 V1_18_MCP_TOOL_CALL_NONE_FIXTURE_HASH = "a19ca9ced54f811a0c2f0b84e86e3d7541272e28f12b12f5d5c0aafb9ad113e6"
+# v1.19 llm_request fixtures. Paired with
+# meilynx-audit/tests/mei2774_policy_binding_chain_round_trip.rs; neither side
+# may drift independently.
+V1_19_POLICY_VERSION_FIXTURE = '5f' * 32
+V1_19_MODEL_EXECUTED_FIXTURE = 'gpt-6-luna-2026-09-30'
+V1_19_LLM_FULL_FIXTURE_HASH = "3bf6543a3d634b6107ef29959878d70b2f489d3bbf524b9761f395ba2bcc3bd1"
+V1_19_LLM_BUDGET_BLOCK_FIXTURE_HASH = "4bb67bf0944741c79eb7393b72502a58fd85f73150880369470187a0bada263e"
+V1_19_LLM_NO_CUSTOMER_FIXTURE_HASH = "29ceddb5b3bd1d9dbd12ed7c08823396c29ddbc7c7ef1163073babfde979f517"
 
 # Tool-call digest fixture. Paired with
 # meilynx-proxy/src/audit_capture.rs::tool_call_digests_are_pinned_for_the_verifier:
@@ -5395,6 +5626,8 @@ def recompute_event_hash(event, seq, previous_hash):
         decision_receipt=event.get('decision_receipt'),
         evaluation_trace=event.get('evaluation_trace'),
         customer=event.get('customer'),
+        policy_version=event.get('policy_version'),
+        model_executed=event.get('model_executed'),
     )
 
 
@@ -5765,9 +5998,274 @@ def stub_problems(stub, seq, entry, require_manifest_hash=False):
     return problems
 
 
+# ---------------------------------------------------------------------------
+# Record signatures (Ed25519 over each record's chain coordinates)
+#
+# A proxy configured with a chain signing key signs every record it seals:
+# Ed25519 (RFC 8032) over
+#   b"meilynx.audit.record_sig.v1\0" || u32 LE len(chain_id) || chain_id
+#   || u64 LE sequence_number || event_hash (64 lowercase hex characters)
+# stored as `record_sig` (128 lowercase hex characters). chain_id is the
+# proxy's internal chain name: `proxy`, `shadow` or `coverage`, from the
+# record's `source`. Records sealed before signing started carry no
+# signature and verify as unsigned. The boundary is a `chain_signing_started`
+# admin action carrying the public key and its fingerprint (`sha256:` + hex
+# SHA-256 of the raw 32-byte key). Verification below is the RFC 8032
+# reference algorithm in pure Python (standard library only); when the
+# `cryptography` package is importable it is used instead, for speed.
+# ---------------------------------------------------------------------------
+
+RECORD_SIG_DOMAIN = b'meilynx.audit.record_sig.v1\x00'
+CHAIN_SIGNING_STARTED = 'chain_signing_started'
+SOURCE_TO_CHAIN_ID = {'proxy': 'proxy', 'shadow_browser': 'shadow', 'coverage': 'coverage'}
+
+_ED_P = 2 ** 255 - 19
+_ED_L = 2 ** 252 + 27742317777372353535851937790883648493
+_ED_D = (-121665 * pow(121666, _ED_P - 2, _ED_P)) % _ED_P
+_ED_SQRT_M1 = pow(2, (_ED_P - 1) // 4, _ED_P)
+_ED_GY = (4 * pow(5, _ED_P - 2, _ED_P)) % _ED_P
+
+
+def _ed_recover_x(y, sign):
+    if y >= _ED_P:
+        return None
+    x2 = (y * y - 1) * pow(_ED_D * y * y + 1, _ED_P - 2, _ED_P)
+    if x2 == 0:
+        return None if sign else 0
+    x = pow(x2, (_ED_P + 3) // 8, _ED_P)
+    if (x * x - x2) % _ED_P != 0:
+        x = x * _ED_SQRT_M1 % _ED_P
+    if (x * x - x2) % _ED_P != 0:
+        return None
+    if (x & 1) != sign:
+        x = _ED_P - x
+    return x
+
+
+_ED_GX = _ed_recover_x(_ED_GY, 0)
+_ED_G = (_ED_GX, _ED_GY, 1, _ED_GX * _ED_GY % _ED_P)
+_ED_ZERO = (0, 1, 1, 0)
+
+
+def _ed_add(P, Q):
+    A = (P[1] - P[0]) * (Q[1] - Q[0]) % _ED_P
+    B = (P[1] + P[0]) * (Q[1] + Q[0]) % _ED_P
+    C = 2 * P[3] * Q[3] * _ED_D % _ED_P
+    D = 2 * P[2] * Q[2] % _ED_P
+    E, F, G, H = B - A, D - C, D + C, B + A
+    return (E * F % _ED_P, G * H % _ED_P, F * G % _ED_P, E * H % _ED_P)
+
+
+def _ed_mul(s, P):
+    Q = _ED_ZERO
+    while s > 0:
+        if s & 1:
+            Q = _ed_add(Q, P)
+        P = _ed_add(P, P)
+        s >>= 1
+    return Q
+
+
+def _ed_equal(P, Q):
+    return ((P[0] * Q[2] - Q[0] * P[2]) % _ED_P == 0
+            and (P[1] * Q[2] - Q[1] * P[2]) % _ED_P == 0)
+
+
+def _ed_decompress(b):
+    if len(b) != 32:
+        return None
+    y = int.from_bytes(b, 'little')
+    sign = y >> 255
+    y &= (1 << 255) - 1
+    x = _ed_recover_x(y, sign)
+    if x is None:
+        return None
+    return (x, y, 1, x * y % _ED_P)
+
+
+def _ed25519_verify_pure(public, msg, sig):
+    A = _ed_decompress(public)
+    if A is None or len(sig) != 64:
+        return False
+    R = _ed_decompress(sig[:32])
+    if R is None:
+        return False
+    s = int.from_bytes(sig[32:], 'little')
+    if s >= _ED_L:
+        return False
+    h = int.from_bytes(hashlib.sha512(sig[:32] + public + msg).digest(), 'little') % _ED_L
+    return _ed_equal(_ed_mul(s, _ED_G), _ed_add(R, _ed_mul(h, A)))
+
+
+def ed25519_verify(public, msg, sig):
+    """Ed25519 (RFC 8032) verification. `cryptography` when importable,
+    else the pure-Python reference above."""
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+        from cryptography.exceptions import InvalidSignature
+    except ImportError:
+        return _ed25519_verify_pure(public, msg, sig)
+    try:
+        Ed25519PublicKey.from_public_bytes(public).verify(sig, msg)
+        return True
+    except (InvalidSignature, ValueError):
+        return False
+
+
+def record_sig_message(chain_id, sequence_number, event_hash):
+    """The bytes a record signature covers. Mirror of `record_sig_message`
+    in meilynx-audit/src/chain_signing.rs."""
+    cid = chain_id.encode('utf-8')
+    return (RECORD_SIG_DOMAIN + struct.pack('<I', len(cid)) + cid
+            + struct.pack('<Q', sequence_number) + event_hash.encode('ascii'))
+
+
+def chain_key_fingerprint(public):
+    """`sha256:` + hex SHA-256 of the raw 32-byte public key."""
+    return 'sha256:' + hashlib.sha256(public).hexdigest()
+
+
+def parse_chain_key(text):
+    """A chain signing public key in the form /readyz and
+    chain_signing_started carry (64 lowercase hex characters), or None."""
+    if not isinstance(text, str) or len(text) != 64:
+        return None
+    try:
+        raw = bytes.fromhex(text)
+    except ValueError:
+        return None
+    return raw if raw.hex() == text else None
+
+
+def record_chain_id(event):
+    """The proxy's internal chain name a record was sealed on, from its
+    `source` (absent means `proxy`), or None for a source this verifier
+    does not know."""
+    return SOURCE_TO_CHAIN_ID.get(event.get('source') or 'proxy')
+
+
+def boundary_key_of(event):
+    """(raw key, None) for a `chain_signing_started` admin record, (None,
+    problem) for one whose key is malformed, (None, None) for any other
+    record."""
+    admin = event.get('admin_action')
+    if not isinstance(admin, dict) or admin.get('action_type') != CHAIN_SIGNING_STARTED:
+        return None, None
+    try:
+        meta = json.loads(admin.get('metadata_json') or '{}')
+    except ValueError:
+        return None, 'chain_signing_started carries no well-formed public key'
+    raw = parse_chain_key(meta.get('public_key')) if isinstance(meta, dict) else None
+    if raw is None or meta.get('public_key_fingerprint') != chain_key_fingerprint(raw):
+        return None, 'chain_signing_started carries no well-formed public key'
+    return raw, None
+
+
+class RecordSignatureWalk:
+    """Record signatures over one walk, in sequence order. Mirror of
+    `SignatureWalk` in meilynx-audit/src/verification.rs.
+
+    A record's signature is checked under the key the latest
+    `chain_signing_started` boundary announced, else under a key the reader
+    pinned (--chain-signing-key). The records before the first signed record
+    are the unsigned prefix: sealed before signing started, verified by hash
+    only and labelled so. An unsigned record after a signed one fails (a
+    rewrite that strips signatures). With a pinned key, the newest signed
+    record must verify under it: it commits to every earlier hash, so a
+    consistent rewrite anywhere before it, even one that forges a boundary
+    for a key of its own, fails there. Without one, the verdict says the
+    signatures were checked under the key the chain itself announces."""
+
+    def __init__(self, pinned=()):
+        self.pinned = {chain_key_fingerprint(k): k for k in pinned}
+        self.active = None
+        self.unsigned_prefix = []
+        self.signed = 0
+        self.unchecked = 0
+        self.started_at = None
+        self.boundaries = []
+        self.first_bad = None
+        self.newest_fingerprint = None
+
+    def check(self, seq, event):
+        """Problems for one record whose hash verified; [] when it checks out."""
+        raw, problem = boundary_key_of(event)
+        if problem:
+            return [problem]
+        if raw is not None:
+            self.active = raw
+            self.boundaries.append((seq, chain_key_fingerprint(raw)))
+        sig = event.get('record_sig')
+        if sig is None:
+            if self.started_at is not None:
+                return [f'unsigned record after signing started at seq={self.started_at} '
+                        f'(a record_sig was removed, or the chain was rewritten without the key)']
+            self.unsigned_prefix.append(seq)
+            return []
+        if self.started_at is None:
+            self.started_at = seq
+        if not (isinstance(sig, str) and len(sig) == 128 and all(c in '0123456789abcdef' for c in sig)):
+            return ['record_sig is not 128 lowercase hex characters']
+        chain_id = record_chain_id(event)
+        if chain_id is None:
+            return [f"record source {event.get('source')!r} names no chain this verifier knows"]
+        keys = [self.active] if self.active is not None else list(self.pinned.values())
+        if not keys:
+            self.unchecked += 1
+            self.signed += 1
+            return []
+        msg = record_sig_message(chain_id, seq, event.get('event_hash') or '')
+        for key in keys:
+            if ed25519_verify(key, msg, bytes.fromhex(sig)):
+                self.signed += 1
+                self.newest_fingerprint = chain_key_fingerprint(key)
+                return []
+        fingerprints = ', '.join(chain_key_fingerprint(k) for k in keys)
+        return [f'record_sig does not verify under the chain signing key ({fingerprints})']
+
+    def note_failure(self, seq, event_id, problem):
+        if self.first_bad is None:
+            self.first_bad = (seq, event_id, problem)
+
+    def state(self):
+        if self.signed == 0:
+            return 'false'
+        return 'partial' if self.unsigned_prefix else 'true'
+
+    def finish(self):
+        """(problems, lines): the walk-level check and the summary lines."""
+        problems, lines = [], []
+        if self.pinned and self.signed and self.newest_fingerprint not in self.pinned:
+            problems.append(
+                'the newest signed record does not verify under the pinned chain signing key '
+                f"({', '.join(sorted(self.pinned))}); the chain was re-signed under another key")
+        if self.unsigned_prefix:
+            lo, hi = self.unsigned_prefix[0], self.unsigned_prefix[-1]
+            lines.append(f'SIGNATURES unsigned prefix seq={lo}..{hi} ({len(self.unsigned_prefix)} records): '
+                         f'sealed before chain_signing_started, verified by hash only')
+        if self.signed:
+            if self.unchecked:
+                how = (f'{self.unchecked} not checked: no chain_signing_started in this pack and no '
+                       f'--chain-signing-key')
+            elif self.pinned:
+                how = 'checked, the newest under the pinned key'
+            else:
+                how = ('checked under the key the chain announces; pin it with --chain-signing-key '
+                       '(the proxy publishes it on /readyz)')
+            bounds = ', '.join(f'seq={s} {fp}' for s, fp in self.boundaries) or 'none in this pack'
+            lines.append(f'SIGNATURES signed={self.state()}: {self.signed} records from seq={self.started_at}, '
+                         f'{how}; chain_signing_started: {bounds}')
+        else:
+            lines.append('SIGNATURES signed=false: no record in this pack carries a record_sig')
+        if self.first_bad is not None:
+            seq, event_id, problem = self.first_bad
+            lines.append(f'SIGNATURES first bad signature: seq={seq} event_id={event_id}: {problem}')
+        return problems, lines
+
+
 def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=False, holders=None,
                          receipts_out=None, records_out=None, stripped=frozenset(), cannot_evaluate_out=None,
-                         stubs=None):
+                         stubs=None, chain_keys=(), signatures_out=None):
     """Walk each event in the manifest, fetch its record through `fetch(seq)`,
     recompute the hash and check the chain linkage. Source-agnostic: `fetch`
     is the only thing that differs between the GCS and the offline path, so
@@ -5797,8 +6295,14 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
     the manifest signs, and the link to the record before it. Its hash is not
     recomputed (that needs the body), and the record after it links to its
     event_hash. A stub of an unreadable record attests nothing and fails, as
-    the record itself would."""
+    the record itself would.
+
+    `chain_keys` are the chain signing public keys the reader pinned
+    (--chain-signing-key), as raw 32-byte keys. Every record's `record_sig`
+    is checked (RecordSignatureWalk); `signatures_out`, when given, receives
+    the walk's verdict (`state`: true / false / partial)."""
     stubs = stubs or {}
+    sig_walk = RecordSignatureWalk(chain_keys)
     hash_version = manifest.get('hash_version', '')
     if hash_version not in SUPPORTED_HASH_VERSIONS:
         print(
@@ -5981,6 +6485,13 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             report(f"FAIL seq={seq}: {problem}")
             all_passed = False
             content_ok = False
+        # The record signature, over the hash just recomputed. A record
+        # whose hash or link failed already has its FAIL line.
+        if hash_ok and chain_ok:
+            for problem in sig_walk.check(seq, event):
+                report(f"FAIL seq={seq}: {problem}")
+                sig_walk.note_failure(seq, event.get('event_id'), problem)
+                all_passed = False
         # A manifest 1.2 entry names the object holding its record.
         if references_objects:
             problem = object_reference_problem(entry, holders)
@@ -6028,6 +6539,16 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             all_passed = False
         elif content_ok:
             next_link = {stored_hash}
+
+    # The signature verdict over the walk.
+    sig_problems, sig_lines = sig_walk.finish()
+    for line in sig_lines:
+        report(line)
+    for problem in sig_problems:
+        report(f"FAIL signatures: {problem}")
+        all_passed = False
+    if signatures_out is not None:
+        signatures_out['state'] = sig_walk.state()
 
     # Each receipt's evidence against the records in
     # this pack, then the manifest's receipt index against the receipts.
@@ -12453,6 +12974,181 @@ def ocsf_export_self_test():
     return ok
 
 
+# Record-signature fixtures. CHAIN_SIG_FIXTURE_* are paired with
+# meilynx-audit/src/chain_signing.rs (the RFC 8032 section 7.1 TEST 1 key
+# signing record_sig_message('proxy', 7, 'ab' * 32)); neither side may drift
+# independently.
+RFC8032_TEST1_SEED = bytes.fromhex('9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60')
+RFC8032_TEST1_PUBLIC = bytes.fromhex('d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a')
+RFC8032_TEST1_SIGNATURE = bytes.fromhex(
+    'e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b')
+CHAIN_SIG_FIXTURE_SIGNATURE = (
+    'ceb306a46d681e103d8607367bd7cbef231a4a87cb1fc4f5391518cb7f0ab4d9'
+    'ada7ea019c7464bd09808a7e7bc353583dab293f7016163053a2611b2d687d09')
+CHAIN_SIG_FIXTURE_FINGERPRINT = 'sha256:21fe31dfa154a261626bf854046fd2271b7bed4b6abe45aa58877ef47f9721b9'
+
+
+def _ed_compress(P):
+    zinv = pow(P[2], _ED_P - 2, _ED_P)
+    x, y = P[0] * zinv % _ED_P, P[1] * zinv % _ED_P
+    return (y | ((x & 1) << 255)).to_bytes(32, 'little')
+
+
+def _ed25519_self_test_keypair(seed):
+    """(public key, sign function) for a 32-byte seed: the RFC 8032 signing
+    algorithm, used only by the self-test to build signed chains."""
+    h = hashlib.sha512(seed).digest()
+    a = int.from_bytes(h[:32], 'little')
+    a &= (1 << 254) - 8
+    a |= 1 << 254
+    public = _ed_compress(_ed_mul(a, _ED_G))
+
+    def sign(msg):
+        r = int.from_bytes(hashlib.sha512(h[32:] + msg).digest(), 'little') % _ED_L
+        R = _ed_compress(_ed_mul(r, _ED_G))
+        k = int.from_bytes(hashlib.sha512(R + public + msg).digest(), 'little') % _ED_L
+        return R + ((r + k * a) % _ED_L).to_bytes(32, 'little')
+    return public, sign
+
+
+def record_signature_self_test():
+    """Record signatures: the Ed25519 primitive, the key and message pinned
+    with the Rust signer, and the walk over signed chains (an unsigned
+    prefix, a consistent rewrite, stripped signatures, a forged boundary,
+    a pinned key)."""
+    import contextlib
+    import io
+    import tempfile
+    ok = True
+
+    def check(label, passed, what, detail=''):
+        nonlocal ok
+        if passed:
+            print(f'SELF-TEST assertion {label} PASS: {what}')
+        else:
+            print(f'SELF-TEST assertion {label} FAIL: {what} {detail}', file=sys.stderr)
+            ok = False
+
+    # 37a — the primitive: RFC 8032 TEST 1, a changed message, a
+    # non-canonical S, and the self-test signer agreeing with the vector.
+    s_big = RFC8032_TEST1_SIGNATURE[:32] + (int.from_bytes(RFC8032_TEST1_SIGNATURE[32:], 'little') + _ED_L).to_bytes(32, 'little')
+    public, sign = _ed25519_self_test_keypair(RFC8032_TEST1_SEED)
+    check('37a', _ed25519_verify_pure(RFC8032_TEST1_PUBLIC, b'', RFC8032_TEST1_SIGNATURE)
+          and not _ed25519_verify_pure(RFC8032_TEST1_PUBLIC, b'x', RFC8032_TEST1_SIGNATURE)
+          and not _ed25519_verify_pure(RFC8032_TEST1_PUBLIC, b'', s_big)
+          and public == RFC8032_TEST1_PUBLIC and sign(b'') == RFC8032_TEST1_SIGNATURE
+          and ed25519_verify(RFC8032_TEST1_PUBLIC, b'', RFC8032_TEST1_SIGNATURE),
+          'Ed25519 verifies RFC 8032 TEST 1 and refuses a changed message and a non-canonical S')
+
+    # 37b — the signed message and signature the Rust signer produces.
+    msg = record_sig_message('proxy', 7, 'ab' * 32)
+    check('37b', len(msg) == 109 and msg.startswith(RECORD_SIG_DOMAIN)
+          and ed25519_verify(RFC8032_TEST1_PUBLIC, msg, bytes.fromhex(CHAIN_SIG_FIXTURE_SIGNATURE))
+          and sign(msg).hex() == CHAIN_SIG_FIXTURE_SIGNATURE
+          and chain_key_fingerprint(RFC8032_TEST1_PUBLIC) == CHAIN_SIG_FIXTURE_FINGERPRINT
+          and not ed25519_verify(RFC8032_TEST1_PUBLIC, record_sig_message('shadow', 7, 'ab' * 32),
+                                 bytes.fromhex(CHAIN_SIG_FIXTURE_SIGNATURE)),
+          'the record_sig message and signature match the Rust signer; the chain id is bound')
+
+    # A chain: two unsigned records, the boundary, three signed records.
+    forger_public, forger_sign = _ed25519_self_test_keypair(b'\x07' * 32)
+
+    def boundary_meta(pub):
+        return json.dumps({'algorithm': 'ed25519', 'public_key': pub.hex(),
+                           'public_key_fingerprint': chain_key_fingerprint(pub)}, sort_keys=True)
+
+    def base(seq):
+        return {'schema_version': 'v1.1', 'source': 'proxy', 'event_id': f'evt-{seq}',
+                'request_id': f'req-{seq}', 'timestamp_utc': f'2026-10-25T12:00:0{seq}Z',
+                'model_requested': 'gpt-6-luna', 'action': 'allow', 'input_tokens': 1, 'output_tokens': 2}
+
+    def chain(signer=sign, pub=public, start_signing=2, edits=None, strip_from=None, n=6):
+        records, prev = [], genesis_hash()
+        for seq in range(n):
+            r = base(seq)
+            if seq == start_signing:
+                r.update(schema_version='v1.3', event_kind='admin_action', model_requested='',
+                         admin_action={'action_type': CHAIN_SIGNING_STARTED, 'actor': 'system:self-test',
+                                       'description': 'boundary', 'metadata_json': boundary_meta(pub)})
+            r.update((edits or {}).get(seq, {}))
+            r['sequence_number'], r['previous_hash'] = seq, prev
+            r['event_hash'] = recompute_event_hash(r, seq, prev)
+            if seq >= start_signing and not (strip_from is not None and seq >= strip_from):
+                r['record_sig'] = signer(record_sig_message('proxy', seq, r['event_hash'])).hex()
+            prev = r['event_hash']
+            records.append(r)
+        return records
+
+    def walk(records, keys=()):
+        manifest = {'hash_version': 'v1', 'prefix': 'audit/self-test/',
+                    'events': [{'sequence': r['sequence_number'], 'recomputed_event_hash': r['event_hash']}
+                               for r in records]}
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp) / 'records'
+            d.mkdir()
+            for r in records:
+                (d / record_file_name(r['sequence_number'])).write_bytes(json.dumps(r).encode('utf-8'))
+            sig = {}
+            with contextlib.redirect_stdout(out):
+                passed = verify_manifest_with(local_fetcher(d), manifest, chain_keys=keys, signatures_out=sig)
+        return passed, out.getvalue().splitlines(), sig.get('state')
+
+    intact = chain()
+    passed, lines, state = walk(intact)
+    pinned_passed, pinned_lines, _ = walk(intact, [RFC8032_TEST1_PUBLIC])
+    check('37c', passed and pinned_passed and state == 'partial'
+          and any(l.startswith('SIGNATURES unsigned prefix seq=0..1 (2 records)') for l in lines)
+          and any(l.startswith('SIGNATURES signed=partial: 4 records from seq=2') for l in lines)
+          and any('the newest under the pinned key' in l for l in pinned_lines),
+          'a signed chain verifies; the unsigned prefix before chain_signing_started is labelled',
+          f'{passed} {state} {lines}')
+
+    # The consistent rewrite: record 3 edited and every hash recomputed
+    # forward, the signatures left as they were. The manifest a rewriter
+    # would produce agrees with the rewritten hashes.
+    rewritten = chain(edits={3: {'model_requested': 'tampered'}})
+    for r, original in zip(rewritten, intact):
+        if 'record_sig' in original:
+            r['record_sig'] = original['record_sig']
+    passed, lines, _ = walk(rewritten)
+    check('37d', passed is False
+          and any(l.startswith('FAIL seq=3: record_sig does not verify') for l in lines)
+          and any(l.startswith('SIGNATURES first bad signature: seq=3 event_id=evt-3') for l in lines)
+          and not any(l.startswith('FAIL seq=') and 'hash' in l for l in lines),
+          'a consistent rewrite (hashes recomputed forward, no key) fails as a signature failure at the edit',
+          f'{lines}')
+
+    stripped = chain(edits={3: {'model_requested': 'tampered'}}, strip_from=3)
+    passed, lines, _ = walk(stripped)
+    check('37e', passed is False
+          and any(l.startswith('FAIL seq=3: unsigned record after signing started at seq=2') for l in lines),
+          'stripping the signatures with the rewrite fails at the first stripped record', f'{lines}')
+
+    forged = chain(signer=forger_sign, pub=forger_public, edits={3: {'model_requested': 'tampered'}})
+    passed, lines, _ = walk(forged)
+    pinned_passed, pinned_lines, _ = walk(forged, [RFC8032_TEST1_PUBLIC])
+    check('37f', passed is True and pinned_passed is False
+          and any('checked under the key the chain announces' in l for l in lines)
+          and any(l.startswith('FAIL signatures: the newest signed record does not verify under the pinned')
+                  for l in pinned_lines),
+          'a chain re-signed under a forged boundary passes only without a pinned key, and says so',
+          f'{lines} {pinned_lines}')
+
+    unsigned = chain(start_signing=99)
+    passed, lines, state = walk(unsigned)
+    bad_boundary = chain(edits={2: {'admin_action': {
+        'action_type': CHAIN_SIGNING_STARTED, 'actor': 'system:self-test', 'description': 'boundary',
+        'metadata_json': json.dumps({'public_key': forger_public.hex()})}}})
+    _, bad_lines, _ = walk(bad_boundary)
+    check('37g', passed and state == 'false'
+          and 'SIGNATURES signed=false: no record in this pack carries a record_sig' in lines
+          and any('chain_signing_started carries no well-formed public key' in l for l in bad_lines),
+          'an unsigned chain verifies as signed=false; a boundary with no well-formed key is a FAIL',
+          f'{lines} {bad_lines}')
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Meilynx Integrity Pack reproducer — independently verifies GCS WORM audit chain.'
@@ -12468,6 +13164,18 @@ def main():
         ),
     )
     parser.add_argument('--manifest', help='Path to manifest.json')
+    parser.add_argument(
+        '--chain-signing-key',
+        action='append',
+        default=[],
+        metavar='HEX',
+        help=(
+            "The proxy's chain signing public key (64 lowercase hex characters, as /readyz "
+            "publishes it in chain_signing_public_key). Repeat for a chain signed under more than "
+            "one key. The newest signed record must verify under one of them; without it, record "
+            "signatures are checked under the key the chain itself announces."
+        ),
+    )
     parser.add_argument(
         '--export-records',
         metavar='DIR',
@@ -12586,10 +13294,14 @@ def main():
         ok = signature_self_test() and ok
         ok = anchor_self_test() and ok
         ok = ocsf_export_self_test() and ok
+        ok = record_signature_self_test() and ok
         sys.exit(0 if ok else 1)
 
     if not (args.bucket or args.records) or not args.manifest:
         parser.error("--manifest plus one of --bucket / --records is required (or use --self-test)")
+    chain_keys = [parse_chain_key(k) for k in args.chain_signing_key]
+    if any(k is None for k in chain_keys):
+        parser.error("--chain-signing-key must be 64 lowercase hex characters (the raw Ed25519 public key)")
     if args.conditions_sha256 is not None and not _SHA256_HEX.fullmatch(args.conditions_sha256):
         parser.error("--conditions-sha256 must be 64 lowercase hex characters")
     if args.conditions_acceptance and args.conditions_sha256 is None:
@@ -12705,7 +13417,7 @@ def main():
         passed = verify_manifest_with(fetch, manifest, require_manifest_hash=signed, holders=holders,
                                       receipts_out=receipts, records_out=pack_full_records,
                                       stripped=stripped, cannot_evaluate_out=stripped_problems,
-                                      stubs=manifest_stubs(manifest))
+                                      stubs=manifest_stubs(manifest), chain_keys=chain_keys)
         # The control-plane chain a 1.3 pack carries, then each
         # decision receipt's anchor against it.
         if 'control_plane' in manifest or manifest.get('schema_version') == '1.3':
