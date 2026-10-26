@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.10.0 (2026-10-26)
+
+- `verify-pack.py` from meilynx-proxy `f3d9d29`.
+- **Upgrade before verifying chains or packs written after this release.**
+  A verifier older than 0.10.0 stops at the first v1.19 record with
+  `unknown schema_version 'v1.19'`. It never reports such a chain as a pass.
+  It also ignores `record_sig`, so it would pass a signed chain that was
+  rewritten without the key.
+- Chain v1.19 (SPEC §4.3): an `llm_request` record binds the policy version
+  in force and the model the provider served. The preimage is the v1.18
+  `llm_request` layout with the customer block presence-tagged, then
+  `policy_version` (u32 LE byte length, then UTF-8 bytes), then
+  `model_executed` (a presence byte, then u32 LE byte length and UTF-8
+  bytes). Both fields were stored but not hashed in every earlier version.
+  An edit to either, or adding or removing the served model, now breaks the
+  chain at that record. v1.19 is defined only for `llm_request` and requires
+  a `policy_version`. Earlier versions are unchanged. Self-test assertions
+  36a to 36d pin the fixture hashes and the failure cases.
+- Record signatures (SPEC §11): a proxy with a chain signing key signs every
+  record with Ed25519 over `"meilynx.audit.record_sig.v1\0" || u32 LE
+  len(chain_id) || chain_id || u64 LE sequence_number || event_hash`, stored
+  as `record_sig`. The verifier checks every signature over the hash it
+  recomputed, reports records sealed before `chain_signing_started` as an
+  unsigned prefix, and fails an unsigned record after signing started, a
+  signature that does not verify, and a malformed boundary. It prints one
+  `SIGNATURES` line with `signed=true`, `partial` or `false`. Verification
+  uses the standard library, or `cryptography` when it is installed.
+- `--chain-signing-key HEX` pins the key the proxy publishes on `/readyz`.
+  With it, the newest signed record must verify under that key, so a chain
+  re-signed under a key of its own fails.
+- `VERIFIER_CAPABILITIES` adds `record-signatures-v1`. Self-test assertions
+  37a to 37g cover the signature walk.
+- New fixtures under `fixtures/record-sigs/`, sealed by the proxy's own
+  writer: an intact signed chain, a consistent rewrite with the signatures
+  kept, and the same rewrite with them removed.
+  `fixtures/run-record-sig-cases.py` runs them, and CI runs it on every push.
+- An unsigned chain verifies as before, with `SIGNATURES signed=false`.
+  Other exit codes and verdicts are unchanged.
+
 ## 0.9.1 (2026-10-20)
 
 - `verify-pack.py` from meilynx-proxy `1e5eb4d`.

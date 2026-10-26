@@ -1,0 +1,15 @@
+{
+  "runs": [
+    {
+      "absent": [
+        "hash mismatch",
+        "chain break"
+      ],
+      "args": [],
+      "contains": [
+        "FAIL seq=3: unsigned record after signing started at seq=2"
+      ],
+      "exit": 1
+    }
+  ]
+}

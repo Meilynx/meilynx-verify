@@ -1,0 +1,16 @@
+{
+  "runs": [
+    {
+      "absent": [
+        "hash mismatch",
+        "chain break"
+      ],
+      "args": [],
+      "contains": [
+        "FAIL seq=3: record_sig does not verify under the chain signing key",
+        "SIGNATURES first bad signature: seq=3 event_id=evt-3"
+      ],
+      "exit": 1
+    }
+  ]
+}

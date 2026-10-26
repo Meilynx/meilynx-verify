@@ -31,6 +31,12 @@ python3 verify-pack.py --records fixtures/anchors/packs/fully-anchored/records \
   --manifest fixtures/anchors/packs/fully-anchored/manifest.json --allow-unsigned \
   --tsa-root test-rsa=fixtures/anchors/roots/rsa-root.pem \
   --tsa-root test-ec=fixtures/anchors/roots/ec-root.pem
+
+# 4. Verify a chain whose records carry Ed25519 signatures, pinned to the
+#    key the proxy publishes on /readyz
+python3 verify-pack.py --records fixtures/record-sigs/signed/records \
+  --manifest fixtures/record-sigs/signed/manifest.json --allow-unsigned \
+  --chain-signing-key d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
 ```
 
 Exit codes, the same online and offline:
@@ -253,6 +259,15 @@ the same exit-code precedence.
   verdict for the condition set whose digest you hold, counting the records
   in the window sealed under it, its gaps and its exceptions
   ([SPEC.md](SPEC.md) §10).
+- **Record signatures** (no flag; `--chain-signing-key HEX` pins the key).
+  Every record's `record_sig` is checked over its chain coordinates, and
+  records sealed before signing started are reported as an unsigned prefix.
+  Pass the key the proxy publishes on `/readyz` (`chain_signing_public_key`)
+  and the newest signed record must verify under it, so a chain re-signed
+  under another key fails ([SPEC.md](SPEC.md) §11).
+  `fixtures/run-record-sig-cases.py` runs the verifier against chains the
+  proxy's own writer sealed: intact, rewritten with the signatures kept, and
+  rewritten with them removed.
 - `--certificate-identity` and `--certificate-oidc-issuer`: the signer a
   signed pack must carry (see "Signed packs").
 - `--tsa-root ID=FILE`: a customer witness's root for chain-head anchors
@@ -284,7 +299,8 @@ It does **not** prove:
   payload is in the preimage.
 - who wrote the record. A signed pack (`manifest.json.sigstore.json`) binds
   the manifest to the signing identity, and the manifest binds each record's
-  hash; the records themselves are not signed individually.
+  hash. A record signature (`record_sig`) binds each record to the proxy's
+  chain signing key, not to a person or organisation.
 - when a record was written, unless the chain is anchored. Without anchors
   the record's timestamp is the proxy's own clock. With anchors, the token's
   time bounds when the covered records existed.
@@ -292,18 +308,18 @@ It does **not** prove:
 ## Versions
 
 The verifier understands chain records with `schema_version` v1 through
-v1.18, stored per record or in segment objects, and pack manifests 1.0
+v1.19, stored per record or in segment objects, and pack manifests 1.0
 through 1.5 (1.1 adds chain-head anchors, 1.2 the storage layout, 1.3 the
 control-plane chain, 1.4 the evidence class label, 1.5 the content-stripped
 pack with its hash-only stubs). It declares the pack features it checks in
 `VERIFIER_CAPABILITIES`: `chain-anchors-v1`, `segmented-records-v1`,
 `decision-receipts-v1`, `evaluation-trace-v1`, `data-reach-evidence-v1`,
 `control-plane-chain-v1`, `ocsf-export-v1`, `customer-scope-v1`,
-`per-tenant-signer-v1`, `evidence-class-v1`, `content-stripped-v1` and
-`customer-conditions-v1`. A record of an unknown version or kind fails
-verification rather than being skipped; a manifest of an unknown version,
-storage layout, evidence class or content claim is cannot evaluate (exit
-`2`). Changes to the verifier are listed in
+`per-tenant-signer-v1`, `evidence-class-v1`, `content-stripped-v1`,
+`customer-conditions-v1` and `record-signatures-v1`. A record of an unknown
+version or kind fails verification rather than being skipped; a manifest of
+an unknown version, storage layout, evidence class or content claim is
+cannot evaluate (exit `2`). Changes to the verifier are listed in
 [CHANGELOG.md](CHANGELOG.md). The canonical source of this file is the
 `meilynx-integrity-pack` crate in the proxy; releases here are byte-identical
 copies tagged with the proxy commit they came from.
