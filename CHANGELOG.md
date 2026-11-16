@@ -30,8 +30,9 @@
 - Local-chain evidence (SPEC §6.5): manifest 1.4 reads a second evidence
   class, `local-chain-not-write-once`, for a pack a gateway with no
   write-once store writes from its own audit database. Such a pack is
-  unsigned and its records were never confirmed by a write-once store; the
-  verifier prints the label and what it means on every verdict. README
+  unsigned and its records were never confirmed by a write-once store. The
+  verifier prints the label and its meaning before verification, and appends
+  the label to the final verdict. README
   "Local-chain evidence" says what such a pack can and cannot show.
 - Coverage claim (SPEC §6.7): a manifest may state `claim`, either
   `chain_to_head` (every record from 0 to the head the generator read) or
@@ -41,15 +42,19 @@
   record now exits 4 with `COVERAGE NOT ESTABLISHED through seq=N` and
   `INTEGRITY OK, COVERAGE NOT ESTABLISHED`. A claim that contradicts the
   manifest, or a local-chain pack that claims `interval`, fails (exit 1).
-  An unknown scope or a malformed claim is exit 2.
+  An explicit claim with an unknown scope or a malformed shape is exit 2.
 - `--require-through SEQ`: the sequence you expect the pack to reach, from a
-  source other than the pack. A pack that stops before it exits 4,
-  whatever its manifest claims.
-- Evidence modes (SPEC §6.8): the verifier prints every
-  `evidence_mode_resolved` seal in the pack as `EVIDENCE MODE seq=N: <mode>
-  (<source>)`, and each change as `EVIDENCE MODE CHANGED at seq=N: <old> ->
-  <new> (<source>)`. A manifest's `evidence_modes` list must equal those
-  seals, or the pack fails.
+  source other than the pack. A pack whose manifest `to_sequence` is before
+  it exits 4, whatever its manifest claims. In this release the closing
+  exit-4 line mentions a verified anchor even when only this option caused
+  the result; the `COVERAGE NOT ESTABLISHED through seq=…` line names the
+  cause (SPEC §6.7).
+- Evidence modes (SPEC §6.8): the verifier prints one line per
+  `evidence_mode_resolved` seal in the pack, `EVIDENCE MODE seq=N: <mode>
+  (<source>)`, or `EVIDENCE MODE CHANGED at seq=N: <old> -> <new>
+  (<source>)` in its place where the mode changes. A manifest's
+  `evidence_modes` list must equal those seals; otherwise the pack fails
+  with `FAIL evidence_modes` lines instead.
 - `VERIFIER_CAPABILITIES` adds `compliance-records-v1`,
   `local-chain-evidence-v1`, `coverage-claim-v1` and `evidence-modes-v1`.
   Self-test assertions 20q (precedence with 4), 25y to 25ac cover them.

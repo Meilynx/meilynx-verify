@@ -261,12 +261,14 @@ the pack holds: the whole chain from sequence 0 up to the head the gateway
 read (`claim`, §6.7).
 
 **What such a pack can show.** Each record's hash recomputes from its fields,
-and each record names the hash of the record before it, so a record changed,
-removed from the middle or reordered after the pack was built fails the
-check. Where an anchor verifies, a timestamp authority signed the chain head
-at that sequence: that head existed no later than the token's time, and the
-records up to it have not changed since. A record changed after it was
-anchored fails.
+and each record names the hash of the record before it: the records are
+internally consistent. That alone does not show they were never changed,
+because whoever holds the records and the unsigned manifest can recompute
+every hash after a change. Where an anchor verifies, a timestamp authority
+signed the chain head at that sequence: that head existed no later than the
+token's time, and the hashed fields of the records up to it have not changed
+since. A change to such a record after it was anchored fails, for a reader
+who holds that anchor.
 
 **What it cannot show.**
 
@@ -279,7 +281,8 @@ anchored fails.
   rewrite or remove records before a pack is built.
 - **That records were not rewritten before they were anchored.** A record
   becomes tamper-evident only once a head that a timestamp authority signed
-  covers it, and then only for a reader who holds that anchor. A history
+  covers it, and then only for a reader who holds that anchor, and only for
+  its hashed fields. A history
   rewritten before its first anchor cannot be detected, and records after
   the last anchor are shown only to be consistent with each other. The
   anchors inside a pack come from the same gateway as the records; anchors
@@ -305,8 +308,10 @@ through the anchored sequence. The manifest's claim is unsigned, so the
 verifier also refuses a local-chain pack whose claim was edited to a window
 (exit `1`). If you know how far the chain had reached from another source,
 for example the head the gateway reported to its control plane, pass
-`--require-through <seq>`: a pack that stops before it exits `4` whatever its
-manifest says.
+`--require-through <seq>`: a pack whose manifest `to_sequence` is before it
+exits `4`, whatever the manifest claims. (The closing line then still
+mentions a verified anchor; the `COVERAGE NOT ESTABLISHED through seq=…`
+line above it names the actual cause. SPEC §6.7.)
 
 The output of a clean local-chain pack carries these lines:
 
@@ -319,11 +324,13 @@ OK: all 5 events verified. Authenticity not established (unsigned pack, accepted
 ```
 
 **Evidence modes.** A gateway seals its evidence mode (`write_once` or
-`local_chain`) as a record at every start. The verifier prints each one,
-`EVIDENCE MODE seq=1: write_once (derived)`, and every change,
-`EVIDENCE MODE CHANGED at seq=4: write_once -> local_chain (configured)`.
-A manifest that lists the modes (`evidence_modes`, [SPEC.md](SPEC.md) §6.8)
-must list exactly the seals in the records, or the pack fails.
+`local_chain`) as a record at every start. The verifier prints one line per
+seal, `EVIDENCE MODE seq=1: write_once (derived)`, and where the mode
+differs from the seal before it, `EVIDENCE MODE CHANGED at seq=4:
+write_once -> local_chain (configured)` in its place. A manifest that lists
+the modes (`evidence_modes`, [SPEC.md](SPEC.md) §6.8) must list exactly the
+seals in the records; otherwise the pack fails with `FAIL evidence_modes`
+lines instead.
 
 `fixtures/local-chain/` holds five packs: a clean local-chain pack, the same
 chain packed at an earlier head and checked against the later anchor
@@ -377,8 +384,8 @@ the same exit-code precedence.
 - `--tsa-root ID=FILE`: a customer witness's root for chain-head anchors
   (see "Chain-head anchors").
 - `--require-through SEQ`: the sequence you expect the pack to reach, from a
-  source other than the pack; a pack that stops before it exits `4` (see
-  "Local-chain evidence").
+  source other than the pack; a pack whose manifest `to_sequence` is before
+  it exits `4` (see "Local-chain evidence").
 - `--export-records DIR`: write every record read, including control-plane
   records and anchors, as per-record files for a reviewer without bucket
   access.
@@ -388,7 +395,10 @@ the same exit-code precedence.
 A pass proves that, for every record in the window:
 
 - the record's hashed fields are byte-for-byte what they were when the record
-  was written, and
+  was written, for a pack whose records come from a write-once store or are
+  covered by an anchor you hold. For a local-chain pack, records after its
+  last anchor are only shown to be consistent with each other (see
+  "Local-chain evidence"); and
 - the records form one unbroken sequence from the genesis value, with no
   insertion, deletion or reordering.
 

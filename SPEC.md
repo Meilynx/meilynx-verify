@@ -18,7 +18,9 @@ segment rollout is per-record, and its packs carry manifest 1.0 or 1.1.
 ## 1. Records
 
 A chain is an ordered sequence of records. Each record is one JSON document
-(UTF-8), stored in a write-once bucket under a chain prefix. The records are
+(UTF-8), stored under a chain prefix: in a write-once bucket, or, for a
+gateway with no write-once store, in the gateway's own audit database, from
+which a local-chain pack (§6.5) copies it. The records are
 held by objects of two kinds, each named by the sequence numbers it holds,
 zero-padded to 20 digits:
 
@@ -84,9 +86,12 @@ concludes:
 | **Gap:** no object holds a sequence, and later objects exist | Fail (exit 1) at the first record after the hole, which does not link to the last record before it (§2) |
 | **Truncation:** the ranges cover a contiguous prefix and stop early | Pass on the records present, for a manifest that lists those records. The shortfall against the chain's final length is a completeness finding, not an integrity one (§8). |
 
-A chain begins at sequence `0` on every proxy instance start and runs until
-that instance stops. Different instances write different chains (distinct
-prefixes); a chain never spans instances. Model-call and MCP records share
+A chain in a write-once bucket begins at sequence `0` on every proxy
+instance start and runs until that instance stops. Different instances write
+different chains (distinct prefixes); such a chain never spans instances. A
+gateway's local chain (§6.5) is different: it lives in the gateway's audit
+database and continues across restarts, so one local chain can hold the
+startup records of several boots. Model-call and MCP records share
 the request chain; coverage records (`coverage_computed`,
 `coverage_key_inventory`) are written to a separate per-tenant coverage chain
 with the same format and genesis.
@@ -814,8 +819,9 @@ explains an unanchored chain.
 | A statement that is not canonical, or does not name this chain at this sequence | Fail (exit 1) |
 | The anchored `event_hash` differs from the record's recomputed hash, or from the hash the record stores | Fail (exit 1): the record changed after it was anchored |
 | A token that does not verify, including a path that reaches no trusted root | Fail (exit 1), with the same reason code the proxy's verifier uses |
+| A listed anchor at a sequence outside `[from_sequence, to_sequence]` | Fail (exit 1), whatever the claim (§6.7) |
 | An anchor found in the records directory or bucket that the manifest does not list, at a sequence inside the pack | Verified like a listed one; a pass is reported as a NOTICE, a failure fails the pack |
-| An anchor found next to the records at a sequence after the pack's last record | Judged only when the pack claims the whole chain up to its head (§6.7): a verified one is coverage not established (exit 4). Otherwise a NOTICE that it was not judged |
+| An anchor the manifest does not list, found next to the records at a sequence after the pack's last record | Judged only when the pack claims the whole chain up to its head (§6.7): a verified one is coverage not established (exit 4). Otherwise a NOTICE that it was not judged |
 | The manifest's `state`, `reason`, `anchored_through_seq` or `unanchored_tail` disagree with the anchors that verified | Fail (exit 1) |
 | A listed seal that is not the `admin_action` record it claims to be | Fail (exit 1) |
 | A record whose `timestamp_utc` is more than five minutes after the `genTime` of the earliest anchor covering it | Pass, with a NOTICE naming the first such record; the token's `genTime` is the authoritative time |
@@ -958,7 +964,7 @@ entry and `RECEIPTS INDEX OK`.
 ### 6.5 Evidence class (manifest 1.4)
 
 A 1.4 manifest is a 1.3 manifest with a required `evidence_class` label
-inside the signed bytes, saying what kind of evidence the pack holds; a 1.5
+inside the manifest, covered by its signature when the pack is signed, saying what kind of evidence the pack holds; a 1.5
 manifest carries it when it has one. The label must be one the verifier
 reads:
 
@@ -1045,8 +1051,8 @@ checks: the signed claim is what lets them verify.
 
 ### 6.7 Coverage claim
 
-A manifest may carry `claim`, inside the signed bytes when the pack is
-signed, saying what the pack holds:
+A manifest may carry `claim`, covered by the manifest's signature when the
+pack is signed, saying what the pack holds:
 
 ```json
 "claim": {"scope": "chain_to_head", "from_sequence": 0, "to_sequence": 27}
@@ -1058,22 +1064,25 @@ signed, saying what the pack holds:
   A pack read from a write-once bucket carries this scope; the bucket is the
   record.
 
-The object holds exactly these three keys, and both bounds are non-negative
-integers. A manifest without `claim` predates it and is read as
-`chain_to_head` when its evidence class is `local-chain-not-write-once` and
-as `interval` otherwise. The verifier prints one `CLAIM:` line, or `FAIL
+An explicit claim is an object with exactly these three keys, and both
+bounds are non-negative integers. A manifest without `claim`, or with
+`claim: null`, predates it and is read as `chain_to_head` when its evidence
+class is `local-chain-not-write-once` and as `interval` otherwise; the
+checks on an explicit claim's bounds in the table below are not applied to
+such an inferred claim. The verifier prints one `CLAIM:` line, or `FAIL
 claim:` with the reason when the claim contradicts the manifest.
 
 | Finding | Verdict |
 |---|---|
-| A claim whose bounds differ from `from_sequence` and `to_sequence` | Fail (exit 1) |
-| `chain_to_head` with `from_sequence` other than 0 | Fail (exit 1) |
+| An explicit claim whose bounds differ from `from_sequence` and `to_sequence` | Fail (exit 1) |
+| An explicit `chain_to_head` claim with `from_sequence` other than 0 | Fail (exit 1) |
 | A `local-chain-not-write-once` pack that claims `interval` | Fail (exit 1): relabelling such a pack as a window would stop a later anchor from being judged |
 | An unknown scope, missing or extra keys, or a bound that is not a non-negative integer | Cannot evaluate (exit 2) |
-| `chain_to_head`, and a verified anchor found next to the records names this chain at a sequence N after the pack's last record | Coverage not established (exit 4) |
-| `interval`, and an anchor after the pack's last record | Not judged: `NOTICE: <n> anchor(s) outside this pack's window <from>..<to> were not judged` |
+| `chain_to_head`, and a verified anchor that the manifest does not list, found next to the records, names this chain at a sequence N after the pack's last record | Coverage not established (exit 4) |
+| `interval`, and an unlisted anchor after the pack's last record | Not judged: `NOTICE: <n> anchor(s) outside this pack's window <from>..<to> were not judged` |
 
-An anchor after a `chain_to_head` pack's last record is judged on its
+Anchors are read on manifest 1.1 and later (§6.1); a 1.0 manifest has
+none. An anchor after a `chain_to_head` pack's last record is judged on its
 statement and tokens only, because the record it names is not in the pack.
 It is evidence of a later head only when at least one token verifies over a
 canonical statement that names this chain at that sequence. When none
@@ -1102,11 +1111,21 @@ claim that names a different head is still a failure (exit 1, §6.1).
 **`--require-through SEQ`.** The claim is in the manifest, which a local-chain
 pack does not sign. A reader who knows from another source how far the chain
 had reached (for example the head the gateway reported to its control plane)
-passes it with `--require-through SEQ`. A pack whose `to_sequence` is before
-SEQ prints `COVERAGE NOT ESTABLISHED through seq=SEQ: the pack's last record
-is seq=M, before the sequence you required (--require-through)` and exits 4,
-whatever its manifest claims; a pack that reaches SEQ prints `COVERAGE: the
-pack reaches seq=M, at or after the required seq=SEQ`.
+passes it with `--require-through SEQ`. The option compares SEQ with the
+manifest's `to_sequence`, whatever the manifest claims. A pack whose
+`to_sequence` is before SEQ prints `COVERAGE NOT ESTABLISHED through
+seq=SEQ: the pack's last record is seq=M, before the sequence you required
+(--require-through)` and exits 4; one whose `to_sequence` is at or after SEQ
+prints `COVERAGE: the pack reaches seq=M, at or after the required
+seq=SEQ`. The option does not itself establish that the pack's records reach
+`to_sequence`; that is the chain check's finding for the records the
+manifest lists.
+
+In this release the closing exit-4 line, `INTEGRITY OK, COVERAGE NOT
+ESTABLISHED: … a verified anchor shows the chain went on past the head this
+pack claims …`, mentions a verified anchor even when only `--require-through`
+caused the result. In that case the `COVERAGE NOT ESTABLISHED through
+seq=SEQ` line above it names the cause, and no anchor need have verified.
 
 ### 6.8 Evidence modes
 
@@ -1128,15 +1147,17 @@ pack's records, in sequence order:
 ]
 ```
 
-The verifier reads the seals from the records themselves and prints one line
-per seal, `EVIDENCE MODE seq=N: <mode> (<source>)`, or `EVIDENCE MODE
-CHANGED at seq=N: <old> -> <new> (<source>)` where the mode differs from the
-seal before it, or `EVIDENCE MODE: no evidence-mode seal among this pack's
-records`. When the manifest carries `evidence_modes`, each entry must hold
-exactly `sequence`, `mode` and `source`, and the list must equal the seals
-found in the records, entry for entry; otherwise the pack fails (exit 1)
-with `FAIL evidence_modes: …`. A manifest without the key predates it; the
-seals are printed from the records alone.
+The verifier reads the seals from the records themselves. When the manifest
+carries `evidence_modes`, each entry must hold exactly `sequence`, `mode`
+and `source`, and the list must equal the seals found in the records, entry
+for entry; otherwise the pack fails (exit 1) and the verifier prints `FAIL
+evidence_modes: …` instead of the lines below. A manifest without the key
+predates it, and the seals are read from the records alone. When the list is
+absent or matches, the verifier prints one line per seal: `EVIDENCE MODE
+seq=N: <mode> (<source>)`, or, in its place, `EVIDENCE MODE CHANGED at
+seq=N: <old> -> <new> (<source>)` where the mode differs from the seal before
+it. A pack with no seal prints `EVIDENCE MODE: no evidence-mode seal among
+this pack's records`.
 
 ## 7. Signed packs (window B)
 
