@@ -1,0 +1,26 @@
+{
+ "schema_version": "v1.1",
+ "timestamp_utc": "2026-11-01T09:05:00.000000000Z",
+ "event_id": "00000000-0000-4000-8000-0000000e0002",
+ "request_id": "00000000-0000-4000-8000-0000000e1002",
+ "model_requested": "gpt-4.1-mini",
+ "model_executed": "gpt-4.1-mini-2025-04-14",
+ "provider": "openai",
+ "action": "allow",
+ "input_tokens": 12,
+ "output_tokens": 30,
+ "total_tokens": 42,
+ "estimated_cost_usd": 5.4e-05,
+ "policy_version": "0000000000000000000000000000000000000000000000000000000000000000",
+ "findings": [],
+ "messages": [
+  {
+   "role": "user",
+   "content": "Synthetic request."
+  }
+ ],
+ "response_text": "Synthetic response.",
+ "sequence_number": 2,
+ "previous_hash": "24e7ad310aa9a24fc4dd98ef2ddfc0b792465e27cee58aa665c653c1933fc3db",
+ "event_hash": "0ef80ee817214675fa1aec1d1fccb1950f6454e584677f1733a27208bcb25577"
+}

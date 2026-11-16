@@ -1,0 +1,137 @@
+{
+  "schema_version": "1.4",
+  "pack_id": "00000000-0000-4000-8000-0000000e0f00",
+  "window": "A",
+  "signing_deferred": true,
+  "generated_at": "2026-11-02T10:00:00Z",
+  "generator_version": "fixture",
+  "substrate_name": "Gateway local hash chain (audit database on the data volume); no write-once store",
+  "evidence_class": "local-chain-not-write-once",
+  "bucket": "local-chain:fixture-gateway",
+  "prefix": "audit/proxy/",
+  "from_sequence": 0,
+  "to_sequence": 5,
+  "claim": {
+    "scope": "chain_to_head",
+    "from_sequence": 0,
+    "to_sequence": 5
+  },
+  "evidence_modes": [
+    {
+      "sequence": 1,
+      "mode": "write_once",
+      "source": "derived"
+    },
+    {
+      "sequence": 4,
+      "mode": "local_chain",
+      "source": "configured"
+    }
+  ],
+  "hash_algorithm": "SHA-256",
+  "hash_version": "v1",
+  "genesis_hash": "c2989403cf897daccd825cc41377b804343c5a4851eac1daf32b58eb1fa4edf8",
+  "verified": true,
+  "records_checked": 6,
+  "first_sequence": 0,
+  "last_sequence": 5,
+  "break_at_sequence": null,
+  "violation_kind": null,
+  "error": null,
+  "anchoring": {
+    "chains": [
+      {
+        "anchored_through_seq": null,
+        "anchors": [],
+        "chain": "proxy",
+        "reason": "no_anchors_found",
+        "seals": [],
+        "unanchored_tail": {
+          "from_seq": 0,
+          "to_seq": 5
+        }
+      }
+    ],
+    "state": "unanchored"
+  },
+  "events": [
+    {
+      "sequence": 0,
+      "timestamp_utc": "2026-11-01T09:00:00.000000000Z",
+      "action": "allow",
+      "model_requested": "",
+      "project_id": null,
+      "request_id": "00000000-0000-4000-8000-0000000e0000",
+      "event_id": "00000000-0000-4000-8000-0000000e0000",
+      "stored_event_hash": "b0599c5ea52cd62a0f0866c5cd3a201d8ae3e0e0d48da128717f4e5b12c0fa12",
+      "recomputed_event_hash": "b0599c5ea52cd62a0f0866c5cd3a201d8ae3e0e0d48da128717f4e5b12c0fa12",
+      "hash_match": true,
+      "previous_hash_match": true
+    },
+    {
+      "sequence": 1,
+      "timestamp_utc": "2026-11-01T09:00:00.100000000Z",
+      "action": "allow",
+      "model_requested": "",
+      "project_id": null,
+      "request_id": "00000000-0000-4000-8000-0000000e0001",
+      "event_id": "00000000-0000-4000-8000-0000000e0001",
+      "stored_event_hash": "24e7ad310aa9a24fc4dd98ef2ddfc0b792465e27cee58aa665c653c1933fc3db",
+      "recomputed_event_hash": "24e7ad310aa9a24fc4dd98ef2ddfc0b792465e27cee58aa665c653c1933fc3db",
+      "hash_match": true,
+      "previous_hash_match": true
+    },
+    {
+      "sequence": 2,
+      "timestamp_utc": "2026-11-01T09:05:00.000000000Z",
+      "action": "allow",
+      "model_requested": "gpt-4.1-mini",
+      "project_id": null,
+      "request_id": "00000000-0000-4000-8000-0000000e1002",
+      "event_id": "00000000-0000-4000-8000-0000000e0002",
+      "stored_event_hash": "0ef80ee817214675fa1aec1d1fccb1950f6454e584677f1733a27208bcb25577",
+      "recomputed_event_hash": "0ef80ee817214675fa1aec1d1fccb1950f6454e584677f1733a27208bcb25577",
+      "hash_match": true,
+      "previous_hash_match": true
+    },
+    {
+      "sequence": 3,
+      "timestamp_utc": "2026-11-02T09:00:00.000000000Z",
+      "action": "allow",
+      "model_requested": "",
+      "project_id": null,
+      "request_id": "00000000-0000-4000-8000-0000000e0003",
+      "event_id": "00000000-0000-4000-8000-0000000e0003",
+      "stored_event_hash": "25a5201089ec21e507c47ce831fc41e1d0b39b38bba7101f6cea84580fb0c34f",
+      "recomputed_event_hash": "25a5201089ec21e507c47ce831fc41e1d0b39b38bba7101f6cea84580fb0c34f",
+      "hash_match": true,
+      "previous_hash_match": true
+    },
+    {
+      "sequence": 4,
+      "timestamp_utc": "2026-11-02T09:00:00.100000000Z",
+      "action": "allow",
+      "model_requested": "",
+      "project_id": null,
+      "request_id": "00000000-0000-4000-8000-0000000e0004",
+      "event_id": "00000000-0000-4000-8000-0000000e0004",
+      "stored_event_hash": "49b3a60168bbdbecea828b8ed3e11924ef800408e427557bac05498de70dbecf",
+      "recomputed_event_hash": "49b3a60168bbdbecea828b8ed3e11924ef800408e427557bac05498de70dbecf",
+      "hash_match": true,
+      "previous_hash_match": true
+    },
+    {
+      "sequence": 5,
+      "timestamp_utc": "2026-11-02T09:05:00.000000000Z",
+      "action": "allow",
+      "model_requested": "gpt-4.1-mini",
+      "project_id": null,
+      "request_id": "00000000-0000-4000-8000-0000000e1005",
+      "event_id": "00000000-0000-4000-8000-0000000e0005",
+      "stored_event_hash": "1353d641beb586f36145b772ef35552266be89496c951ff7a8f411818efb4730",
+      "recomputed_event_hash": "1353d641beb586f36145b772ef35552266be89496c951ff7a8f411818efb4730",
+      "hash_match": true,
+      "previous_hash_match": true
+    }
+  ]
+}

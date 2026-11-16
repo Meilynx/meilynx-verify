@@ -1,0 +1,71 @@
+{
+  "runs": [
+    {
+      "absent": [
+        "FAIL",
+        "COVERAGE NOT ESTABLISHED"
+      ],
+      "args": [
+        "--allow-unsigned",
+        "--tsa-root",
+        "test-rsa=anchors/roots/rsa-root.pem",
+        "--tsa-root",
+        "test-ec=anchors/roots/ec-root.pem"
+      ],
+      "contains": [
+        "EVIDENCE CLASS: local-chain-not-write-once",
+        "CLAIM: the whole chain chain_tnt_fixture_run_a from seq=0 up to its head at seq=4",
+        "ANCHORS OK: verified through seq=4, 2/2 witnesses",
+        "AUTHENTICITY NOT ESTABLISHED",
+        "[evidence class: local-chain-not-write-once]"
+      ],
+      "exit": 0
+    },
+    {
+      "args": [
+        "--tsa-root",
+        "test-rsa=anchors/roots/rsa-root.pem",
+        "--tsa-root",
+        "test-ec=anchors/roots/ec-root.pem"
+      ],
+      "contains": [
+        "AUTHENTICITY NOT ESTABLISHED"
+      ],
+      "exit": 3
+    },
+    {
+      "args": [
+        "--allow-unsigned",
+        "--require-through",
+        "4",
+        "--tsa-root",
+        "test-rsa=anchors/roots/rsa-root.pem",
+        "--tsa-root",
+        "test-ec=anchors/roots/ec-root.pem"
+      ],
+      "contains": [
+        "COVERAGE: the pack reaches seq=4, at or after the required seq=4"
+      ],
+      "exit": 0
+    },
+    {
+      "absent": [
+        "FAIL"
+      ],
+      "args": [
+        "--allow-unsigned",
+        "--require-through",
+        "5",
+        "--tsa-root",
+        "test-rsa=anchors/roots/rsa-root.pem",
+        "--tsa-root",
+        "test-ec=anchors/roots/ec-root.pem"
+      ],
+      "contains": [
+        "COVERAGE NOT ESTABLISHED through seq=5: the pack's last record is seq=4",
+        "INTEGRITY OK, COVERAGE NOT ESTABLISHED"
+      ],
+      "exit": 4
+    }
+  ]
+}

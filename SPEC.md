@@ -5,18 +5,22 @@ enough that a verifier can be written from it without reading Meilynx code.
 `verify-pack.py` in this repository is one such verifier; its `--self-test`
 pins the values below against fixture hashes.
 
-Status: describes chain records with `schema_version` v1 through v1.19, the
+Status: describes chain records with `schema_version` v1 through v1.20, the
 per-record and segment storage layouts, pack manifest `schema_version` 1.0
 through 1.5, the control-plane chain a 1.3 manifest carries, the per-tenant
-pack signature, the export copy a pack can be checked against (§9), the
-customer-conditions verdict (§10) and record signatures (§11), as read by
-`verify-pack.py` from meilynx-proxy commit `f3d9d29` (2026-10-25). A chain written before the
+pack signature, the local-chain evidence class (§6.5), the manifest's
+coverage claim (§6.7) and list of evidence modes (§6.8), the export copy a
+pack can be checked against (§9), the customer-conditions verdict (§10) and
+record signatures (§11), as read by `verify-pack.py` from meilynx-proxy
+commit `de763b8` (2026-11-15). A chain written before the
 segment rollout is per-record, and its packs carry manifest 1.0 or 1.1.
 
 ## 1. Records
 
 A chain is an ordered sequence of records. Each record is one JSON document
-(UTF-8), stored in a write-once bucket under a chain prefix. The records are
+(UTF-8), stored under a chain prefix: in a write-once bucket, or, for a
+gateway with no write-once store, in the gateway's own audit database, from
+which a local-chain pack (§6.5) copies it. The records are
 held by objects of two kinds, each named by the sequence numbers it holds,
 zero-padded to 20 digits:
 
@@ -82,9 +86,12 @@ concludes:
 | **Gap:** no object holds a sequence, and later objects exist | Fail (exit 1) at the first record after the hole, which does not link to the last record before it (§2) |
 | **Truncation:** the ranges cover a contiguous prefix and stop early | Pass on the records present, for a manifest that lists those records. The shortfall against the chain's final length is a completeness finding, not an integrity one (§8). |
 
-A chain begins at sequence `0` on every proxy instance start and runs until
-that instance stops. Different instances write different chains (distinct
-prefixes); a chain never spans instances. Model-call and MCP records share
+A chain in a write-once bucket begins at sequence `0` on every proxy
+instance start and runs until that instance stops. Different instances write
+different chains (distinct prefixes); such a chain never spans instances. A
+gateway's local chain (§6.5) is different: it lives in the gateway's audit
+database and continues across restarts, so one local chain can hold the
+startup records of several boots. Model-call and MCP records share
 the request chain; coverage records (`coverage_computed`,
 `coverage_key_inventory`) are written to a separate per-tenant coverage chain
 with the same format and genesis.
@@ -93,8 +100,8 @@ Every record carries at least these fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.19"`). Absent means `"v1"`. |
-| `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`, `decision_receipt`). Absent means `llm_request`. |
+| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.20"`). Absent means `"v1"`. |
+| `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`, `decision_receipt`, `compliance_record`). Absent means `llm_request`. |
 | `sequence_number` | integer | Position in the chain, starting at 0. |
 | `timestamp_utc` | string | RFC 3339 UTC timestamp, nanosecond precision, `Z` suffix. |
 | `event_id` | string | Unique id of this record. |
@@ -110,7 +117,8 @@ Every record carries at least these fields:
 
 Kind-specific payloads live under `admin_action`, `auth_session`,
 `mcp_event`, `coverage`, `coverage_key_inventory`, `decision_receipt`,
-`join_context`, `content`, `identity`, `evaluation_trace` and `customer`.
+`compliance_record`, `join_context`, `content`, `identity`,
+`evaluation_trace` and `customer`.
 LLM records also carry
 `messages`, `response_text`, `findings`, `policy_version`,
 `model_executed`, `raw_request`/`raw_response` and routing metadata; **only
@@ -212,6 +220,7 @@ wire names differ from the serde `event_kind` values stored in the JSON:
 | `coverage_computed` | `coverage.computed` |
 | `coverage_key_inventory` | `coverage.key_inventory` |
 | `decision_receipt` | `decision.receipt` |
+| `compliance_record` | `compliance.record` |
 
 ### 4.3 Per-version suffixes
 
@@ -458,6 +467,40 @@ carries a `policy_version`; a v1.19 record without one, or v1.19 on any
 other kind, is invalid and fails verification. The trace, content,
 identity and customer, when present, are checked as for v1.18.
 
+**v1.20 `compliance.record`**: from `compliance_record`, after the kind
+attestation: `vendor`, `api_surface`, `record_type`, `outcome` (strings),
+`external_id`, `parent_id`, `external_type`, `external_created_at`,
+`external_updated_at`, `organization_uuid`, `actor_type`, `actor_id`,
+`error_class` (optional strings), `http_status` (optional i64),
+`vendor_request_id`, `cursor_before`, `cursor_after` (optional strings),
+`item_count`, `content_bytes` (i64), `content_sha256` (optional string),
+`record_sha256`, `scan_status` (strings), `findings_count` (i64),
+`findings_sha256` (string), `fetched_at` (i64, Unix seconds). 41 fields. A
+required string that is absent is fed as the empty string.
+
+A compliance record is one item a proxy retrieved from a vendor's compliance
+API with the customer's own credential (an activity, a chat, a message, a
+file and the like), or one polling run that failed, was partial or was
+skipped. These records are sealed on their own chain, `compliance`, next to
+the proxy's request chain. The item as received is stored in `raw_response`
+and its findings in `findings`; both are outside the preimage and bound by
+digests the verifier recomputes:
+
+- `record_sha256` is the RFC 8785 digest of `raw_response` (of `null` when
+  the record stores none);
+- when `raw_response` carries `content_base64`, the decoded bytes must hash
+  (SHA-256) to `content_sha256` and measure `content_bytes`;
+- `findings_sha256` is the RFC 8785 digest of the findings projected to
+  `code`, `validator`, `severity`, `category` and `message`, in order, and
+  `findings_count` is their number.
+
+A disagreement fails verification at that record, naming the digest. In a
+content-stripped pack (§6.6) whose `removed_fields` include `raw_response`,
+only the findings are checked. `compliance_record` on any other version or
+kind, v1.20 on any other kind, a v1.20 record without the payload, or a
+v1.20 record that also carries another kind's payload (`auth_session`,
+`admin_action`, `mcp_event`, `coverage`), is invalid and fails verification.
+
 MCP kinds are: `mcp.tool_call`, `mcp.policy_decision`, `mcp.tool_result`,
 `mcp.tools_list.served`, `mcp.error`, `mcp.catalog_drift`. Any MCP hasher
 called with a non-MCP kind is an error.
@@ -471,7 +514,8 @@ v1.16, v1.18, v1.19) it also recomputes the stored-content digests (§4.4),
 for v1.12, v1.14, v1.17, v1.18 and v1.19 records with an identity the
 asserted-claims digest (§4.5), for v1.16, v1.18 and v1.19 records the
 evaluation outcome digest, for v1.15 records the evidence-set digest (§4.3),
-and for v1.18 and v1.19 records the customer label digest (§4.6).
+for v1.18 and v1.19 records the customer label digest (§4.6), and for v1.20
+records the stored-record, file-content and findings digests (§4.3).
 
 ### 4.4 LLM content attestation (v1.10, v1.11, v1.12, v1.16, v1.18, v1.19)
 
@@ -631,6 +675,8 @@ verification window of one chain:
   "prefix": "<chain prefix, ends with />",
   "from_sequence": 0,
   "to_sequence": 27,
+  "claim": {"scope": "chain_to_head" | "interval", "from_sequence": 0, "to_sequence": 27},   … optional, §6.7 …
+  "evidence_modes": [ … present when the pack holds evidence-mode seals, §6.8 … ],
   "hash_algorithm": "sha256",
   "hash_version": "v1",
   "genesis_hash": "<hex>",
@@ -773,7 +819,9 @@ explains an unanchored chain.
 | A statement that is not canonical, or does not name this chain at this sequence | Fail (exit 1) |
 | The anchored `event_hash` differs from the record's recomputed hash, or from the hash the record stores | Fail (exit 1): the record changed after it was anchored |
 | A token that does not verify, including a path that reaches no trusted root | Fail (exit 1), with the same reason code the proxy's verifier uses |
-| An anchor found in the records directory or bucket that the manifest does not list | Verified like a listed one; a pass is reported as a NOTICE, a failure fails the pack |
+| A listed anchor at a sequence outside `[from_sequence, to_sequence]` | Fail (exit 1), whatever the claim (§6.7) |
+| An anchor found in the records directory or bucket that the manifest does not list, at a sequence inside the pack | Verified like a listed one; a pass is reported as a NOTICE, a failure fails the pack |
+| An anchor the manifest does not list, found next to the records at a sequence after the pack's last record | Judged only when the pack claims the whole chain up to its head (§6.7): a verified one is coverage not established (exit 4). Otherwise a NOTICE that it was not judged |
 | The manifest's `state`, `reason`, `anchored_through_seq` or `unanchored_tail` disagree with the anchors that verified | Fail (exit 1) |
 | A listed seal that is not the `admin_action` record it claims to be | Fail (exit 1) |
 | A record whose `timestamp_utc` is more than five minutes after the `genTime` of the earliest anchor covering it | Pass, with a NOTICE naming the first such record; the token's `genTime` is the authoritative time |
@@ -916,13 +964,41 @@ entry and `RECEIPTS INDEX OK`.
 ### 6.5 Evidence class (manifest 1.4)
 
 A 1.4 manifest is a 1.3 manifest with a required `evidence_class` label
-inside the signed bytes, saying what kind of evidence the pack holds; a 1.5
+inside the manifest, covered by its signature when the pack is signed, saying what kind of evidence the pack holds; a 1.5
 manifest carries it when it has one. The label must be one the verifier
-reads: `sandbox-non-production`, evidence sealed on a self-serve evaluation
-tenant, not production evidence. The verifier prints the label before the
-records and on every verdict line. An unknown label, a 1.4 manifest without
-one, or a label on a 1.0 to 1.3 manifest, is cannot evaluate (exit 2): a
-label is never ignored.
+reads:
+
+| Label | Meaning |
+|---|---|
+| `sandbox-non-production` | Evidence sealed on a self-serve evaluation tenant, not production evidence. |
+| `local-chain-not-write-once` | Records read from a gateway's own local hash chain. No write-once store confirmed them, and the pack is unsigned. |
+
+The verifier prints the label and its meaning before the records and the
+label on every verdict line. An unknown label, a 1.4 manifest without one,
+or a label on a 1.0 to 1.3 manifest, is cannot evaluate (exit 2): a label is
+never ignored.
+
+**Local-chain packs.** A gateway with no write-once store keeps its chain
+only in its own audit database. Its pack generator writes, for one chain,
+`manifest.json` (1.4, `local-chain-not-write-once`, window A with no
+signature, `bucket` set to `local-chain:<gateway id>`), the records under
+`records/`, and the local chain-head anchors at or below the pack's last
+record under `records/anchors/` (§6.1). The pack always starts at sequence 0
+and runs to the head the generator read, and its manifest says so with a
+`chain_to_head` claim (§6.7). A chain whose first records the gateway's
+retention removed is not packed.
+
+What such a pack can show: that each record's hash recomputes and links to
+the record before it, and, where an anchor verifies, that the chain head at
+that sequence existed no later than the token's `genTime`. What it cannot
+show: who produced it (it is unsigned, so the manifest is only as
+trustworthy as the way the reader received it); that the history is
+complete (whoever controls the gateway's data volume can rewrite or remove
+records before the pack is built, and a history rewritten before its first
+anchor cannot be detected); anything about records after the last anchor
+beyond their internal consistency. The one truncation a reader can detect is
+a pack that stops before a head that a later anchor names, which §6.7
+reports as coverage not established.
 
 ### 6.6 Content-stripped packs (manifest 1.5)
 
@@ -972,6 +1048,116 @@ and carries `[content: stripped]`. A receipt evidence entry (§4.3) or a
 chain-head anchor (§6.1) that cites a stub is checked on the stub's
 `event_hash`. Read as a full pack, the same records fail their content
 checks: the signed claim is what lets them verify.
+
+### 6.7 Coverage claim
+
+A manifest may carry `claim`, covered by the manifest's signature when the
+pack is signed, saying what the pack holds:
+
+```json
+"claim": {"scope": "chain_to_head", "from_sequence": 0, "to_sequence": 27}
+```
+
+- `chain_to_head`: every record of the chain from sequence 0 up to the head
+  the generator read. A local-chain pack (§6.5) carries this scope.
+- `interval`: one window of a longer chain, which may go on on either side.
+  A pack read from a write-once bucket carries this scope; the bucket is the
+  record.
+
+An explicit claim is an object with exactly these three keys, and both
+bounds are non-negative integers. A manifest without `claim`, or with
+`claim: null`, predates it and is read as `chain_to_head` when its evidence
+class is `local-chain-not-write-once` and as `interval` otherwise; the
+checks on an explicit claim's bounds in the table below are not applied to
+such an inferred claim. The verifier prints one `CLAIM:` line, or `FAIL
+claim:` with the reason when the claim contradicts the manifest.
+
+| Finding | Verdict |
+|---|---|
+| An explicit claim whose bounds differ from `from_sequence` and `to_sequence` | Fail (exit 1) |
+| An explicit `chain_to_head` claim with `from_sequence` other than 0 | Fail (exit 1) |
+| A `local-chain-not-write-once` pack that claims `interval` | Fail (exit 1): relabelling such a pack as a window would stop a later anchor from being judged |
+| An unknown scope, missing or extra keys, or a bound that is not a non-negative integer | Cannot evaluate (exit 2) |
+| `chain_to_head`, and a verified anchor that the manifest does not list, found next to the records, names this chain at a sequence N after the pack's last record | Coverage not established (exit 4) |
+| `interval`, and an unlisted anchor after the pack's last record | Not judged: `NOTICE: <n> anchor(s) outside this pack's window <from>..<to> were not judged` |
+
+Anchors are read on manifest 1.1 and later (§6.1); a 1.0 manifest has
+none. An anchor after a `chain_to_head` pack's last record is judged on its
+statement and tokens only, because the record it names is not in the pack.
+It is evidence of a later head only when at least one token verifies over a
+canonical statement that names this chain at that sequence. When none
+verifies and one has no trust root or cannot be parsed, the pack is cannot
+evaluate (exit 2), because whether history is missing is not known. Any
+other such anchor (no statement, a statement that does not name this chain
+at that sequence, no token, a token that fails) is not evidence of a later
+head and is reported as a NOTICE.
+
+Coverage not established is neither a pass nor a tampering verdict. Every
+record verified, but a timestamp authority saw the chain at sequence N and
+the pack stops before N. The pack may have been built before that head, the
+records after its last one may have been removed, or the anchor may name
+another gateway's chain of the same name; nothing in the pack can say which.
+The verifier prints
+
+```
+COVERAGE anchor seq=N: a verified anchor (…) names chain <chain> at seq=N, after this pack's last record seq=M; …
+COVERAGE NOT ESTABLISHED through seq=N: …
+INTEGRITY OK, COVERAGE NOT ESTABLISHED: all <count> events verified, … This is not a tampering verdict.
+```
+
+and exits 4. The remedy is a pack that runs through N. An anchor inside the
+claim that names a different head is still a failure (exit 1, §6.1).
+
+**`--require-through SEQ`.** The claim is in the manifest, which a local-chain
+pack does not sign. A reader who knows from another source how far the chain
+had reached (for example the head the gateway reported to its control plane)
+passes it with `--require-through SEQ`. The option compares SEQ with the
+manifest's `to_sequence`, whatever the manifest claims. A pack whose
+`to_sequence` is before SEQ prints `COVERAGE NOT ESTABLISHED through
+seq=SEQ: the pack's last record is seq=M, before the sequence you required
+(--require-through)` and exits 4; one whose `to_sequence` is at or after SEQ
+prints `COVERAGE: the pack reaches seq=M, at or after the required
+seq=SEQ`. The option does not itself establish that the pack's records reach
+`to_sequence`; that is the chain check's finding for the records the
+manifest lists.
+
+In this release the closing exit-4 line, `INTEGRITY OK, COVERAGE NOT
+ESTABLISHED: … a verified anchor shows the chain went on past the head this
+pack claims …`, mentions a verified anchor even when only `--require-through`
+caused the result. In that case the `COVERAGE NOT ESTABLISHED through
+seq=SEQ` line above it names the cause, and no anchor need have verified.
+
+### 6.8 Evidence modes
+
+A gateway resolves its evidence mode once at each start and seals it as an
+`admin_action` record (v1.3) with `action_type` `evidence_mode_resolved` and
+`metadata_json` holding `mode` (`write_once` or `local_chain`), `source`
+(`configured` or `derived`, the latter when the mode was inferred from the
+storage settings) and `write_once_confirmed`. The mode never changes while
+the gateway runs, so a change of mode is visible only across a restart, as
+two seals with different modes.
+
+A manifest may carry `evidence_modes`, one entry per such seal among the
+pack's records, in sequence order:
+
+```json
+"evidence_modes": [
+  {"sequence": 1, "mode": "write_once", "source": "derived"},
+  {"sequence": 4, "mode": "local_chain", "source": "configured"}
+]
+```
+
+The verifier reads the seals from the records themselves. When the manifest
+carries `evidence_modes`, each entry must hold exactly `sequence`, `mode`
+and `source`, and the list must equal the seals found in the records, entry
+for entry; otherwise the pack fails (exit 1) and the verifier prints `FAIL
+evidence_modes: …` instead of the lines below. A manifest without the key
+predates it, and the seals are read from the records alone. When the list is
+absent or matches, the verifier prints one line per seal: `EVIDENCE MODE
+seq=N: <mode> (<source>)`, or, in its place, `EVIDENCE MODE CHANGED at
+seq=N: <old> -> <new> (<source>)` where the mode differs from the seal before
+it. A pack with no seal prints `EVIDENCE MODE: no evidence-mode seal among
+this pack's records`.
 
 ## 7. Signed packs (window B)
 
@@ -1078,8 +1264,9 @@ as unsupported, never as a pass.
 | 1 | A record or the signature failed. The reason is one of: signature required by manifest but missing; manifest bytes changed since signing; untrusted certificate chain; signer identity mismatch; OIDC issuer mismatch; invalid transparency-log proof; transparency-log entry does not match this signature; signed outside certificate validity; malformed signature material. |
 | 2 | Cannot evaluate: unsupported hash version, manifest version, storage layout, evidence class, content claim, signature method or bundle format; unusable trust anchors; a per-tenant signer checked without `--certificate-identity`; a content-stripped pack read with `--bucket` or still carrying a removed field. |
 | 3 | Unsigned pack: records verified, authenticity not established. |
+| 4 | Coverage not established: every record verified, but the pack claims the chain up to its head and a verified anchor names a later head (§6.7), or the pack stops before the sequence given with `--require-through`. `--allow-unsigned` does not turn it into 0. |
 
-1 outranks 2, which outranks 3. The codes are the same whether the records
+1 outranks 2, which outranks 4, which outranks 3. The codes are the same whether the records
 are read from the bucket or from an exported record set. The export check
 (§9) and the customer-conditions verdict (§10) each produce a code by the
 same rule, and the highest-ranking code is the exit code.
@@ -1111,8 +1298,12 @@ since; the chain hashes attest the records.
   and in order. It cannot show that an interaction which never reached the
   proxy was recorded. A chain whose objects stop before the last record its
   writer sealed (truncation, §1) verifies on the records present; the
-  shortfall is not an integrity failure, and this verifier does not report
-  it.
+  shortfall is not an integrity failure. The verifier reports it only when it
+  has evidence of it: a pack that claims the whole chain up to its head and a
+  verified anchor of a later head, or a pack that stops before the sequence a
+  reader required (§6.7, exit 4). A local-chain pack (§6.5) comes from a
+  store its operator can rewrite, so its records before the first anchor can
+  have been rewritten without any check failing.
 - **Unhashed fields.** For LLM records before v1.10, `messages`,
   `response_text`, `findings`, `raw_request`, `raw_response` and routing
   metadata are stored in the record but not in the preimage. From v1.10 the
@@ -1128,7 +1319,9 @@ since; the chain hashes attest the records.
   v1.16, v1.18 and v1.19 records the evaluation trace's timing is stored
   but not hashed; its outcomes are bound by `outcomes_sha256_jcs` (§4.3). On
   v1.18 and v1.19 records the plain `customer_id` is stored but not hashed;
-  `label_sha256` binds it only when `source` is `asserted` (§4.6). On LLM
+  `label_sha256` binds it only when `source` is `asserted` (§4.6). On v1.20
+  records the stored item, its file bytes and its findings are bound through
+  `record_sha256`, `content_sha256` and `findings_sha256` (§4.3). On LLM
   records before v1.19 `policy_version` and `model_executed` are stored but
   not hashed (v1.19 binds both, §4.3), and on every MCP record
   `mcp_event.finding_summary` is; the customer-conditions verdict (§10) says

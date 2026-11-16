@@ -1,0 +1,24 @@
+{
+ "schema_version": "v1.3",
+ "event_kind": "admin_action",
+ "timestamp_utc": "2026-11-02T09:00:00.100000000Z",
+ "event_id": "00000000-0000-4000-8000-0000000e0004",
+ "request_id": "00000000-0000-4000-8000-0000000e0004",
+ "model_requested": "",
+ "action": "allow",
+ "input_tokens": 0,
+ "output_tokens": 0,
+ "estimated_cost_usd": null,
+ "findings": [],
+ "messages": [],
+ "response_text": null,
+ "admin_action": {
+  "action_type": "evidence_mode_resolved",
+  "actor": "system:pid:1",
+  "description": "Evidence mode local_chain: no write-once store; the local chain is the only record and exports say their records are not write-once confirmed",
+  "metadata_json": "{\"mode\":\"local_chain\",\"source\":\"configured\",\"write_once_confirmed\":false}"
+ },
+ "sequence_number": 4,
+ "previous_hash": "25a5201089ec21e507c47ce831fc41e1d0b39b38bba7101f6cea84580fb0c34f",
+ "event_hash": "49b3a60168bbdbecea828b8ed3e11924ef800408e427557bac05498de70dbecf"
+}

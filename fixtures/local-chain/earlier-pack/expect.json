@@ -1,0 +1,37 @@
+{
+  "runs": [
+    {
+      "absent": [
+        "FAIL"
+      ],
+      "args": [
+        "--allow-unsigned",
+        "--tsa-root",
+        "test-rsa=anchors/roots/rsa-root.pem",
+        "--tsa-root",
+        "test-ec=anchors/roots/ec-root.pem"
+      ],
+      "contains": [
+        "CLAIM: the whole chain chain_tnt_fixture_run_a from seq=0 up to its head at seq=2",
+        "COVERAGE anchor seq=4: a verified anchor",
+        "after this pack's last record seq=2",
+        "COVERAGE NOT ESTABLISHED through seq=4",
+        "INTEGRITY OK, COVERAGE NOT ESTABLISHED: all 3 events verified",
+        "This is not a tampering verdict."
+      ],
+      "exit": 4
+    },
+    {
+      "args": [
+        "--tsa-root",
+        "test-rsa=anchors/roots/rsa-root.pem",
+        "--tsa-root",
+        "test-ec=anchors/roots/ec-root.pem"
+      ],
+      "contains": [
+        "INTEGRITY OK, COVERAGE NOT ESTABLISHED"
+      ],
+      "exit": 4
+    }
+  ]
+}

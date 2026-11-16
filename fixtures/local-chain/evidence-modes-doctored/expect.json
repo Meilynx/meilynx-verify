@@ -1,0 +1,13 @@
+{
+  "runs": [
+    {
+      "args": [
+        "--allow-unsigned"
+      ],
+      "contains": [
+        "FAIL evidence_modes: manifest evidence_modes (seq=1 write_once) disagrees with the evidence-mode seals in the pack's records (seq=1 write_once, seq=4 local_chain)"
+      ],
+      "exit": 1
+    }
+  ]
+}
