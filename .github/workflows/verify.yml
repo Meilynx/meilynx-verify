@@ -10,8 +10,11 @@ permissions:
 
 jobs:
   self-test-and-fixtures:
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest moved to an image whose setup-python has no 3.9,
+    # the oldest Python this verifier is tested on.
+    runs-on: ubuntu-24.04
     strategy:
+      fail-fast: false
       matrix:
         python: ["3.9", "3.12"]
     steps:
