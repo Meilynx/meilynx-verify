@@ -1,0 +1,18 @@
+{
+  "runs": [
+    {
+      "absent": [
+        "FAIL"
+      ],
+      "args": [
+        "--allow-unsigned"
+      ],
+      "contains": [
+        "EVIDENCE MODE seq=1: write_once (derived)",
+        "EVIDENCE MODE CHANGED at seq=4: write_once -> local_chain (configured)",
+        "CLAIM: the whole chain proxy from seq=0 up to its head at seq=5"
+      ],
+      "exit": 0
+    }
+  ]
+}

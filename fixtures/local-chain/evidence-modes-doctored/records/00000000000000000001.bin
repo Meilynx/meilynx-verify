@@ -1,0 +1,24 @@
+{
+ "schema_version": "v1.3",
+ "event_kind": "admin_action",
+ "timestamp_utc": "2026-11-01T09:00:00.100000000Z",
+ "event_id": "00000000-0000-4000-8000-0000000e0001",
+ "request_id": "00000000-0000-4000-8000-0000000e0001",
+ "model_requested": "",
+ "action": "allow",
+ "input_tokens": 0,
+ "output_tokens": 0,
+ "estimated_cost_usd": null,
+ "findings": [],
+ "messages": [],
+ "response_text": null,
+ "admin_action": {
+  "action_type": "evidence_mode_resolved",
+  "actor": "system:pid:1",
+  "description": "Evidence mode write_once: records are confirmed by the write-once store before export",
+  "metadata_json": "{\"mode\":\"write_once\",\"source\":\"derived\",\"write_once_confirmed\":true}"
+ },
+ "sequence_number": 1,
+ "previous_hash": "b0599c5ea52cd62a0f0866c5cd3a201d8ae3e0e0d48da128717f4e5b12c0fa12",
+ "event_hash": "24e7ad310aa9a24fc4dd98ef2ddfc0b792465e27cee58aa665c653c1933fc3db"
+}

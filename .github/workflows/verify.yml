@@ -118,6 +118,10 @@ jobs:
           diff -r /tmp/regen/coverage fixtures/coverage
           python fixtures/gen-segment-fixtures.py /tmp/regen/segments
           diff -r /tmp/regen/segments fixtures/segments
+          python fixtures/gen-local-chain-fixtures.py /tmp/regen/local-chain
+          diff -r /tmp/regen/local-chain fixtures/local-chain
+      - name: Local-chain packs; coverage claims (exit 4) and evidence modes exit with their verdicts
+        run: python fixtures/run-local-chain-cases.py
       - name: Record signatures; each writer-sealed case exits with its verdict
         run: python fixtures/run-record-sig-cases.py
       - name: Embedded signature test vectors match their generator

@@ -1,0 +1,18 @@
+{
+  "runs": [
+    {
+      "args": [
+        "--allow-unsigned",
+        "--tsa-root",
+        "test-rsa=anchors/roots/rsa-root.pem",
+        "--tsa-root",
+        "test-ec=anchors/roots/ec-root.pem"
+      ],
+      "contains": [
+        "FAIL claim: a local-chain-not-write-once pack claims 'interval'",
+        "FAIL: the manifest's claim contradicts the manifest"
+      ],
+      "exit": 1
+    }
+  ]
+}

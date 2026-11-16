@@ -1,5 +1,70 @@
 # Changelog
 
+## 0.11.0 (2026-11-15)
+
+- `verify-pack.py` from meilynx-proxy `de763b8`.
+- **Upgrade before verifying chains or packs written after this release.**
+  A verifier older than 0.11.0 stops at the first v1.20 record with
+  `unknown schema_version 'v1.20'`, and exits 2 on a pack labelled
+  `local-chain-not-write-once`. It never reports either as a pass. It
+  ignores a manifest's `claim` and `evidence_modes`: it neither prints them
+  nor checks them against the records and anchors.
+- **New exit code 4: integrity passed, coverage not established.** Every
+  record verified, but the pack does not reach a sequence the chain is known
+  to have reached. Precedence is now 1 > 2 > 4 > 3, and `--allow-unsigned`
+  never turns 4 into 0. A script that treats any non-zero exit as a failure
+  needs no change. A script that reads only 1 as a failure should handle 4,
+  whose remedy is a pack that runs further.
+- Chain v1.20 (SPEC §4.3): a new record kind, `compliance_record`, for one
+  item a proxy retrieved from a vendor's compliance API with the customer's
+  own credential, or one polling run that failed, was partial or was
+  skipped. These records are sealed on their own `compliance` chain. The
+  v1.2 prefix, the kind attestation `compliance.record`, then 25 fields
+  (41 in all). The stored item (`raw_response`) and its findings are outside
+  the preimage; the verifier recomputes `record_sha256`, `findings_sha256`
+  and `findings_count`, and, when the stored item carries file bytes,
+  `content_sha256` and `content_bytes`. v1.20 is defined only for this kind.
+  Three self-test assertions pin the fixture hash and the failure cases.
+  They print as 37a to 37c, labels the record-signature assertions of 0.10.0
+  also use; the descriptions tell them apart.
+- Local-chain evidence (SPEC §6.5): manifest 1.4 reads a second evidence
+  class, `local-chain-not-write-once`, for a pack a gateway with no
+  write-once store writes from its own audit database. Such a pack is
+  unsigned and its records were never confirmed by a write-once store; the
+  verifier prints the label and what it means on every verdict. README
+  "Local-chain evidence" says what such a pack can and cannot show.
+- Coverage claim (SPEC §6.7): a manifest may state `claim`, either
+  `chain_to_head` (every record from 0 to the head the generator read) or
+  `interval` (one window of a longer chain). A manifest without it is read
+  as `chain_to_head` for a local-chain pack and `interval` otherwise. A
+  verified anchor that names a head after a `chain_to_head` pack's last
+  record now exits 4 with `COVERAGE NOT ESTABLISHED through seq=N` and
+  `INTEGRITY OK, COVERAGE NOT ESTABLISHED`. A claim that contradicts the
+  manifest, or a local-chain pack that claims `interval`, fails (exit 1).
+  An unknown scope or a malformed claim is exit 2.
+- `--require-through SEQ`: the sequence you expect the pack to reach, from a
+  source other than the pack. A pack that stops before it exits 4,
+  whatever its manifest claims.
+- Evidence modes (SPEC §6.8): the verifier prints every
+  `evidence_mode_resolved` seal in the pack as `EVIDENCE MODE seq=N: <mode>
+  (<source>)`, and each change as `EVIDENCE MODE CHANGED at seq=N: <old> ->
+  <new> (<source>)`. A manifest's `evidence_modes` list must equal those
+  seals, or the pack fails.
+- `VERIFIER_CAPABILITIES` adds `compliance-records-v1`,
+  `local-chain-evidence-v1`, `coverage-claim-v1` and `evidence-modes-v1`.
+  Self-test assertions 20q (precedence with 4), 25y to 25ac cover them.
+- New fixtures under `fixtures/local-chain/`: a clean local-chain pack, the
+  same chain packed at an earlier head and checked against a later anchor
+  (exit 4), that pack with its claim edited to `interval` (exit 1), a chain
+  whose evidence mode changes, and the same chain with the change missing
+  from the manifest (exit 1). The anchored packs reuse the proxy-generated
+  anchor fixture chain byte for byte; `fixtures/gen-local-chain-fixtures.py`
+  writes them and `fixtures/run-local-chain-cases.py` runs them. CI runs
+  both on every push.
+- Packs without a claim, a local-chain label, evidence-mode seals or v1.20
+  records verify as before, apart from one new output line each:
+  `CLAIM: …` and `EVIDENCE MODE: …`.
+
 ## 0.10.0 (2026-10-26)
 
 - `verify-pack.py` from meilynx-proxy `f3d9d29`.

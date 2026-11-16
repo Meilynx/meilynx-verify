@@ -88,9 +88,17 @@ OCSF evidence export:
 Evidence class (manifest 1.4):
     A 1.4 manifest labels what kind of evidence the pack holds
     (`evidence_class`, inside the signed bytes). `sandbox-non-production`
-    marks evidence sealed on a self-serve sandbox project. The verifier
-    prints the label before the records and on every verdict line; an
-    unknown label, or a 1.4 manifest without one, cannot be evaluated.
+    marks evidence sealed on a self-serve sandbox project.
+    `local-chain-not-write-once` marks records read from a gateway's own
+    local hash chain: no write-once store confirmed them and the pack is
+    unsigned, so it shows that the records are consistent with each other
+    and, through its anchors, that a chain head existed by a given time; it
+    cannot show that the history is complete. For that class a verified
+    anchor that names a chain head after the pack's last record fails the
+    pack: put any anchors you hold in <records>/anchors/ before you run it.
+    The verifier prints the label before the records and on every verdict
+    line; an unknown label, or a 1.4 manifest without one, cannot be
+    evaluated.
 
 Content-stripped Exchange pack (manifest 1.5):
     A pack an Evidence Exchange subscriber receives carries no captured
@@ -194,7 +202,7 @@ Signed packs (window B):
             --certificate-oidc-issuer <PINNED_OIDC_ISSUER> manifest.json
 
 Exit codes (the same in --bucket and --records mode; when several apply,
-1 outranks 2, which outranks 3):
+1 outranks 2, which outranks 4, which outranks 3):
     0  verified: every record, and for a signed pack the signature. An
        unsigned pack exits 0 only with --allow-unsigned, and still prints
        that authenticity is not established.
@@ -227,6 +235,13 @@ Exit codes (the same in --bucket and --records mode; when several apply,
        produced the manifest. Pass --allow-unsigned to accept it. A signed
        pack stripped of its signature and relabelled window A lands here,
        not at 0.
+    4  coverage not established: every record verified, but the pack claims
+       the whole chain up to its head (manifest `claim`), and a verified
+       chain-head anchor shows the chain reached a later sequence N. The pack
+       was built before that head, or records after its last one were
+       removed; nothing in it can say which. Never a pass, and never a
+       tampering verdict: get a pack that runs through N. --allow-unsigned
+       does not turn it into 0.
 
 The GCS bucket uses CMEK encryption; decryption is handled transparently
 by GCS when you authenticate with credentials that have storage.objects.get.
@@ -274,7 +289,34 @@ EVIDENCE_CLASSES = {
         "evidence sealed on a sandbox project, a self-serve evaluation tenant; "
         "it is not production evidence"
     ),
+    "local-chain-not-write-once": (
+        "records read from a gateway's own local hash chain; no write-once store "
+        "confirmed them, so this pack cannot show that its history is complete"
+    ),
 }
+# The class of a pack read from a gateway's local chain. Such a pack is built
+# from sequence 0 to the chain's head, from a store its operator can rewrite,
+# so it claims the whole chain up to that head (CLAIM_CHAIN_TO_HEAD).
+LOCAL_CHAIN_EVIDENCE_CLASS = "local-chain-not-write-once"
+# A manifest's `claim`: what the pack says it holds. `chain_to_head`: every
+# record of the chain from sequence 0 up to the head its generator read.
+# `interval`: one window of a longer chain (a pack read from a write-once
+# bucket, where the bucket is the record). Anchors are judged against it. An
+# anchor inside the claim must match the pack's record at that sequence, or
+# the pack fails. A verified anchor after a chain_to_head claim shows the
+# chain went on past what the pack holds: coverage is not established (exit
+# 4), which is not a failure. After an interval claim the chain going on is
+# expected and is not judged. A claim that disagrees with the manifest's own
+# window fails the pack. A manifest with no claim predates it and is read as
+# chain_to_head when it carries the local-chain class (the only way such a
+# pack is built) and as interval otherwise.
+CLAIM_CHAIN_TO_HEAD = "chain_to_head"
+CLAIM_INTERVAL = "interval"
+CLAIM_SCOPES = (CLAIM_CHAIN_TO_HEAD, CLAIM_INTERVAL)
+# The admin action a gateway seals at every boot with the evidence mode it
+# resolved (`mode`, `source`). A manifest's `evidence_modes` lists them.
+ACTION_EVIDENCE_MODE_RESOLVED = "evidence_mode_resolved"
+EVIDENCE_MODE_INDEX_FIELDS = ("sequence", "mode", "source")
 # Pack features this verifier checks, read by the release-sync gate
 # (check-meilynx-verify-sync.sh --covers) so a generator never ships a
 # feature the public verifier would silently skip. `segmented-records-v1`
@@ -316,11 +358,25 @@ EVIDENCE_CLASSES = {
 # (chain_id, sequence_number, event_hash), labels the unsigned prefix sealed
 # before `chain_signing_started`, and with --chain-signing-key requires the
 # newest signature to be the pinned key's.
+# `compliance-records-v1` reads v1.20 compliance.record records (one record
+# retrieved from a vendor compliance API with the customer's own key) and
+# recomputes the digests of the stored record, its findings and its file bytes.
+# `local-chain-evidence-v1` reads a pack labelled local-chain-not-write-once,
+# prints that label on every verdict, and judges a verified anchor supplied
+# with it that names a chain head after the pack's last record.
+# `coverage-claim-v1` reads a manifest's `claim`, fails a claim that
+# contradicts the manifest, and reports a verified anchor after a
+# chain_to_head claim as coverage not established (exit 4), never as a
+# failure.
+# `evidence-modes-v1` reads a manifest's `evidence_modes`, checks it against
+# the evidence_mode_resolved seals in the pack, and prints each mode and
+# every change of mode.
 VERIFIER_CAPABILITIES = frozenset(
     {"chain-anchors-v1", "segmented-records-v1", "decision-receipts-v1", "evaluation-trace-v1",
      "data-reach-evidence-v1", "control-plane-chain-v1", "ocsf-export-v1", "customer-scope-v1",
      "per-tenant-signer-v1", "evidence-class-v1", "content-stripped-v1", "customer-conditions-v1",
-     "record-signatures-v1"}
+     "record-signatures-v1", "compliance-records-v1", "local-chain-evidence-v1", "coverage-claim-v1",
+     "evidence-modes-v1"}
 )
 # The stripped profile of a manifest 1.5 Exchange pack. Mirror of
 # `exchange::STRIPPED_FIELDS` / `WITHHELD_FIELDS` / `STUB_FIELDS` /
@@ -361,6 +417,7 @@ EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_CANNOT_EVALUATE = 2
 EXIT_UNSIGNED = 3
+EXIT_COVERAGE_NOT_ESTABLISHED = 4
 
 # ---------------------------------------------------------------------------
 # Timestamp normalization
@@ -494,6 +551,8 @@ EVENT_KIND_COVERAGE_COMPUTED = 'coverage.computed'
 EVENT_KIND_COVERAGE_KEY_INVENTORY = 'coverage.key_inventory'
 # The decision receipt kind (v1.15 bucket).
 EVENT_KIND_DECISION_RECEIPT = 'decision.receipt'
+# The vendor compliance API record kind (v1.20 bucket).
+EVENT_KIND_COMPLIANCE_RECORD = 'compliance.record'
 
 MCP_EVENT_KINDS = {
     EVENT_KIND_MCP_TOOL_CALL,
@@ -522,6 +581,8 @@ SERDE_EVENT_KIND_TO_WIRE = {
     'coverage_key_inventory': EVENT_KIND_COVERAGE_KEY_INVENTORY,
     # Serde snake_case form of the v1.15 kind.
     'decision_receipt': EVENT_KIND_DECISION_RECEIPT,
+    # Serde snake_case form of the v1.20 kind.
+    'compliance_record': EVENT_KIND_COMPLIANCE_RECORD,
 }
 
 
@@ -1086,6 +1147,124 @@ def check_decision_receipt(event):
     elif action_str(event) != expected_action:
         problems.append(
             f"decision receipt {rid}: base action {action_str(event)!r} is not the projection of outcome {outcome!r} ({expected_action!r})"
+        )
+    return problems
+
+
+# The 25 compliance-record fields in preimage order, with how each feeds:
+# required utf-8 string, optional string (presence tag), required i64 LE,
+# optional i64 (presence tag + LE).
+COMPLIANCE_RECORD_FEED = (
+    ('vendor', 'str'), ('api_surface', 'str'), ('record_type', 'str'), ('outcome', 'str'),
+    ('external_id', 'opt_str'), ('parent_id', 'opt_str'), ('external_type', 'opt_str'),
+    ('external_created_at', 'opt_str'), ('external_updated_at', 'opt_str'),
+    ('organization_uuid', 'opt_str'), ('actor_type', 'opt_str'), ('actor_id', 'opt_str'),
+    ('error_class', 'opt_str'), ('http_status', 'opt_i64'), ('vendor_request_id', 'opt_str'),
+    ('cursor_before', 'opt_str'), ('cursor_after', 'opt_str'),
+    ('item_count', 'i64'), ('content_bytes', 'i64'), ('content_sha256', 'opt_str'),
+    ('record_sha256', 'str'), ('scan_status', 'str'), ('findings_count', 'i64'),
+    ('findings_sha256', 'str'), ('fetched_at', 'i64'),
+)
+
+
+def compute_event_hash_v1_20_compliance_record(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    record,
+):
+    """v1.20 compliance.record hash. `record` is a dict matching
+    `ComplianceRecordFields`. Mirror of
+    `compute_event_hash_v1_20_compliance_record` in sqlite.rs: the SAME v1.2
+    prefix, then the event_kind wire-name, then the 25 fields in
+    `COMPLIANCE_RECORD_FEED` order. The stored record (`raw_response`) and the
+    findings are outside the preimage; `record_sha256` and `findings_sha256`
+    bind them (see `check_compliance_record`)."""
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_COMPLIANCE_RECORD.encode('utf-8'))
+    for name, kind in COMPLIANCE_RECORD_FEED:
+        value = record.get(name)
+        if kind == 'str':
+            h.update(str(value if value is not None else '').encode('utf-8'))
+        elif kind == 'opt_str':
+            h.update(encode_optional_str(value))
+        elif kind == 'i64':
+            h.update(struct.pack('<q', int(value)))
+        elif kind == 'opt_i64':
+            if value is None:
+                h.update(b'\x00')
+            else:
+                h.update(b'\x01' + struct.pack('<q', int(value)))
+    return h.hexdigest()
+
+
+def compliance_findings_projection(findings):
+    """The stable projection of a compliance record's findings that
+    `findings_sha256` binds: code, validator, severity, category and message of
+    each finding, in order."""
+    out = []
+    for f in findings or []:
+        f = f if isinstance(f, dict) else {}
+        out.append({k: f.get(k) for k in ('code', 'validator', 'severity', 'category', 'message')})
+    return out
+
+
+def check_compliance_record(event, stripped=frozenset()):
+    """For a v1.20 record, check what the hash alone cannot: the stored record
+    (`raw_response`, null when absent) hashes to `record_sha256`; the stored
+    findings hash to `findings_sha256` and number `findings_count`; and when
+    the stored record carries `content_base64`, the decoded bytes hash to
+    `content_sha256` and measure `content_bytes`. `stripped` names the fields
+    a content-stripped Exchange pack removed; when `raw_response` is among
+    them only the findings are checked. Returns a
+    list of problems; empty means the record checks out. Records on any other
+    schema version return no problems."""
+    if (event.get('schema_version') or 'v1') != 'v1.20':
+        return []
+    fields = event.get('compliance_record')
+    if not isinstance(fields, dict):
+        return ['v1.20 record carries no compliance_record payload']
+    problems = []
+    rid = event.get('event_id', '?')
+    if 'raw_response' not in stripped:
+        stored = event.get('raw_response')
+        got = sha256_jcs(stored)
+        if got != fields.get('record_sha256'):
+            problems.append(
+                f"compliance record {rid}: stored record hashes to {got}, "
+                f"not the sealed record_sha256 {fields.get('record_sha256')}"
+            )
+        if isinstance(stored, dict) and isinstance(stored.get('content_base64'), str):
+            try:
+                raw = base64.b64decode(stored['content_base64'], validate=True)
+            except (binascii.Error, ValueError) as e:
+                problems.append(f"compliance record {rid}: stored content is not base64: {e}")
+            else:
+                if hashlib.sha256(raw).hexdigest() != fields.get('content_sha256'):
+                    problems.append(
+                        f"compliance record {rid}: stored content does not hash to the sealed content_sha256"
+                    )
+                if len(raw) != fields.get('content_bytes'):
+                    problems.append(
+                        f"compliance record {rid}: stored content is {len(raw)} bytes, not the sealed content_bytes"
+                    )
+    findings = event.get('findings') or []
+    got = sha256_jcs(compliance_findings_projection(findings))
+    if got != fields.get('findings_sha256'):
+        problems.append(
+            f"compliance record {rid}: stored findings hash to {got}, "
+            f"not the sealed findings_sha256 {fields.get('findings_sha256')}"
+        )
+    if len(findings) != fields.get('findings_count'):
+        problems.append(
+            f"compliance record {rid}: {len(findings)} stored findings, "
+            f"sealed findings_count {fields.get('findings_count')}"
         )
     return problems
 
@@ -3009,6 +3188,7 @@ def compute_event_hash_dispatch(
     mcp_event=None, coverage=None, join_context=None, content=None,
     identity=None, coverage_key_inventory=None, decision_receipt=None,
     evaluation_trace=None, customer=None, policy_version=None, model_executed=None,
+    compliance_record=None,
 ):
     """Python mirror of compute_event_hash_dispatch in sqlite.rs.
 
@@ -3053,6 +3233,16 @@ def compute_event_hash_dispatch(
         isinstance(evaluation_trace, dict) and isinstance(evaluation_trace.get('outcomes_sha256_jcs'), str)
     ):
         raise ValueError("evaluation_trace has no outcomes_sha256_jcs, so the record has no defined preimage.")
+    # Fail closed. The compliance-record payload is hashed only by the v1.20
+    # compliance.record hasher; anywhere else it would sit on the record
+    # unhashed.
+    if compliance_record is not None and (
+        schema_version != 'v1.20' or event_kind != EVENT_KIND_COMPLIANCE_RECORD
+    ):
+        raise ValueError(
+            f"compliance_record payload present on a {schema_version!r} "
+            f"{event_kind!r} event — it is hashed only in the v1.20 compliance.record bucket."
+        )
     # Fail closed. The receipt payload is hashed only by
     # the v1.15 decision.receipt hasher; anywhere else it would sit on the record
     # unhashed. A decider on a lapse (or none on a decision) is malformed.
@@ -3326,6 +3516,28 @@ def compute_event_hash_dispatch(
             total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
             cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
             coverage_key_inventory,
+        )
+    if schema_version == 'v1.20':
+        # v1.20 introduces exactly one new event class: compliance.record.
+        # Same kind-only gate posture as v1.8, v1.13 and v1.15.
+        if event_kind != EVENT_KIND_COMPLIANCE_RECORD:
+            raise ValueError(
+                f"schema_version v1.20 is defined only for "
+                f"compliance.record events; got event_kind {event_kind!r}"
+            )
+        if compliance_record is None:
+            raise ValueError("ComplianceRecord event missing compliance_record payload")
+        if any(p is not None for p in (auth_session, admin_action, mcp_event, coverage)):
+            raise ValueError(
+                "a v1.20 compliance.record event carries another kind's payload; "
+                "it would ride the record unhashed."
+            )
+        return compute_event_hash_v1_20_compliance_record(
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            compliance_record,
         )
     if schema_version == 'v1.15':
         # v1.15 introduces exactly one new event class:
@@ -4100,6 +4312,91 @@ def run_self_test():
         print('SELF-TEST assertion 16d FAIL: recompute_event_hash mis-handles v1.13 coverage.key_inventory', file=sys.stderr)
         print(f'  expected: {V1_13_COVERAGE_KEY_INVENTORY_FIXTURE_HASH} (misplaced payload rejected)', file=sys.stderr)
         print(f'  got:      {got_v113_loop} (misplaced rejected: {misplaced_rejected})', file=sys.stderr)
+        ok = False
+
+    # Assertion 37a — v1.20 compliance.record fixture (direct fn), paired
+    # with the Rust mei2728_v1_20_compliance_record_fixture_hash_pinned literal.
+    got_v120 = compute_event_hash_v1_20_compliance_record(
+        sequence_number=11, timestamp_utc='2026-10-31T12:00:00.000000+00:00',
+        event_id='evt-compliance-1', request_id='req_011CVfixture', model_requested='',
+        action='allow', input_tokens=0, output_tokens=0, total_tokens=None,
+        cache_creation_input_tokens=None, cache_read_input_tokens=None,
+        cached_input_tokens=None, reasoning_tokens=None, estimated_cost_usd=None,
+        previous_hash='b' * 64, record=_V1_20_COMPLIANCE_RECORD_FIXTURE_PAYLOAD,
+    )
+    if got_v120 == V1_20_COMPLIANCE_RECORD_FIXTURE_HASH:
+        print('SELF-TEST assertion 37a PASS: v1.20 compliance.record fixture hash matches')
+    else:
+        print('SELF-TEST assertion 37a FAIL: v1.20 compliance.record fixture drift', file=sys.stderr)
+        print(f'  expected: {V1_20_COMPLIANCE_RECORD_FIXTURE_HASH}', file=sys.stderr)
+        print(f'  got:      {got_v120}', file=sys.stderr)
+        ok = False
+
+    # Assertion 37b — a full v1.20 record through recompute_event_hash (the
+    # production path) with a Z-suffix timestamp, its stored record, file
+    # bytes and findings bound by their sealed digests; the checks pass on the
+    # intact record and catch an edited record, edited bytes, an edited
+    # finding and a dropped finding.
+    stored_record = {'metadata': {'id': 'claude_file_01', 'mime_type': 'application/pdf'},
+                     'content_base64': base64.b64encode(b'%PDF-1.4 synthetic').decode('ascii')}
+    stored_findings = [{'validator': 'pii-detection', 'severity': 'warning', 'code': 'pii-ssn',
+                        'category': 'pii', 'message': 'pii-ssn matched in a user text unit', 'latency_ms': 1}]
+    v120_payload = dict(
+        _V1_20_COMPLIANCE_RECORD_FIXTURE_PAYLOAD, api_surface='files', record_type='chat_file',
+        content_bytes=len(b'%PDF-1.4 synthetic'), content_sha256=hashlib.sha256(b'%PDF-1.4 synthetic').hexdigest(),
+        record_sha256=sha256_jcs(stored_record), findings_count=1,
+        findings_sha256=sha256_jcs(compliance_findings_projection(stored_findings)),
+    )
+    v120_event = dict(
+        schema_version='v1.20', event_kind='compliance_record',
+        timestamp_utc='2026-10-31T12:00:00.000000Z', event_id='evt-compliance-1',
+        request_id='req_011CVfixture', model_requested='', action='allow', input_tokens=0,
+        output_tokens=0, compliance_record=v120_payload, raw_response=stored_record,
+        findings=stored_findings,
+    )
+    direct = compute_event_hash_v1_20_compliance_record(
+        sequence_number=11, timestamp_utc='2026-10-31T12:00:00.000000+00:00',
+        event_id='evt-compliance-1', request_id='req_011CVfixture', model_requested='',
+        action='allow', input_tokens=0, output_tokens=0, total_tokens=None,
+        cache_creation_input_tokens=None, cache_read_input_tokens=None,
+        cached_input_tokens=None, reasoning_tokens=None, estimated_cost_usd=None,
+        previous_hash='b' * 64, record=v120_payload,
+    )
+    edited_record = dict(v120_event, raw_response=dict(stored_record, metadata={'id': 'other'}))
+    edited_bytes = dict(v120_event, raw_response=dict(
+        stored_record, content_base64=base64.b64encode(b'other').decode('ascii')))
+    edited_finding = dict(v120_event, findings=[dict(stored_findings[0], code='pii-email')])
+    dropped_finding = dict(v120_event, findings=[])
+    caught = [bool(check_compliance_record(e)) for e in (edited_record, edited_bytes, edited_finding, dropped_finding)]
+    stripped_ok = not check_compliance_record(dict(v120_event, raw_response=None), frozenset({'raw_response'}))
+    if (recompute_event_hash(v120_event, 11, 'b' * 64) == direct and not check_compliance_record(v120_event)
+            and all(caught) and stripped_ok):
+        print('SELF-TEST assertion 37b PASS: v1.20 compliance.record recomputes, and its stored digests are checked')
+    else:
+        print(f'SELF-TEST assertion 37b FAIL: problems {check_compliance_record(v120_event)}, '
+              f'caught {caught}, stripped_ok {stripped_ok}', file=sys.stderr)
+        ok = False
+
+    # Assertion 37c — the fail-closed invariants: the payload on any other
+    # version or kind, v1.20 on another kind, and v1.20 without a payload are
+    # refused by the dispatcher.
+    rejected = 0
+    base_args = (11, '2026-10-31T12:00:00+00:00', 'e', 'r', '', 'allow', 0, 0,
+                 None, None, None, None, None, None, 'b' * 64)
+    for version, kind, payload in (
+        ('v1.15', EVENT_KIND_COMPLIANCE_RECORD, _V1_20_COMPLIANCE_RECORD_FIXTURE_PAYLOAD),
+        ('v1.20', EVENT_KIND_LLM_REQUEST, _V1_20_COMPLIANCE_RECORD_FIXTURE_PAYLOAD),
+        ('v1.20', EVENT_KIND_LLM_REQUEST, None),
+        ('v1.20', EVENT_KIND_COMPLIANCE_RECORD, None),
+    ):
+        try:
+            compute_event_hash_dispatch(version, *base_args, event_kind=kind, compliance_record=payload)
+        except ValueError:
+            rejected += 1
+    if rejected == 4:
+        print('SELF-TEST assertion 37c PASS: misplaced or missing compliance payloads are refused')
+    else:
+        print(f'SELF-TEST assertion 37c FAIL: only {rejected} of 4 refused', file=sys.stderr)
         ok = False
 
     # Assertion 28a — v1.15 decision.receipt fixture (direct fn),
@@ -5206,6 +5503,18 @@ _V1_16_FIXTURE_ARGS = (
 V1_16_LLM_REQUEST_FIXTURE_HASH = "985cec7081f7c4efab7a745fba9f3aa73e68ea1f9b3f42dc8a51cc38359173cc"
 V1_16_LLM_REQUEST_BARE_FIXTURE_HASH = "254d2401a772b260d64d6fd843b17f0c0147b3306f57af6a35d25ae3c4115bef"
 
+V1_20_COMPLIANCE_RECORD_FIXTURE_HASH = "8b0c867e23803c4634117763417bcb706feedd4bf4fdfb9cd1647f40122b2ece"
+_V1_20_COMPLIANCE_RECORD_FIXTURE_PAYLOAD = dict(
+    vendor='anthropic', api_surface='activities', record_type='activity', outcome='retrieved',
+    external_id='activity_01DeFgHjKmNpQrStUvWxYzAb', parent_id=None,
+    external_type='claude_chat_created', external_created_at='2026-04-10T08:09:10Z',
+    external_updated_at=None, organization_uuid='abcdef01-2345-6789-abcd-ef0123456789',
+    actor_type='user_actor', actor_id='user_01TuVwXyZaBcDeFgH2JkLmN4', error_class=None,
+    http_status=200, vendor_request_id='req_011CVfixture', cursor_before=None, cursor_after=None,
+    item_count=1, content_bytes=0, content_sha256=None, record_sha256='1' * 64,
+    scan_status='no_text', findings_count=0, findings_sha256='2' * 64, fetched_at=1791000000,
+)
+
 V1_15_DECISION_RECEIPT_FIXTURE_HASH = "4e93ecd462a3acd7a0a73e1fe98317a35fe0da3c1876e8389d4b63c668450682"
 _V1_15_DECISION_RECEIPT_FIXTURE_EVIDENCE = [
     {"chain_id": "chain-1", "content_digests": {"payload_sha256_jcs": "c" * 64}, "event_hash": "1" * 64,
@@ -5628,6 +5937,7 @@ def recompute_event_hash(event, seq, previous_hash):
         customer=event.get('customer'),
         policy_version=event.get('policy_version'),
         model_executed=event.get('model_executed'),
+        compliance_record=event.get('compliance_record'),
     )
 
 
@@ -6469,6 +6779,12 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
         # and its sealed clock verdict; this checks the stored list and the
         # arithmetic still match them.
         for problem in check_decision_receipt(event):
+            report(f"FAIL seq={seq}: {problem}")
+            all_passed = False
+            content_ok = False
+        # A v1.20 record's hash covers the digests of the record it stores,
+        # its findings and its file bytes; this checks they still match.
+        for problem in check_compliance_record(event, stripped):
             report(f"FAIL seq={seq}: {problem}")
             all_passed = False
             content_ok = False
@@ -7709,21 +8025,28 @@ PASSED = "passed"
 FAILED = "failed"
 UNSIGNED = "unsigned"
 CANNOT_EVALUATE = "cannot evaluate"
+# Every record verified; a verified anchor shows the chain went on past a
+# pack that claims the whole chain up to its head (exit 4).
+COVERAGE_NOT_ESTABLISHED = "coverage not established"
 
 
 def final_exit_code(chain_status, signature_status, allow_unsigned):
     """The overall verdict, the same in --bucket and --records mode.
 
-    `chain_status` is PASSED, FAILED or CANNOT_EVALUATE; `signature_status`
-    is PASSED, FAILED, UNSIGNED or CANNOT_EVALUATE. Precedence: a failure of
-    either check (EXIT_FAIL) outranks a check that could not be evaluated
-    (EXIT_CANNOT_EVALUATE), which outranks a pack with no signature
-    (EXIT_UNSIGNED). An unsigned pack whose chain verifies exits 0 only when
-    the caller accepts unsigned packs with --allow-unsigned."""
+    `chain_status` is PASSED, FAILED, CANNOT_EVALUATE or
+    COVERAGE_NOT_ESTABLISHED; `signature_status` is PASSED, FAILED, UNSIGNED
+    or CANNOT_EVALUATE. Precedence: a failure of either check (EXIT_FAIL)
+    outranks a check that could not be evaluated (EXIT_CANNOT_EVALUATE),
+    which outranks coverage not established (EXIT_COVERAGE_NOT_ESTABLISHED),
+    which outranks a pack with no signature (EXIT_UNSIGNED). An unsigned pack
+    whose chain verifies exits 0 only when the caller accepts unsigned packs
+    with --allow-unsigned; that flag never excuses coverage."""
     if FAILED in (chain_status, signature_status):
         return EXIT_FAIL
     if CANNOT_EVALUATE in (chain_status, signature_status):
         return EXIT_CANNOT_EVALUATE
+    if chain_status == COVERAGE_NOT_ESTABLISHED:
+        return EXIT_COVERAGE_NOT_ESTABLISHED
     if signature_status == UNSIGNED and not allow_unsigned:
         return EXIT_UNSIGNED
     return EXIT_OK
@@ -8800,6 +9123,49 @@ def _verify_one_anchor(seq, chain, source, record_fetch, roots_for, listed_token
     return min(gen_times), witnesses
 
 
+def _anchor_past_the_pack(seq, chain, source, roots_for, verify_token=None):
+    """For a local-chain pack: is the anchor object stored for `seq`, a
+    sequence after the pack's last record, evidence that the chain reached
+    `seq`? The record it anchors is not in the pack, so only the statement
+    and its tokens are judged. Returns one of
+    ("verified", witnesses), ("cannot", reason), ("not_evidence", reason).
+    One verified token is enough: it shows the head existed."""
+    verify_token = verify_token or verify_tsa_token
+    raw = source.get(f"{seq:020d}.json")
+    if raw is None:
+        return "not_evidence", "no statement object"
+    try:
+        statement = parse_anchor_statement(raw)
+    except AnchorFailure as exc:
+        return "not_evidence", f"statement: {exc}"
+    if not any(h["chain"] == chain and h["seq"] == seq for h in statement["heads"]):
+        return "not_evidence", f"statement does not name chain {chain} at this sequence"
+    imprint = anchor_imprint(raw)
+    tsa_ids = sorted({m.group(2) for m in map(_ANCHOR_TOKEN_NAME.fullmatch, source.list_names())
+                      if m and int(m.group(1)) == seq})
+    if not tsa_ids:
+        return "not_evidence", "no witness token"
+    verified, cannot, refused = [], [], []
+    for tsa_id in tsa_ids:
+        token = source.get(f"{seq:020d}.{tsa_id}.tsr")
+        roots = roots_for(tsa_id)
+        if token is None:
+            refused.append(f"{tsa_id}: token object is missing")
+        elif roots is None:
+            cannot.append(f"no trust root for witness {tsa_id}; pass --tsa-root {tsa_id}=FILE")
+        else:
+            try:
+                result = verify_token(token, imprint, roots)
+                verified.append(f"{tsa_id} {_iso(result['gen_time'])}")
+            except AnchorFailure as exc:
+                (cannot if exc.code == "malformed" else refused).append(f"{tsa_id}: {exc}")
+    if verified:
+        return "verified", "; ".join(verified)
+    if cannot:
+        return "cannot", "; ".join(cannot)
+    return "not_evidence", "; ".join(refused)
+
+
 def supplied_root_notice(tsa_id, root):
     return (f"NOTICE: anchor tokens from witness {tsa_id} verified through a root supplied with --tsa-root, "
             f"not one pinned in this verifier: {root.name} SHA-256 {root.fingerprint}. Trusting it was "
@@ -8903,17 +9269,21 @@ def verify_anchors(manifest, record_fetch, source, roots_for, record_times=None)
         return CANNOT_EVALUATE
     try:
         return _verify_listed_and_found(anchoring, entry, listed, seals, (lo, hi), record_fetch, source,
-                                        roots_for, check, record_times or {}, frozenset(manifest_stubs(manifest)))
+                                        roots_for, check, record_times or {}, frozenset(manifest_stubs(manifest)),
+                                        claim_scope(manifest) == CLAIM_CHAIN_TO_HEAD)
     except OSError as exc:
         print(f"ERROR: cannot read the anchor objects ({exc})", file=sys.stderr)
         return CANNOT_EVALUATE
 
 
 def _verify_listed_and_found(anchoring, entry, listed, seals, window, record_fetch, source, roots_for, check,
-                             record_times, stubs=frozenset()):
+                             record_times, stubs=frozenset(), to_head=False):
     chain, reason = entry["chain"], entry["reason"]
     lo, hi = window
     covered = []
+    # Verified anchors after a chain_to_head claim: the chain went on past
+    # what the pack holds.
+    beyond = []
     covering = []
     listed_seqs = set()
     for a in listed:
@@ -8942,6 +9312,25 @@ def _verify_listed_and_found(anchoring, entry, listed, seals, window, record_fet
             if m:
                 discovered.add(int(m.group(1)))
         for seq in sorted(discovered - listed_seqs):
+            if to_head and seq > hi:
+                # The pack claims the whole chain up to its head at hi. A
+                # verified anchor past it is evidence of records beyond the
+                # claim: coverage, never tampering.
+                verdict, detail = _anchor_past_the_pack(seq, chain, source, roots_for)
+                if verdict == "verified":
+                    beyond.append(seq)
+                    print(
+                        f"COVERAGE anchor seq={seq}: a verified anchor ({detail}) names chain {chain} at "
+                        f"seq={seq}, after this pack's last record seq={hi}; the pack claims the chain only up to "
+                        f"seq={hi}")
+                elif verdict == "cannot":
+                    check.cannot_evaluate(
+                        f"ERROR: anchor seq={seq} is after this pack's last record seq={hi} and could not be "
+                        f"evaluated ({detail}); whether history is missing is not known")
+                else:
+                    print(f"NOTICE anchor seq={seq}: after this pack's last record seq={hi}, and not evidence "
+                          f"of a later chain head ({detail})")
+                continue
             if not lo <= seq <= hi:
                 outside += 1
                 continue
@@ -9022,7 +9411,141 @@ def _verify_listed_and_found(anchoring, entry, listed, seals, window, record_fet
         if seal_notes:
             line += "; " + "; ".join(seal_notes)
     print(line)
+    if beyond:
+        print(f"COVERAGE NOT ESTABLISHED through seq={max(beyond)}: every anchor this pack holds verified, but it "
+              f"claims chain {chain} only up to its head at seq={hi}, and a timestamp authority saw the chain at "
+              f"seq={max(beyond)}. The pack was built before that head, or records after seq={hi} were removed, "
+              f"or the anchor names another gateway's chain of the same name; nothing in the pack can say which. "
+              f"Get a pack that runs through seq={max(beyond)}.")
+        return COVERAGE_NOT_ESTABLISHED
     return PASSED
+
+
+def manifest_claim(manifest):
+    """(scope, from_sequence, to_sequence, stated) the pack claims. A
+    manifest without `claim` predates it: it is read as chain_to_head when
+    it carries the local-chain class and as interval otherwise, with stated
+    False. Raises ValueError for a claim this verifier cannot read and
+    ClaimContradiction for one that disagrees with the manifest."""
+    lo, hi = manifest.get("from_sequence"), manifest.get("to_sequence")
+    claim = manifest.get("claim")
+    if claim is None:
+        scope = CLAIM_CHAIN_TO_HEAD if manifest.get("evidence_class") == LOCAL_CHAIN_EVIDENCE_CLASS else CLAIM_INTERVAL
+        return scope, lo, hi, False
+    if not isinstance(claim, dict) or set(claim) != {"scope", "from_sequence", "to_sequence"}:
+        raise ValueError("manifest claim must carry exactly scope, from_sequence, to_sequence")
+    scope, c_lo, c_hi = claim["scope"], claim["from_sequence"], claim["to_sequence"]
+    if scope not in CLAIM_SCOPES:
+        raise ValueError(f"manifest claim scope {scope!r} is not one this verifier reads "
+                         f"({', '.join(CLAIM_SCOPES)}). Re-run with an updated verifier.")
+    if not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in (c_lo, c_hi)):
+        raise ValueError("manifest claim bounds must be non-negative integers")
+    if (c_lo, c_hi) != (lo, hi):
+        raise ClaimContradiction(f"the manifest claims seq={c_lo}..{c_hi} but covers seq={lo}..{hi}")
+    if scope == CLAIM_CHAIN_TO_HEAD and c_lo != 0:
+        raise ClaimContradiction(f"the manifest claims the whole chain up to its head but starts at seq={c_lo}")
+    if scope != CLAIM_CHAIN_TO_HEAD and manifest.get("evidence_class") == LOCAL_CHAIN_EVIDENCE_CLASS:
+        # A local-chain pack is only ever built from 0 to the head its
+        # gateway held. Relabelling it a window would stop a later anchor
+        # from being judged.
+        raise ClaimContradiction(f"a {LOCAL_CHAIN_EVIDENCE_CLASS} pack claims {scope!r}; such a pack is built "
+                                 f"from seq=0 to its head and claims {CLAIM_CHAIN_TO_HEAD!r}")
+    return scope, c_lo, c_hi, True
+
+
+class ClaimContradiction(Exception):
+    """A manifest claim that disagrees with the manifest itself."""
+
+
+def claim_scope(manifest):
+    """The scope anchors are judged against; interval when the claim cannot
+    be read (check_claim has already made that a non-success)."""
+    try:
+        return manifest_claim(manifest)[0]
+    except (ValueError, ClaimContradiction):
+        return CLAIM_INTERVAL
+
+
+def check_claim(manifest):
+    """Print what the pack claims and return PASSED, FAILED (the claim
+    contradicts the manifest) or CANNOT_EVALUATE (a claim this verifier
+    cannot read)."""
+    chain = chain_for_prefix(manifest.get("prefix", "audit/")) or manifest.get("prefix", "")
+    try:
+        scope, lo, hi, stated = manifest_claim(manifest)
+    except ClaimContradiction as exc:
+        print(f"FAIL claim: {exc}")
+        return FAILED
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return CANNOT_EVALUATE
+    note = "" if stated else " (the manifest predates claims; read from its evidence class)"
+    if scope == CLAIM_CHAIN_TO_HEAD:
+        print(f"CLAIM: the whole chain {chain} from seq=0 up to its head at seq={hi}{note}")
+    else:
+        print(f"CLAIM: chain {chain}, seq={lo}..{hi}, one window of the chain; records outside it are not "
+              f"claimed{note}")
+    return PASSED
+
+
+def required_coverage_status(manifest, require_through):
+    """--require-through: the reader's own expectation of how far the pack
+    reaches, independent of the manifest's (possibly unsigned) claim. A pack
+    that stops before it is COVERAGE_NOT_ESTABLISHED; None when not asked."""
+    if require_through is None:
+        return PASSED
+    hi = manifest.get("to_sequence")
+    if isinstance(hi, int) and not isinstance(hi, bool) and hi >= require_through:
+        print(f"COVERAGE: the pack reaches seq={hi}, at or after the required seq={require_through}")
+        return PASSED
+    print(f"COVERAGE NOT ESTABLISHED through seq={require_through}: the pack's last record is seq={hi}, "
+          f"before the sequence you required (--require-through)")
+    return COVERAGE_NOT_ESTABLISHED
+
+
+def evidence_mode_findings(manifest, records):
+    """Check the manifest's `evidence_modes` against the evidence_mode_resolved
+    seals among the pack's records (`records`: seq -> parsed record) and print
+    each mode and every change of mode. Returns (status, lines): FAILED when the
+    list disagrees with the seals, else PASSED. A manifest without the key
+    predates it; the seals are printed from the records alone."""
+    seals = []
+    for seq in sorted(records):
+        event = records[seq]
+        admin = event.get("admin_action") if isinstance(event, dict) else None
+        if (event.get("event_kind") != "admin_action" or not isinstance(admin, dict)
+                or admin.get("action_type") != ACTION_EVIDENCE_MODE_RESOLVED):
+            continue
+        try:
+            meta = json.loads(admin.get("metadata_json") or "{}")
+        except ValueError:
+            meta = {}
+        meta = meta if isinstance(meta, dict) else {}
+        seals.append({"sequence": seq, "mode": str(meta.get("mode", "")), "source": str(meta.get("source", ""))})
+    lines, failures = [], []
+    if "evidence_modes" in manifest:
+        index = manifest["evidence_modes"]
+        if not isinstance(index, list) or not all(isinstance(e, dict) and set(e) == set(EVIDENCE_MODE_INDEX_FIELDS)
+                                                   for e in index):
+            failures.append("manifest evidence_modes must be a list of {sequence, mode, source}")
+        elif index != seals:
+            listed = ", ".join(f"seq={e['sequence']} {e['mode']}" for e in index) or "none"
+            found = ", ".join(f"seq={e['sequence']} {e['mode']}" for e in seals) or "none"
+            failures.append(f"manifest evidence_modes ({listed}) disagrees with the evidence-mode seals in the "
+                            f"pack's records ({found})")
+    previous = None
+    for seal in seals:
+        if previous is not None and previous["mode"] != seal["mode"]:
+            lines.append(f"EVIDENCE MODE CHANGED at seq={seal['sequence']}: {previous['mode']} -> {seal['mode']} "
+                         f"({seal['source']})")
+        else:
+            lines.append(f"EVIDENCE MODE seq={seal['sequence']}: {seal['mode']} ({seal['source']})")
+        previous = seal
+    if not seals:
+        lines.append("EVIDENCE MODE: no evidence-mode seal among this pack's records")
+    if failures:
+        return FAILED, [f"FAIL evidence_modes: {f}" for f in failures]
+    return PASSED, lines
 
 
 def _seal_note(action_type, seq):
@@ -9201,11 +9724,14 @@ def load_tsa_roots(specs):
 
 def combine_with_anchor_status(chain_status, anchor_status):
     """Fold the anchor verdict into the chain verdict: a failure of either is
-    a failure; otherwise a check that could not be evaluated wins."""
+    a failure; otherwise a check that could not be evaluated wins; otherwise
+    coverage not established wins over a pass."""
     if FAILED in (chain_status, anchor_status):
         return FAILED
     if CANNOT_EVALUATE in (chain_status, anchor_status):
         return CANNOT_EVALUATE
+    if COVERAGE_NOT_ESTABLISHED in (chain_status, anchor_status):
+        return COVERAGE_NOT_ESTABLISHED
     return chain_status
 
 
@@ -11905,9 +12431,20 @@ def signature_self_test():
         ((PASSED, UNSIGNED, False), EXIT_UNSIGNED),
         ((PASSED, UNSIGNED, True), EXIT_OK),
         ((FAILED, UNSIGNED, True), EXIT_FAIL),
+        ((COVERAGE_NOT_ESTABLISHED, PASSED, False), EXIT_COVERAGE_NOT_ESTABLISHED),
+        ((COVERAGE_NOT_ESTABLISHED, UNSIGNED, False), EXIT_COVERAGE_NOT_ESTABLISHED),
+        ((COVERAGE_NOT_ESTABLISHED, UNSIGNED, True), EXIT_COVERAGE_NOT_ESTABLISHED),
+        ((COVERAGE_NOT_ESTABLISHED, CANNOT_EVALUATE, True), EXIT_CANNOT_EVALUATE),
+        ((COVERAGE_NOT_ESTABLISHED, FAILED, True), EXIT_FAIL),
     ]
-    check("20q", all(final_exit_code(*args) == want for args, want in table),
-          "exit codes: failure 1 outranks cannot-evaluate 2 outranks unsigned 3; unsigned is 0 only with --allow-unsigned")
+    ranks = [_exit_code_rank(c) for c in (EXIT_FAIL, EXIT_CANNOT_EVALUATE, EXIT_COVERAGE_NOT_ESTABLISHED,
+                                          EXIT_UNSIGNED, EXIT_OK)]
+    check("20q", all(final_exit_code(*args) == want for args, want in table) and ranks == sorted(ranks, reverse=True)
+          and combine_with_anchor_status(PASSED, COVERAGE_NOT_ESTABLISHED) == COVERAGE_NOT_ESTABLISHED
+          and combine_with_anchor_status(FAILED, COVERAGE_NOT_ESTABLISHED) == FAILED
+          and len({EXIT_OK, EXIT_FAIL, EXIT_CANNOT_EVALUATE, EXIT_UNSIGNED, EXIT_COVERAGE_NOT_ESTABLISHED}) == 5,
+          "exit codes: failure 1 outranks cannot-evaluate 2 outranks coverage-not-established 4 outranks unsigned 3; "
+          "unsigned is 0 only with --allow-unsigned, which never excuses coverage; coverage shares no code")
 
     # 20r: the downgrade, end to end at the command line in --records mode.
     # A signed pack stripped of its bundle and relabelled window A verifies
@@ -12448,6 +12985,101 @@ def anchor_self_test():
         check("25t", status == FAILED and "anchoring summary does not match" in output,
               "a manifest claiming coverage that no anchor provides fails", output)
 
+        # 25y-25z: a local-chain pack and an anchor past its last record. The
+        # pack holds records 0..1; the anchor objects for seq 2 are supplied.
+        truncated = dict(manifest_with({"state": "unanchored", "chains": [dict(
+            unanchored["chains"][0], unanchored_tail={"from_seq": 0, "to_seq": 1})]}), to_sequence=1)
+        truncated["events"] = truncated["events"][:2]
+        source = DirectoryAnchorSource(anchors_dir)
+        stub_ok = lambda token, imprint, trust: {"gen_time": 1767225605}  # noqa: E731
+        past = (
+            _anchor_past_the_pack(2, "self-test", source, roots.get, verify_token=stub_ok),
+            _anchor_past_the_pack(2, "self-test", source, roots.get),
+            _anchor_past_the_pack(2, "another-chain", source, roots.get, verify_token=stub_ok),
+            _anchor_past_the_pack(2, "self-test", source, lambda tsa_id: None, verify_token=stub_ok),
+        )
+        check("25y", [p[0] for p in past] == ["verified", "cannot", "not_evidence", "cannot"],
+              "an anchor past a pack's last record is evidence of a later head only when a token verifies over "
+              "a statement naming this chain there; an unparseable token or a missing root cannot be evaluated",
+              repr(past))
+        status, output = run(truncated)
+        labelled = dict(truncated, schema_version="1.4", evidence_class=LOCAL_CHAIN_EVIDENCE_CLASS)
+        local_status, local_output = run(labelled)
+        check("25z", status == PASSED and "1 anchor(s) outside this pack's window 0..1 were not judged" in output
+              and local_status == CANNOT_EVALUATE and "after this pack's last record seq=1" in local_output
+              and manifest_evidence_class_error(labelled) is None
+              and "local-chain-evidence-v1" in VERIFIER_CAPABILITIES,
+              "an anchor past the last record is a notice on an unlabelled pack and is judged on a "
+              "local-chain pack (here it cannot be evaluated: the token does not parse)",
+              output + local_output)
+
+        # 25aa: the claim decides whether an anchor past the last record is
+        # judged. The same truncated window, stated as an interval: a notice;
+        # stated as the chain up to its head: judged.
+        interval = dict(truncated, claim={"scope": CLAIM_INTERVAL, "from_sequence": 0, "to_sequence": 1})
+        to_head = dict(truncated, claim={"scope": CLAIM_CHAIN_TO_HEAD, "from_sequence": 0, "to_sequence": 1})
+        interval_status, interval_output = run(interval)
+        head_status, head_output = run(to_head)
+        check("25aa", interval_status == PASSED and "were not judged" in interval_output
+              and head_status == CANNOT_EVALUATE and "after this pack's last record seq=1" in head_output,
+              "an anchor past an interval claim is not judged; past a chain_to_head claim it is",
+              interval_output + head_output)
+
+    # 25ab: reading the claim. Stated, inferred from the evidence class,
+    # contradicted by the manifest (a failure), or unreadable (exit 2).
+    base = {"prefix": "audit/self-test/", "from_sequence": 0, "to_sequence": 9}
+    local = dict(base, evidence_class=LOCAL_CHAIN_EVIDENCE_CLASS)
+
+    def claim_outcome(manifest):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            return check_claim(manifest), out.getvalue()
+
+    def claim_quiet(fn, *args):
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            return fn(*args)
+
+    stated = dict(base, claim={"scope": CLAIM_CHAIN_TO_HEAD, "from_sequence": 0, "to_sequence": 9})
+    outcomes = [
+        manifest_claim(local), manifest_claim(base), manifest_claim(stated),
+        claim_outcome(dict(base, claim={"scope": CLAIM_INTERVAL, "from_sequence": 0, "to_sequence": 8}))[0],
+        claim_outcome(dict(base, from_sequence=3,
+                           claim={"scope": CLAIM_CHAIN_TO_HEAD, "from_sequence": 3, "to_sequence": 9}))[0],
+        claim_outcome(dict(base, claim={"scope": "everything", "from_sequence": 0, "to_sequence": 9}))[0],
+        claim_outcome(dict(base, claim={"scope": CLAIM_INTERVAL, "from_sequence": 0}))[0],
+        claim_outcome(stated),
+    ]
+    check("25ab", outcomes[0] == (CLAIM_CHAIN_TO_HEAD, 0, 9, False) and outcomes[1] == (CLAIM_INTERVAL, 0, 9, False)
+          and outcomes[2] == (CLAIM_CHAIN_TO_HEAD, 0, 9, True)
+          and outcomes[3:7] == [FAILED, FAILED, CANNOT_EVALUATE, CANNOT_EVALUATE]
+          and outcomes[7][0] == PASSED and "the whole chain self-test from seq=0 up to its head at seq=9" in outcomes[7][1]
+          and claim_outcome(dict(local, claim={"scope": CLAIM_INTERVAL, "from_sequence": 0, "to_sequence": 9}))[0]
+          == FAILED
+          and [claim_quiet(required_coverage_status, base, n) for n in (None, 9, 10)]
+          == [PASSED, PASSED, COVERAGE_NOT_ESTABLISHED]
+          and {"coverage-claim-v1", "evidence-modes-v1"} <= VERIFIER_CAPABILITIES,
+          "a claim is read as stated or inferred from the evidence class; one that contradicts the manifest fails; "
+          "an unknown scope or a malformed claim cannot be evaluated", repr(outcomes))
+
+    # 25ac: the evidence-mode index against the seals in the records.
+    def mode_seal(seq, mode, source):
+        return {"event_kind": "admin_action", "admin_action": {
+            "action_type": ACTION_EVIDENCE_MODE_RESOLVED, "actor": "system:self-test", "description": "",
+            "metadata_json": json.dumps({"mode": mode, "source": source, "write_once_confirmed": mode == "write_once"})}}
+    records_by_seq = {0: mode_seal(0, "write_once", "derived"), 1: {"event_kind": "llm_request"},
+                      2: mode_seal(2, "local_chain", "configured")}
+    index = [{"sequence": 0, "mode": "write_once", "source": "derived"},
+             {"sequence": 2, "mode": "local_chain", "source": "configured"}]
+    matched = evidence_mode_findings({"evidence_modes": index}, records_by_seq)
+    missing = evidence_mode_findings({"evidence_modes": index[:1]}, records_by_seq)
+    absent = evidence_mode_findings({}, records_by_seq)
+    none = evidence_mode_findings({}, {1: {"event_kind": "llm_request"}})
+    check("25ac", matched[0] == PASSED and "EVIDENCE MODE CHANGED at seq=2: write_once -> local_chain (configured)"
+          in matched[1] and missing[0] == FAILED and absent == matched
+          and none == (PASSED, ["EVIDENCE MODE: no evidence-mode seal among this pack's records"]),
+          "the evidence-mode index must equal the seals in the records; each mode and every change is printed",
+          repr((matched, missing, absent, none)))
+
     # 25w: the clock check covers every anchored record, each against the
     # earliest anchor at or after it. Anchors at 2 (genTime 100) and 5
     # (genTime 50, an earlier token on a later head): records 0-5 all compare
@@ -12768,7 +13400,7 @@ def verify_ocsf_export(entries, pack_chain, pack_records, public_point=None, qui
 
 
 def _exit_code_rank(code):
-    return {EXIT_FAIL: 3, EXIT_CANNOT_EVALUATE: 2, EXIT_UNSIGNED: 1, EXIT_OK: 0}[code]
+    return {EXIT_FAIL: 4, EXIT_CANNOT_EVALUATE: 3, EXIT_COVERAGE_NOT_ESTABLISHED: 2, EXIT_UNSIGNED: 1, EXIT_OK: 0}[code]
 
 
 def _ec_mul(c, k, point):
@@ -13269,6 +13901,17 @@ def main():
         ),
     )
     parser.add_argument(
+        '--require-through',
+        type=int,
+        default=None,
+        metavar='SEQ',
+        help=(
+            'The sequence you expect the pack to reach, from a source other than the pack (for example the '
+            'chain head the gateway reported to its control plane). A pack whose last record is before SEQ '
+            f'exits {EXIT_COVERAGE_NOT_ESTABLISHED} (coverage not established), whatever its manifest claims.'
+        ),
+    )
+    parser.add_argument(
         '--allow-unsigned',
         action='store_true',
         help=(
@@ -13306,6 +13949,8 @@ def main():
         parser.error("--conditions-sha256 must be 64 lowercase hex characters")
     if args.conditions_acceptance and args.conditions_sha256 is None:
         parser.error("--conditions-acceptance needs --conditions-sha256")
+    if args.require_through is not None and args.require_through < 0:
+        parser.error("--require-through must be a sequence number (0 or more)")
     supplied_acceptance = None
     if args.conditions_acceptance:
         try:
@@ -13340,6 +13985,9 @@ def main():
         sys.exit(EXIT_CANNOT_EVALUATE)
     if evidence_class_suffix(manifest):
         print(f"EVIDENCE CLASS: {manifest['evidence_class']} ({EVIDENCE_CLASSES[manifest['evidence_class']]}).")
+    # What the pack claims to hold; anchors are judged against it.
+    claim_status = check_claim(manifest)
+    claim_status = combine_with_anchor_status(claim_status, required_coverage_status(manifest, args.require_through))
     # A stripped Exchange pack says so before the records and on
     # every verdict line, and is verified from its own records only.
     label = evidence_class_suffix(manifest) + content_suffix(manifest)
@@ -13425,6 +14073,11 @@ def main():
             passed = verify_control_plane_section(manifest, receipts, control_plane_fetch,
                                                   records_out=control_plane_records) and passed
         chain_status = PASSED if passed else FAILED
+        # The evidence mode at each boot in the pack, and every change.
+        mode_status, mode_lines = evidence_mode_findings(manifest, pack_full_records)
+        for line in mode_lines:
+            print(line)
+        chain_status = combine_with_anchor_status(chain_status, mode_status)
         # A record that contradicts the signed content claim makes
         # the pack one this verifier cannot evaluate as what it says it is.
         if stripped_problems and chain_status == PASSED:
@@ -13435,10 +14088,11 @@ def main():
     # The verdict counts the hash-only stubs it linked through.
     stub_count = len(manifest_stubs(manifest))
     stubbed = (f", {stub_count} of them as hash-only stubs (linked, hash not recomputed)" if stub_count else "")
-    code = final_exit_code(combine_with_anchor_status(chain_status, anchor_status), signature_status,
-                           bool(args.allow_unsigned))
+    code = final_exit_code(combine_with_anchor_status(combine_with_anchor_status(chain_status, claim_status),
+                                                      anchor_status),
+                           signature_status, bool(args.allow_unsigned))
     # The OCSF export beside the pack. Its verdict
-    # combines with the pack's by the same precedence (1 > 2 > 3 > 0).
+    # combines with the pack's by the same precedence (1 > 2 > 4 > 3 > 0).
     if args.ocsf_export:
         print()
         export_code = EXIT_CANNOT_EVALUATE
@@ -13492,6 +14146,8 @@ def main():
             print(f"\nFAIL: one or more events failed verification.{label}", file=sys.stderr)
         if anchor_status == FAILED:
             print(f"\nFAIL: chain-head anchor verification failed (see above).{label}", file=sys.stderr)
+        if claim_status == FAILED:
+            print(f"\nFAIL: the manifest's claim contradicts the manifest (see above).{label}", file=sys.stderr)
         if signature_status == FAILED:
             print(f"\nFAIL: the manifest signature did not verify (see above).{label}", file=sys.stderr)
     elif code == EXIT_CANNOT_EVALUATE and conditions_status == CANNOT_EVALUATE and chain_status != CANNOT_EVALUATE:
@@ -13500,6 +14156,12 @@ def main():
     elif code == EXIT_CANNOT_EVALUATE:
         print(f"\nCANNOT EVALUATE: this verifier does not support part of this pack (see above).{label}",
               file=sys.stderr)
+    elif code == EXIT_COVERAGE_NOT_ESTABLISHED:
+        if signature_status != PASSED:
+            print(f"\n{UNSIGNED_NOTICE}")
+        print(f"\nINTEGRITY OK, COVERAGE NOT ESTABLISHED: all {count} events verified{stubbed}, but a verified "
+              f"anchor shows the chain went on past the head this pack claims (see above). This is not a "
+              f"tampering verdict.{label}", file=sys.stderr)
     elif signature_status == PASSED:
         print(f"\nOK: all {count} events verified{stubbed}, and the manifest signature verified.{label}")
     else:
