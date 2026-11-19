@@ -23,6 +23,13 @@ Where the records come from:
 - The evidence-mode cases are a new chain sealed with this verifier's own
   hash functions, as fixtures/generate.py does, holding two gateway boots:
   one in write_once mode and one in local_chain mode.
+- The judgment-verdict cases are another such chain: two model requests and
+  three v1.21 verdict receipts, each linked to the request it judged (a
+  scored FLAG whose judged record is uploaded under another id, a scored
+  PASS whose judged record is not uploaded, and a pack_unavailable verdict
+  that names no pack version). Each receipt stores its uploaded form, the
+  receipt without the judge's reason and spans, and its local part, the
+  reason and spans, in the shape the proxy writes them.
 
 The cases (each case's expect.json lists its runs):
 
@@ -34,6 +41,13 @@ The cases (each case's expect.json lists its runs):
   evidence-modes-doctored
                       the same records, the manifest's list of modes
                       missing the change                               exit 1
+  judgment-verdicts   two requests and three verdict receipts          exit 0 / 3
+  judgment-verdicts-edited
+                      the same records, one receipt's uploaded form
+                      and another's reason edited after sealing        exit 1
+  judgment-verdicts-relinked
+                      a receipt sealed with a link to another record
+                      than the one at the sequence it names            exit 1
 
 Everything is synthetic: fixed timestamps and ids, no real content.
 """
@@ -230,14 +244,13 @@ def mode_chain():
     return genesis, records
 
 
-def mode_cases(root):
-    genesis, records = mode_chain()
+def unanchored_base(genesis, records, pack_id, generated_at):
+    """The manifest of an unanchored pack holding `records`, before
+    `local_manifest` relabels it."""
     head = records[-1]["sequence_number"]
-    modes = [{"sequence": 1, "mode": "write_once", "source": "derived"},
-             {"sequence": 4, "mode": "local_chain", "source": "configured"}]
-    base = {
-        "schema_version": "1.4", "pack_id": "00000000-0000-4000-8000-0000000e0f00", "window": "A",
-        "signing_deferred": True, "generated_at": "2026-11-02T10:00:00Z", "generator_version": "fixture",
+    return {
+        "schema_version": "1.4", "pack_id": pack_id, "window": "A",
+        "signing_deferred": True, "generated_at": generated_at, "generator_version": "fixture",
         "prefix": "audit/proxy/", "from_sequence": 0, "hash_algorithm": "SHA-256", "hash_version": "v1",
         "genesis_hash": genesis, "verified": True, "first_sequence": 0, "break_at_sequence": None,
         "violation_kind": None, "error": None,
@@ -253,14 +266,23 @@ def mode_cases(root):
         } for r in records],
     }
 
-    def write_records(out):
-        (out / "records").mkdir(parents=True)
-        for r in records:
-            (out / "records" / vp.record_file_name(r["sequence_number"])).write_bytes(
-                json.dumps(r, indent=1).encode("utf-8"))
+
+def write_records(out, records):
+    (out / "records").mkdir(parents=True)
+    for r in records:
+        (out / "records" / vp.record_file_name(r["sequence_number"])).write_bytes(
+            json.dumps(r, indent=1).encode("utf-8"))
+
+
+def mode_cases(root):
+    genesis, records = mode_chain()
+    head = records[-1]["sequence_number"]
+    modes = [{"sequence": 1, "mode": "write_once", "source": "derived"},
+             {"sequence": 4, "mode": "local_chain", "source": "configured"}]
+    base = unanchored_base(genesis, records, "00000000-0000-4000-8000-0000000e0f00", "2026-11-02T10:00:00Z")
 
     out = root / "evidence-modes"
-    write_records(out)
+    write_records(out, records)
     write_case(out, local_manifest(base, head, evidence_modes=modes), {"runs": [
         {"args": ["--allow-unsigned"], "exit": 0, "contains": [
             "EVIDENCE MODE seq=1: write_once (derived)",
@@ -270,11 +292,168 @@ def mode_cases(root):
     ]})
 
     out = root / "evidence-modes-doctored"
-    write_records(out)
+    write_records(out, records)
     write_case(out, local_manifest(base, head, evidence_modes=modes[:1]), {"runs": [
         {"args": ["--allow-unsigned"], "exit": 1, "contains": [
             "FAIL evidence_modes: manifest evidence_modes (seq=1 write_once) disagrees with the evidence-mode "
             "seals in the pack's records (seq=1 write_once, seq=4 local_chain)"]},
+    ]})
+
+
+# Synthetic judgment ids and digests. The pack digests and clause digests
+# name no real pack: the verifier checks a receipt against the chain, not
+# against a pack.
+PACK_SHA256 = "5" * 64
+CLAUSE_SHA256 = "6" * 64
+BACKEND = {
+    "id": "fixture:judge@1", "distribution": "native", "validated": True,
+    "prompt_version": "judge_prompt.v1", "prompt_sha256": "7" * 64,
+    "validation_run": "vr_01JFIXTURE", "validation_sha256": "8" * 64,
+}
+
+
+def verdict_receipt(n, ts, judged, upload_id, rule_id, judgment, verdict, reason_code, questions,
+                    reason_text, spans, link=None):
+    """One v1.21 judgment.verdict record judging the request record `judged`.
+
+    The uploaded form is the receipt without its reason and spans, stored as
+    RFC 8785 text; it names the judged record by `upload_id`, the id that
+    record is uploaded under (its chain id when nothing is uploaded for it).
+    The local part holds the reason and the spans. `link` replaces the three
+    link values the receipt seals (judged event id, event hash, sequence)."""
+    hexid = f"{n:032x}"
+    verdict_id = f"jv_{hexid}"
+    unavailable = reason_code == vp.JUDGMENT_VERDICT_NO_PACK_VERSION_REASON
+    source = "none" if unavailable else "judge"
+    uploaded = {
+        "schema": "judgment_verdict.v1", "verdict_id": verdict_id, "judged_event_id": upload_id,
+        "rule_id": rule_id, "judgment": judgment,
+        "pack": {"version": None if unavailable else 3, "sha256": PACK_SHA256},
+        "verdict": verdict, "source": source, "reason_code": reason_code, "enforceable": True,
+        "questions": questions, "execution": "gateway", "backend": None if unavailable else BACKEND,
+        "timing": "after_delivery", "rollout_stage": "shadow", "action_taken": "allow",
+        "latency_ms": 0 if unavailable else 180 + n, "evaluated_at": ts[:19] + "Z",
+    }
+    local = {"schema": vp.JUDGMENT_VERDICT_LOCAL_SCHEMA, "reason_text": reason_text,
+             "reason_text_withheld": False, "spans": spans, "floor_unavailable": False}
+    uploaded_json = vp.jcs_dumps(uploaded)
+    judged_id, judged_hash, judged_seq = link or (judged["event_id"], judged["event_hash"],
+                                                  judged["sequence_number"])
+    uuid = f"{hexid[:8]}-{hexid[8:12]}-{hexid[12:16]}-{hexid[16:20]}-{hexid[20:]}"
+    return {
+        "schema_version": "v1.21", "event_kind": "judgment_verdict", "timestamp_utc": ts,
+        "event_id": uuid, "request_id": uuid, "model_requested": "", "action": "allow",
+        "input_tokens": 0, "output_tokens": 0, "estimated_cost_usd": None,
+        "judgment_verdict": {
+            "verdict_id": verdict_id, "judged_event_id": judged_id, "judged_upload_event_id": upload_id,
+            "judged_event_hash": judged_hash, "judged_sequence_number": judged_seq,
+            "rule_id": rule_id, "judgment": judgment, "pack_sha256": PACK_SHA256, "verdict": verdict,
+            "source": source, "reason_code": reason_code, "enforceable": True,
+            "uploaded_sha256": vp.judgment_verdict_uploaded_sha256(uploaded_json),
+            "local_sha256": vp.sha256_jcs(local), "uploaded_json": uploaded_json,
+        },
+        "raw_response": local,
+    }
+
+
+def verdict_chain(relinked=False):
+    """Two requests and three receipts: a FLAG on the first request (its
+    record uploaded under another id), then a PASS and a pack_unavailable
+    verdict of two rules on the second (its record not uploaded). With
+    `relinked`, the first receipt is sealed naming the first request's
+    sequence with another record's event id and a hash no record has."""
+    genesis = vp.genesis_hash()
+    records, prev = [], genesis
+
+    def seal(event):
+        nonlocal prev
+        event["sequence_number"] = len(records)
+        event["previous_hash"] = prev
+        event["event_hash"] = vp.recompute_event_hash(event, event["sequence_number"], prev)
+        prev = event["event_hash"]
+        records.append(event)
+        return event
+
+    def request(ts, n):
+        return {
+            "schema_version": "v1.1", "timestamp_utc": ts,
+            "event_id": f"00000000-0000-4000-8000-0000000f00{n:02d}",
+            "request_id": f"00000000-0000-4000-8000-0000000f10{n:02d}",
+            "model_requested": "gpt-4.1-mini", "model_executed": "gpt-4.1-mini-2025-04-14",
+            "provider": "openai", "action": "allow", "input_tokens": 12, "output_tokens": 30,
+            "total_tokens": 42, "estimated_cost_usd": 5.4e-05, "policy_version": "0" * 64,
+            "findings": [], "messages": [{"role": "user", "content": "Synthetic request."}],
+            "response_text": "Synthetic response.",
+        }
+
+    def question(qid, outcome, p, p_pass):
+        return {"id": qid, "clause_sha256": CLAUSE_SHA256, "outcome": outcome, "p": p, "p_pass": p_pass,
+                "flag_at": 0.8, "pass_at": 0.1}
+
+    first = seal(request("2026-11-03T09:00:00.000000000Z", 0))
+    # Relinked: sequence 0, named with the second request's event id and a
+    # hash no record of the chain has.
+    second_link = ("00000000-0000-4000-8000-0000000f0002", "9" * 64, 0) if relinked else None
+    seal(verdict_receipt(
+        1, "2026-11-03T09:00:01.000000000Z", first, "3f9a1c0b7e2d4a65", "judgment.scope-boundary",
+        "scope-boundary@2", "FLAG", "clause_violated", [question("Q-SCOPE-1-a", "FLAG", 0.93, 0.05)],
+        "Q-SCOPE-1-a: synthetic reason.", [{"input": "reply", "start": 0, "end": 19}], link=second_link))
+    second = seal(request("2026-11-03T09:01:00.000000000Z", 2))
+    seal(verdict_receipt(
+        3, "2026-11-03T09:01:01.000000000Z", second, second["event_id"], "judgment.scope-boundary",
+        "scope-boundary@2", "PASS", "ok", [question("Q-SCOPE-1-a", "PASS", 0.04, 0.95)],
+        "Q-SCOPE-1-a: synthetic reason.", []))
+    seal(verdict_receipt(
+        4, "2026-11-03T09:01:01.500000000Z", second, second["event_id"], "judgment.disclosure",
+        "disclosure@1", "INDETERMINATE", vp.JUDGMENT_VERDICT_NO_PACK_VERSION_REASON, [], None, []))
+    return genesis, records
+
+
+def verdict_cases(root):
+    genesis, records = verdict_chain()
+    head = records[-1]["sequence_number"]
+    base = unanchored_base(genesis, records, "00000000-0000-4000-8000-0000000f0f00", "2026-11-03T10:00:00Z")
+    receipts = {r["sequence_number"]: r["judgment_verdict"]["verdict_id"]
+                for r in records if r.get("event_kind") == "judgment_verdict"}
+
+    out = root / "judgment-verdicts"
+    write_records(out, records)
+    write_case(out, local_manifest(base, head), {"runs": [
+        {"args": ["--allow-unsigned"], "exit": 0, "contains": [
+            "CLAIM: the whole chain proxy from seq=0 up to its head at seq=4",
+            "AUTHENTICITY NOT ESTABLISHED"],
+         "absent": ["FAIL"]},
+        {"args": [], "exit": 3, "contains": ["AUTHENTICITY NOT ESTABLISHED"], "absent": ["FAIL"]},
+    ]})
+
+    # The same records, edited after sealing in the two parts of a receipt
+    # that sit beside its hash: the first receipt's uploaded form turned from
+    # FLAG to PASS, and the second receipt's reason text. No hash changes.
+    edited = [json.loads(json.dumps(r)) for r in records]
+    form = edited[1]["judgment_verdict"]
+    form["uploaded_json"] = form["uploaded_json"].replace('"verdict":"FLAG"', '"verdict":"PASS"')
+    edited[3]["raw_response"]["reason_text"] = "Another reason."
+    out = root / "judgment-verdicts-edited"
+    write_records(out, edited)
+    write_case(out, local_manifest(base, head), {"runs": [
+        {"args": ["--allow-unsigned"], "exit": 1, "contains": [
+            f"FAIL seq=1: verdict receipt {receipts[1]}: the stored uploaded form hashes to",
+            f"FAIL seq=1: verdict receipt {receipts[1]}: the sealed `verdict` is not the `verdict` of the "
+            "stored uploaded form",
+            f"FAIL seq=3: verdict receipt {receipts[3]}: the stored local part hashes to"]},
+    ]})
+
+    # A chain whose first receipt was sealed naming sequence 0 with another
+    # record's event id and a hash no record has. Every hash recomputes; the
+    # link does not.
+    genesis, relinked = verdict_chain(relinked=True)
+    base = unanchored_base(genesis, relinked, "00000000-0000-4000-8000-0000000f0f01", "2026-11-03T10:00:00Z")
+    out = root / "judgment-verdicts-relinked"
+    write_records(out, relinked)
+    write_case(out, local_manifest(base, head), {"runs": [
+        {"args": ["--allow-unsigned"], "exit": 1, "contains": [
+            f"FAIL seq=1: verdict receipt {receipts[1]}: does not link to the pack's record at sequence 0: "
+            "that record has another event id or event hash"]},
     ]})
 
 
@@ -284,6 +463,7 @@ def main():
         shutil.rmtree(root)
     anchored_cases(root)
     mode_cases(root)
+    verdict_cases(root)
     return 0
 
 

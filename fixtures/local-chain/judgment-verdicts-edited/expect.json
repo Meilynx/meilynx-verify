@@ -1,0 +1,15 @@
+{
+  "runs": [
+    {
+      "args": [
+        "--allow-unsigned"
+      ],
+      "contains": [
+        "FAIL seq=1: verdict receipt jv_00000000000000000000000000000001: the stored uploaded form hashes to",
+        "FAIL seq=1: verdict receipt jv_00000000000000000000000000000001: the sealed `verdict` is not the `verdict` of the stored uploaded form",
+        "FAIL seq=3: verdict receipt jv_00000000000000000000000000000003: the stored local part hashes to"
+      ],
+      "exit": 1
+    }
+  ]
+}

@@ -36,7 +36,7 @@ python3 verify-pack.py --records fixtures/anchors/packs/fully-anchored/records \
 #    key the proxy publishes on /readyz
 python3 verify-pack.py --records fixtures/record-sigs/signed/records \
   --manifest fixtures/record-sigs/signed/manifest.json --allow-unsigned \
-  --chain-signing-key d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
+  --gateway-key d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a
 
 # 5. Verify a local-chain pack (a gateway with no write-once store), then the
 #    same chain packed earlier and checked against a later anchor (exit 4)
@@ -48,6 +48,10 @@ python3 verify-pack.py --records fixtures/local-chain/earlier-pack/records \
   --manifest fixtures/local-chain/earlier-pack/manifest.json --allow-unsigned \
   --tsa-root test-rsa=fixtures/anchors/roots/rsa-root.pem \
   --tsa-root test-ec=fixtures/anchors/roots/ec-root.pem
+
+# 6. Verify a chain that holds judgment verdict receipts
+python3 verify-pack.py --records fixtures/local-chain/judgment-verdicts/records \
+  --manifest fixtures/local-chain/judgment-verdicts/manifest.json --allow-unsigned
 ```
 
 Exit codes, the same online and offline:
@@ -55,10 +59,10 @@ Exit codes, the same online and offline:
 | Code | Meaning |
 |---|---|
 | `0` | Every record verified, and on a signed pack the signature too. An unsigned pack reaches `0` only with `--allow-unsigned`, and the output still says authenticity is not established. |
-| `1` | Verification failed. The output names the first record that failed and why (hash mismatch, chain break, missing record, unknown record kind, two stored copies of one record that differ), why the signature failed, or which chain-head anchor failed and why. |
-| `2` | This verifier cannot evaluate the pack: an unsupported hash version, manifest version, storage layout, evidence class, content claim, signature method or bundle format (use a newer release), an unusable `--trusted-root`, an anchor from a witness with no trust root (pass `--tsa-root`), a pack signed by a per-tenant signer checked without `--certificate-identity`, or a content-stripped pack read with `--bucket` or still carrying a removed field. |
+| `1` | Verification failed. The output names the first record that failed and why (hash mismatch, chain break, missing record, unknown record kind, two stored copies of one record that differ), why the signature failed, which chain-head anchor failed and why, or which gateway evidence-key check failed (see "Gateway evidence key" below). |
+| `2` | This verifier cannot evaluate the pack: an unsupported hash version, manifest version, storage layout, evidence class, content claim, signature method or bundle format (use a newer release), an unusable `--trusted-root`, an anchor from a witness with no trust root (pass `--tsa-root`), a pack signed by a per-tenant signer checked without `--certificate-identity`, a pack or export signed by a gateway evidence key checked with neither `--attestation-key` nor `--gateway-key`, or a content-stripped pack read with `--bucket` or still carrying a removed field. |
 | `3` | The records verified, but the pack is unsigned, so nothing shows who produced the manifest. |
-| `4` | Integrity passed, coverage not established. Every record verified, but the pack does not reach a sequence the chain is known to have reached: the pack claims the whole chain up to its head and a verified chain-head anchor names a later head, or the pack stops before the sequence you passed with `--require-through`. Not a pass, and not a tampering verdict (see "Local-chain evidence" below). |
+| `4` | Integrity passed, coverage not established. Every record verified, but the pack does not reach a sequence the chain is known to have reached: the pack claims the whole chain up to its head and a verified chain-head anchor, or a chain head the gateway signed, names a later head, or the pack stops before the sequence you passed with `--require-through`. Not a pass, and not a tampering verdict (see "Local-chain evidence" below). |
 
 When more than one applies, `1` outranks `2`, `2` outranks `4`, and `4`
 outranks `3`. `--allow-unsigned` turns `3` into `0`; it never turns `4` into
@@ -99,6 +103,7 @@ A **pack** is what a Meilynx proxy's `integrity-pack` command produces:
 | `records/<seq>.bin` | The chain records themselves, one JSON document per file, named by 20-digit zero-padded sequence number. This is the per-record layout of the write-once bucket; a chain the bucket stores in segment objects is exported in the same form (see "Segment objects" below). |
 | `manifest.json.sigstore.json` | Present on a signed pack: a Sigstore bundle holding a keyless cosign signature over `manifest.json`, the signing certificate, and the Rekor transparency-log proof |
 | `records/anchors/<seq>.json` and `records/anchors/<seq>.<witness>.tsr` | Present on an anchored chain: the chain-head statement the proxy timestamped, and one RFC 3161 token per witness |
+| `evidence-keys/attestations.json` and `records/head-signatures/<seq>.json` | Present on a pack from a gateway with an evidence key: the control plane's attestations of that key, and the chain heads the gateway signed (see "Gateway evidence key" below) |
 | `records/control-plane/<seq>.json` | Present on a pack whose manifest (1.3 and later) carries the control-plane chain: the control plane's own record of the human actions a decision involved, one JSON object per record, verified from its genesis and checked against each decision receipt in the pack that cites one of its records ([SPEC.md](SPEC.md) §6.3) |
 
 Records are exported alongside the manifest with
@@ -169,6 +174,61 @@ cosign verify-blob --bundle manifest.json.sigstore.json \
 `fixtures/run-signature-cases.py` runs the verifier against a set of signed
 and tampered test packs, and with `--cosign cosign` compares every verdict
 with cosign's.
+
+## Gateway evidence key
+
+A gateway can hold an Ed25519 evidence key. It signs every record it seals,
+the chain heads it signs from time to time (`records/head-signatures/`), and
+the manifests of its packs and OCSF exports. The control plane attests the
+key with the project's attestation key, and the pack carries those
+attestations in `evidence-keys/attestations.json`. Pin the key you trust
+once, out of band, and check every pack against it offline:
+
+```bash
+# a gateway enrolled with a control plane: the project's attestation key
+python3 verify-pack.py --records records --manifest manifest.json \
+  --attestation-key evidence-attestation-key.json
+
+# a gateway with no control plane: the gateway's own key, as /readyz publishes it
+python3 verify-pack.py --records records --manifest manifest.json \
+  --gateway-key <64 hex characters, or an Ed25519 JWK or PEM file>
+```
+
+With `--attestation-key`, every attestation in the pack must verify under
+the key you pinned, and every record signature, signed head and manifest
+signature must verify under a key it attests. The verdict names the gateway
+and the key:
+
+```
+SIGNED BY GATEWAY <proxy> (key sha256:…, key_seq 1), key attested by the project key you pinned
+```
+
+With `--gateway-key` (repeat it for each key of a chain whose key was
+rotated; `--chain-signing-key` is its older name) the verdict says the key
+was pinned by you, not certified. A pack signed by an evidence key and
+checked with neither option exits `2`: nothing in the pack can say whose key
+it is.
+
+What fails (exit `1`): a signature under a key that no attestation covers or
+that is not the key you pinned, a key that took over from another without a
+rotation the old key signed or an acknowledged loss, an edited record,
+manifest or signed head, and a signed head that names another hash than the
+pack's record at that sequence. A verified signed head after the last record
+of a pack that claims the whole chain is "coverage not established" (exit
+`4`), as an anchor is.
+
+What does not fail: a gateway that lost its key, or whose new key waits for
+the project's approval, records why it stopped signing, and its records after
+that point are unsigned. The verifier accepts them by hash only and says so;
+a pack built in that state exits `3`, or `0` with `--allow-unsigned`. A key that replaced a
+lost one after the project acknowledged the loss is credited from the
+sequence the acknowledgement names, and the verdict prints a
+`KEY DISCONTINUITY` line.
+
+A signature shows which gateway key signed the records, heads and manifest.
+It does not show who held the key, or that no record is missing: whoever
+runs the host can delete records, the key or the database
+([SPEC.md](SPEC.md) §12).
 
 ## Chain-head anchors
 
@@ -272,9 +332,10 @@ who holds that anchor.
 
 **What it cannot show.**
 
-- **Who produced it.** The pack is unsigned. The manifest is only as
-  trustworthy as the way you received it, and the verifier exits `3` unless
-  you pass `--allow-unsigned`.
+- **Who produced it**, unless the gateway signs with an evidence key (see
+  "Gateway evidence key"). Without one the pack is unsigned: the manifest is
+  only as trustworthy as the way you received it, and the verifier exits `3`
+  unless you pass `--allow-unsigned`.
 - **That the history is complete.** The records come from a database on a
   volume the gateway's operator controls. They are not write-once: no
   write-once store ever confirmed them, and whoever controls that volume can
@@ -332,13 +393,57 @@ the modes (`evidence_modes`, [SPEC.md](SPEC.md) §6.8) must list exactly the
 seals in the records; otherwise the pack fails with `FAIL evidence_modes`
 lines instead.
 
-`fixtures/local-chain/` holds five packs: a clean local-chain pack, the same
+`fixtures/local-chain/` holds eight packs: a clean local-chain pack, the same
 chain packed at an earlier head and checked against the later anchor
 (exit `4`), that pack with its claim edited (exit `1`), a chain with a
-change of evidence mode, and the same chain with the change left out of the
-manifest (exit `1`). `fixtures/run-local-chain-cases.py` runs each one with
-its expected exit code and output lines; `fixtures/gen-local-chain-fixtures.py`
-writes them and says where each record comes from.
+change of evidence mode, the same chain with the change left out of the
+manifest (exit `1`), and the three judgment verdict packs described below.
+`fixtures/run-local-chain-cases.py` runs each one with its expected exit code
+and output lines; `fixtures/gen-local-chain-fixtures.py` writes them and says
+where each record comes from.
+
+## Judgment verdict receipts
+
+A gateway can run judgments: checks of a model request against an
+organization's policy, each with a verdict (`PASS`, `FLAG` or
+`INDETERMINATE`) and a reason code. Every verdict is sealed in the
+gateway's chain as a receipt (a v1.21 `judgment_verdict` record), after the
+request it judged and on the same chain. For each receipt the verifier
+checks that:
+
+- **it is intact.** Its hash recomputes, and the two parts stored beside the
+  hash match the digests the hash covers: the receipt as the gateway uploads
+  it, and the part the gateway keeps only in its own audit store;
+- **it says what was sealed.** The verdict, reason code, judgment, pack
+  digest and the other sealed facts are the ones the stored receipt states;
+- **it is linked to the record it judged.** The receipt names that record by
+  its event id, event hash and sequence number. When the pack holds the
+  record at that sequence, it must be that record, and it must come before
+  the receipt. A judged record outside the pack's window is not a failure:
+  the receipt's hash still binds the three values.
+
+An edit to any of these fails the pack at the receipt (exit `1`).
+
+**What a receipt does not show.** The uploaded part carries ids, digests,
+numbers and fixed vocabularies, and no text of the conversation. The judge's
+reason and the spans it quoted are in the local part only, which the
+gateway keeps in its own encrypted audit store and which a content-stripped
+pack removes. A pass shows that a verdict was recorded and has not changed
+since; it does not show that the verdict was right, or that every request
+that should have been judged has a receipt.
+
+```bash
+python3 verify-pack.py --records fixtures/local-chain/judgment-verdicts/records \
+  --manifest fixtures/local-chain/judgment-verdicts/manifest.json --allow-unsigned
+```
+
+The fixture chain holds two requests and three receipts: a `FLAG`, a `PASS`,
+and a verdict of a rule whose judgment pack was not loaded, which names no
+pack version. `judgment-verdicts-edited` is the same chain with one
+receipt's uploaded part and another's reason edited after sealing, and
+`judgment-verdicts-relinked` has a receipt sealed with a link to another
+record than the one at the sequence it names; both exit `1`
+([SPEC.md](SPEC.md) §4.3).
 
 ## Further checks
 
@@ -366,11 +471,18 @@ the same exit-code precedence.
   verdict for the condition set whose digest you hold, counting the records
   in the window sealed under it, its gaps and its exceptions
   ([SPEC.md](SPEC.md) §10).
+- **Judgment verdict receipts** (no flag). A v1.21 `judgment_verdict`
+  record is checked for its stored parts, its sealed facts and its link to
+  the record it judged (see "Judgment verdict receipts").
+- **Gateway evidence key** (`--attestation-key JWK` or `--gateway-key KEY`).
+  Attestations, record signatures, signed chain heads and evidence-key
+  manifest signatures (see "Gateway evidence key").
 - **Compliance records** (no flag). A v1.20 `compliance_record` record, one
   item a proxy retrieved from a vendor's compliance API with the customer's
   own credential, binds the stored item, its file bytes and its findings
   through digests the verifier recomputes ([SPEC.md](SPEC.md) §4.3).
-- **Record signatures** (no flag; `--chain-signing-key HEX` pins the key).
+- **Record signatures** (no flag; `--gateway-key KEY` pins the key,
+  `--chain-signing-key` is its alias).
   Every record's `record_sig` is checked over its chain coordinates, and
   records sealed before signing started are reported as an unsigned prefix.
   Pass the key the proxy publishes on `/readyz` (`chain_signing_public_key`)
@@ -422,7 +534,10 @@ It does **not** prove:
 - who wrote the record. A signed pack (`manifest.json.sigstore.json`) binds
   the manifest to the signing identity, and the manifest binds each record's
   hash. A record signature (`record_sig`) binds each record to the proxy's
-  chain signing key, not to a person or organisation.
+  chain signing key (its evidence key), not to a person or organisation.
+- for a judgment verdict receipt, that the verdict was right. A receipt
+  shows which judgment produced which verdict on which record, and that the
+  record of it has not changed.
 - when a record was written, unless the chain is anchored. Without anchors
   the record's timestamp is the proxy's own clock. With anchors, the token's
   time bounds when the covered records existed.
@@ -430,7 +545,7 @@ It does **not** prove:
 ## Versions
 
 The verifier understands chain records with `schema_version` v1 through
-v1.20, stored per record or in segment objects, and pack manifests 1.0
+v1.21, stored per record or in segment objects, and pack manifests 1.0
 through 1.5 (1.1 adds chain-head anchors, 1.2 the storage layout, 1.3 the
 control-plane chain, 1.4 the evidence class label, 1.5 the content-stripped
 pack with its hash-only stubs). It declares the pack features it checks in
@@ -439,7 +554,8 @@ pack with its hash-only stubs). It declares the pack features it checks in
 `control-plane-chain-v1`, `ocsf-export-v1`, `customer-scope-v1`,
 `per-tenant-signer-v1`, `evidence-class-v1`, `content-stripped-v1`,
 `customer-conditions-v1`, `record-signatures-v1`, `compliance-records-v1`,
-`local-chain-evidence-v1`, `coverage-claim-v1` and `evidence-modes-v1`. A record of an unknown
+`local-chain-evidence-v1`, `coverage-claim-v1`, `evidence-modes-v1`,
+`gateway-evidence-key-v1` and `judgment-verdicts-v1`. A record of an unknown
 version or kind fails verification rather than being skipped; a manifest of
 an unknown version, storage layout, evidence class or content claim is
 cannot evaluate (exit `2`). Changes to the verifier are listed in
