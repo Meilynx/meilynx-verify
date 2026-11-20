@@ -1,0 +1,39 @@
+{
+ "schema_version": "v1.21",
+ "event_kind": "judgment_verdict",
+ "timestamp_utc": "2026-11-03T09:01:01.000000000Z",
+ "event_id": "00000000-0000-0000-0000-000000000003",
+ "request_id": "00000000-0000-0000-0000-000000000003",
+ "model_requested": "",
+ "action": "allow",
+ "input_tokens": 0,
+ "output_tokens": 0,
+ "estimated_cost_usd": null,
+ "judgment_verdict": {
+  "verdict_id": "jv_00000000000000000000000000000003",
+  "judged_event_id": "00000000-0000-4000-8000-0000000f0002",
+  "judged_upload_event_id": "00000000-0000-4000-8000-0000000f0002",
+  "judged_event_hash": "bf42adbc65db4fb3277c3b1ae656049599b71adf43c22e201d76e37fe8dc825c",
+  "judged_sequence_number": 2,
+  "rule_id": "judgment.scope-boundary",
+  "judgment": "scope-boundary@2",
+  "pack_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+  "verdict": "PASS",
+  "source": "judge",
+  "reason_code": "ok",
+  "enforceable": true,
+  "uploaded_sha256": "2b472b9395b953efb2a88d36fa8a5d17ec23f4d2865aef8bf24034809707a24d",
+  "local_sha256": "63a72cd1be01f8a9f590b082942bfb8184647f8e5c5b56a1ab9e1b397c8d4b1f",
+  "uploaded_json": "{\"action_taken\":\"allow\",\"backend\":{\"distribution\":\"native\",\"id\":\"fixture:judge@1\",\"prompt_sha256\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"prompt_version\":\"judge_prompt.v1\",\"validated\":true,\"validation_run\":\"vr_01JFIXTURE\",\"validation_sha256\":\"8888888888888888888888888888888888888888888888888888888888888888\"},\"enforceable\":true,\"evaluated_at\":\"2026-11-03T09:01:01Z\",\"execution\":\"gateway\",\"judged_event_id\":\"00000000-0000-4000-8000-0000000f0002\",\"judgment\":\"scope-boundary@2\",\"latency_ms\":183,\"pack\":{\"sha256\":\"5555555555555555555555555555555555555555555555555555555555555555\",\"version\":3},\"questions\":[{\"clause_sha256\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"flag_at\":0.8,\"id\":\"Q-SCOPE-1-a\",\"outcome\":\"PASS\",\"p\":0.04,\"p_pass\":0.95,\"pass_at\":0.1}],\"reason_code\":\"ok\",\"rollout_stage\":\"shadow\",\"rule_id\":\"judgment.scope-boundary\",\"schema\":\"judgment_verdict.v1\",\"source\":\"judge\",\"timing\":\"after_delivery\",\"verdict\":\"PASS\",\"verdict_id\":\"jv_00000000000000000000000000000003\"}"
+ },
+ "raw_response": {
+  "schema": "judgment_verdict_local.v1",
+  "reason_text": "Another reason.",
+  "reason_text_withheld": false,
+  "spans": [],
+  "floor_unavailable": false
+ },
+ "sequence_number": 3,
+ "previous_hash": "bf42adbc65db4fb3277c3b1ae656049599b71adf43c22e201d76e37fe8dc825c",
+ "event_hash": "e1eb26e4a997d48718a392e45e9f08643693ae24317c1728c979535a4628b005"
+}

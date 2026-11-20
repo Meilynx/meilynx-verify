@@ -1,0 +1,39 @@
+{
+ "schema_version": "v1.21",
+ "event_kind": "judgment_verdict",
+ "timestamp_utc": "2026-11-03T09:01:01.500000000Z",
+ "event_id": "00000000-0000-0000-0000-000000000004",
+ "request_id": "00000000-0000-0000-0000-000000000004",
+ "model_requested": "",
+ "action": "allow",
+ "input_tokens": 0,
+ "output_tokens": 0,
+ "estimated_cost_usd": null,
+ "judgment_verdict": {
+  "verdict_id": "jv_00000000000000000000000000000004",
+  "judged_event_id": "00000000-0000-4000-8000-0000000f0002",
+  "judged_upload_event_id": "00000000-0000-4000-8000-0000000f0002",
+  "judged_event_hash": "bf42adbc65db4fb3277c3b1ae656049599b71adf43c22e201d76e37fe8dc825c",
+  "judged_sequence_number": 2,
+  "rule_id": "judgment.disclosure",
+  "judgment": "disclosure@1",
+  "pack_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+  "verdict": "INDETERMINATE",
+  "source": "none",
+  "reason_code": "pack_unavailable",
+  "enforceable": true,
+  "uploaded_sha256": "6a7f86db8d7cddc24f46059ba42f1604f91f6600016ca204c291067934a8844c",
+  "local_sha256": "483bf3cf5882f4617977f68ba5255228307cd69fd6d6d02d0156202c8f23a459",
+  "uploaded_json": "{\"action_taken\":\"allow\",\"backend\":null,\"enforceable\":true,\"evaluated_at\":\"2026-11-03T09:01:01Z\",\"execution\":\"gateway\",\"judged_event_id\":\"00000000-0000-4000-8000-0000000f0002\",\"judgment\":\"disclosure@1\",\"latency_ms\":0,\"pack\":{\"sha256\":\"5555555555555555555555555555555555555555555555555555555555555555\",\"version\":null},\"questions\":[],\"reason_code\":\"pack_unavailable\",\"rollout_stage\":\"shadow\",\"rule_id\":\"judgment.disclosure\",\"schema\":\"judgment_verdict.v1\",\"source\":\"none\",\"timing\":\"after_delivery\",\"verdict\":\"INDETERMINATE\",\"verdict_id\":\"jv_00000000000000000000000000000004\"}"
+ },
+ "raw_response": {
+  "schema": "judgment_verdict_local.v1",
+  "reason_text": null,
+  "reason_text_withheld": false,
+  "spans": [],
+  "floor_unavailable": false
+ },
+ "sequence_number": 4,
+ "previous_hash": "e1eb26e4a997d48718a392e45e9f08643693ae24317c1728c979535a4628b005",
+ "event_hash": "ea303ca2b7aba6a307f6c0f673c8bfddc20af0d042cf0793d6498295fc7f9ca2"
+}

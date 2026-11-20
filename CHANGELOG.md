@@ -1,5 +1,72 @@
 # Changelog
 
+## 0.12.0 (2026-11-19)
+
+- `verify-pack.py` from meilynx-proxy `bcbc8eb`.
+- **Upgrade before verifying chains or packs written after this release.**
+  A verifier older than 0.12.0 fails every v1.21 record with
+  `unknown event_kind 'judgment_verdict'` (exit 1). It never reports such a
+  chain as a pass. It also ignores the gateway evidence key: it cannot check
+  a pack or OCSF export manifest signed by that key, or the chain heads the
+  gateway signed.
+- Chain v1.21 (SPEC §4.3): a new record kind, `judgment_verdict`, the sealed
+  receipt of one judgment on one model request. A receipt is sealed on the
+  same chain as the request it judged, after it, and names that request by
+  its event id, event hash and sequence number. The verifier checks that:
+  - the receipt is intact: its hash recomputes, and the two parts stored
+    beside the hash (the receipt as uploaded, and the part kept only in the
+    customer's audit store) match the digests the hash covers;
+  - the facts the hash covers (verdict, reason code, judgment, pack digest
+    and the like) are the ones the stored receipt states;
+  - the receipt is linked to the record it judged: the request at that
+    sequence, when the pack holds it, has that event id and event hash, and
+    it comes before the receipt;
+  - a receipt whose judgment pack was not loaded names no pack version, and
+    every other receipt names one.
+
+  The uploaded part of a receipt carries ids, digests, numbers and fixed
+  vocabularies, and no text of the conversation. The judge's reason and the
+  spans it quoted are in the local part only. A pass shows that a verdict
+  was recorded and not changed since; it does not show that the verdict was
+  right. v1.21 is defined only for this kind. Self-test assertions 39a to
+  39c pin the fixture hash and the failure cases.
+- Gateway evidence key (SPEC §12): a gateway's Ed25519 evidence key signs
+  its records, the chain heads it signs (`records/head-signatures/`), and
+  its pack and OCSF export manifests (signature scheme
+  `meilynx.evidence.v1`). The control plane attests the key with the
+  project's attestation key, and a pack carries the attestations in
+  `evidence-keys/attestations.json`.
+  - `--attestation-key JWK`: the project's attestation key, pinned once.
+    Every attestation must verify under it, and every signature in the pack
+    under a key it attests. The verdict names the gateway and the key.
+  - `--gateway-key KEY` (hex, an Ed25519 JWK file or a PEM public key) pins
+    the gateway's own key, for a gateway with no control plane. The verdict
+    says the key was pinned by you, not certified. `--chain-signing-key` is
+    now its alias.
+  - A pack or export manifest signed by the evidence key and checked with
+    neither option exits 2. A signature under a key no attestation covers, a
+    key replaced without a rotation the old key signed or an acknowledged
+    loss, and a signed head that contradicts the pack, exit 1. A verified
+    signed head after the last record of a pack that claims the whole chain
+    exits 4. After the gateway sealed that its key was lost, or that signing
+    stopped while a new key waits for the project's approval, its unsigned
+    records are accepted by hash only; a pack built in that state exits 3,
+    or 0 with `--allow-unsigned`, and never 1. A key replaced after an
+    acknowledged loss prints a `KEY DISCONTINUITY` line.
+  - An OCSF export manifest signed by the evidence key carries
+    `mapping_version` `1+gateway-evidence-key-v1`.
+- `VERIFIER_CAPABILITIES` adds `gateway-evidence-key-v1` and
+  `judgment-verdicts-v1`. Self-test assertions 38a to 38y cover the evidence
+  key.
+- New fixtures under `fixtures/local-chain/`: a chain of two requests and
+  three verdict receipts (exit 0, or 3 without `--allow-unsigned`), the same
+  records with one receipt's uploaded part and another's reason edited after
+  sealing (exit 1), and a receipt sealed with a link to another record than
+  the one at the sequence it names (exit 1).
+  `fixtures/gen-local-chain-fixtures.py` writes them and
+  `fixtures/run-local-chain-cases.py` runs them.
+- Packs without v1.21 records or an evidence-key signature verify as before.
+
 ## 0.11.0 (2026-11-15)
 
 - `verify-pack.py` from meilynx-proxy `de763b8`.

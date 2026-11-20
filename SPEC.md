@@ -5,14 +5,14 @@ enough that a verifier can be written from it without reading Meilynx code.
 `verify-pack.py` in this repository is one such verifier; its `--self-test`
 pins the values below against fixture hashes.
 
-Status: describes chain records with `schema_version` v1 through v1.20, the
+Status: describes chain records with `schema_version` v1 through v1.21, the
 per-record and segment storage layouts, pack manifest `schema_version` 1.0
 through 1.5, the control-plane chain a 1.3 manifest carries, the per-tenant
 pack signature, the local-chain evidence class (§6.5), the manifest's
 coverage claim (§6.7) and list of evidence modes (§6.8), the export copy a
-pack can be checked against (§9), the customer-conditions verdict (§10) and
-record signatures (§11), as read by `verify-pack.py` from meilynx-proxy
-commit `de763b8` (2026-11-15). A chain written before the
+pack can be checked against (§9), the customer-conditions verdict (§10),
+record signatures (§11) and the gateway evidence key (§12), as read by
+`verify-pack.py` from meilynx-proxy commit `bcbc8eb` (2026-11-19). A chain written before the
 segment rollout is per-record, and its packs carry manifest 1.0 or 1.1.
 
 ## 1. Records
@@ -100,8 +100,8 @@ Every record carries at least these fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.20"`). Absent means `"v1"`. |
-| `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`, `decision_receipt`, `compliance_record`). Absent means `llm_request`. |
+| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.21"`). Absent means `"v1"`. |
+| `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`, `decision_receipt`, `compliance_record`, `judgment_verdict`). Absent means `llm_request`. |
 | `sequence_number` | integer | Position in the chain, starting at 0. |
 | `timestamp_utc` | string | RFC 3339 UTC timestamp, nanosecond precision, `Z` suffix. |
 | `event_id` | string | Unique id of this record. |
@@ -117,8 +117,8 @@ Every record carries at least these fields:
 
 Kind-specific payloads live under `admin_action`, `auth_session`,
 `mcp_event`, `coverage`, `coverage_key_inventory`, `decision_receipt`,
-`compliance_record`, `join_context`, `content`, `identity`,
-`evaluation_trace` and `customer`.
+`compliance_record`, `judgment_verdict`, `join_context`, `content`,
+`identity`, `evaluation_trace` and `customer`.
 LLM records also carry
 `messages`, `response_text`, `findings`, `policy_version`,
 `model_executed`, `raw_request`/`raw_response` and routing metadata; **only
@@ -221,6 +221,7 @@ wire names differ from the serde `event_kind` values stored in the JSON:
 | `coverage_key_inventory` | `coverage.key_inventory` |
 | `decision_receipt` | `decision.receipt` |
 | `compliance_record` | `compliance.record` |
+| `judgment_verdict` | `judgment.verdict` |
 
 ### 4.3 Per-version suffixes
 
@@ -501,6 +502,62 @@ kind, v1.20 on any other kind, a v1.20 record without the payload, or a
 v1.20 record that also carries another kind's payload (`auth_session`,
 `admin_action`, `mcp_event`, `coverage`), is invalid and fails verification.
 
+**v1.21 `judgment.verdict`**: from `judgment_verdict`, after the kind
+attestation: `verdict_id`, `judged_event_id`, `judged_upload_event_id`,
+`judged_event_hash` (length-prefixed strings, §3), `judged_sequence_number`
+(u64), `rule_id`, `judgment`, `pack_sha256`, `verdict`, `source`,
+`reason_code` (length-prefixed strings), `enforceable` (one byte, `0x01` for
+true or `0x00` for false), `uploaded_sha256`, `local_sha256`
+(length-prefixed strings). 30 fields. Every field is required; a field that
+is absent or of another type leaves the record with no defined preimage and
+fails verification.
+
+A verdict receipt records one judgment (`judgment`, `<id>@<version>`) of
+one rule (`rule_id`) on one model request: its verdict (`PASS`, `FLAG` or
+`INDETERMINATE`), what produced it (`source`), its reason code and whether
+it may act (`enforceable`). It is sealed on the chain of the request it
+judged, after it. It names that request three ways: `judged_event_id` (its
+chain event id), `judged_event_hash` and `judged_sequence_number`.
+`judged_upload_event_id` is the id under which the request's record is
+uploaded to the control plane; it equals `judged_event_id` when nothing is
+uploaded for the record.
+
+Two parts of the receipt are stored beside the hash and bound by digests the
+verifier recomputes:
+
+- `judgment_verdict.uploaded_json`, the **uploaded form**: the receipt as the
+  gateway uploads it (`judgment_verdict.v1`), stored as its RFC 8785 text.
+  `uploaded_sha256` is the SHA-256 of those UTF-8 bytes as stored. It
+  carries ids, digests, numbers and fixed vocabularies, and no text of the
+  conversation. Its members `verdict_id`, `judged_event_id`, `rule_id`,
+  `judgment`, `pack.sha256`, `verdict`, `source`, `reason_code` and
+  `enforceable` must equal, in value and JSON type, the sealed
+  `verdict_id`, `judged_upload_event_id`, `rule_id`, `judgment`,
+  `pack_sha256`, `verdict`, `source`, `reason_code` and `enforceable`.
+  `pack.version` is `null` exactly when `reason_code` is `pack_unavailable`
+  (the rule's judgment pack was not loaded), and an unsigned integer on
+  every other receipt.
+- `raw_response`, the **local part**: an object with exactly the keys
+  `schema` (`judgment_verdict_local.v1`), `reason_text`,
+  `reason_text_withheld`, `spans` and `floor_unavailable`, or `null`.
+  `local_sha256` is its RFC 8785 digest. It holds the judge's reason and the
+  spans it quoted, and stays in the gateway's audit store. In a
+  content-stripped pack (§6.6) whose `removed_fields` include
+  `raw_response`, this check is left out.
+
+The link: `judged_sequence_number` must be below the receipt's own
+sequence. When the pack holds a record at that sequence, its `event_id`
+must be `judged_event_id` (not compared for a hash-only stub) and its
+`event_hash` must be `judged_event_hash`. A judged record outside the pack's
+window is not a failure; the receipt's hash still binds the three values.
+
+A disagreement fails verification at that receipt. `judgment_verdict` on any
+other version or kind, v1.21 on any other kind, a v1.21 record without the
+payload, or a v1.21 record that also carries another kind's payload
+(`auth_session`, `admin_action`, `mcp_event`, `coverage`), is invalid and
+fails verification. A receipt shows that a verdict was recorded and not
+changed since. It does not show that the verdict was right.
+
 MCP kinds are: `mcp.tool_call`, `mcp.policy_decision`, `mcp.tool_result`,
 `mcp.tools_list.served`, `mcp.error`, `mcp.catalog_drift`. Any MCP hasher
 called with a non-MCP kind is an error.
@@ -514,8 +571,9 @@ v1.16, v1.18, v1.19) it also recomputes the stored-content digests (§4.4),
 for v1.12, v1.14, v1.17, v1.18 and v1.19 records with an identity the
 asserted-claims digest (§4.5), for v1.16, v1.18 and v1.19 records the
 evaluation outcome digest, for v1.15 records the evidence-set digest (§4.3),
-for v1.18 and v1.19 records the customer label digest (§4.6), and for v1.20
-records the stored-record, file-content and findings digests (§4.3).
+for v1.18 and v1.19 records the customer label digest (§4.6), for v1.20
+records the stored-record, file-content and findings digests (§4.3), and for
+v1.21 records the digests of the uploaded form and the local part (§4.3).
 
 ### 4.4 LLM content attestation (v1.10, v1.11, v1.12, v1.16, v1.18, v1.19)
 
@@ -1321,7 +1379,9 @@ since; the chain hashes attest the records.
   v1.18 and v1.19 records the plain `customer_id` is stored but not hashed;
   `label_sha256` binds it only when `source` is `asserted` (§4.6). On v1.20
   records the stored item, its file bytes and its findings are bound through
-  `record_sha256`, `content_sha256` and `findings_sha256` (§4.3). On LLM
+  `record_sha256`, `content_sha256` and `findings_sha256` (§4.3). On v1.21
+  records the uploaded form and the local part are bound through
+  `uploaded_sha256` and `local_sha256` (§4.3). On LLM
   records before v1.19 `policy_version` and `model_executed` are stored but
   not hashed (v1.19 binds both, §4.3), and on every MCP record
   `mcp_event.finding_summary` is; the customer-conditions verdict (§10) says
@@ -1336,7 +1396,12 @@ since; the chain hashes attest the records.
 - **Authorship of the chain.** A signed pack (§7) binds an identity to a
   window. A record signature (§11) binds each record to the proxy's chain
   signing key, not to a person or organisation, and whoever holds both that
-  key and the records could sign a rewritten chain.
+  key and the records could sign a rewritten chain. An attestation (§12)
+  binds that key to a gateway of a project, not to whoever held it.
+- **Whether a verdict was right.** A verdict receipt (§4.3) shows which
+  judgment gave which verdict on which record. It does not show that the
+  verdict was correct, or that every request that should have been judged
+  has a receipt.
 - **When a record was written.** `timestamp_utc` is hashed, but it comes from
   the proxy's clock and nothing in the chain shows that clock was right. A
   chain-head anchor (§6.1) shows that a record existed no later than the
@@ -1496,7 +1561,8 @@ A verifier walks the signatures with the hashes, in sequence order:
    the record was edited and every hash after it recomputed without the key.
 3. An unsigned record after a signed one fails: the chain was rewritten and
    its signatures stripped.
-4. When the reader supplies the key (`--chain-signing-key`), the newest
+4. When the reader supplies the key (`--gateway-key`, alias
+   `--chain-signing-key`), the newest
    signed record must verify under it. A chain re-signed under another key,
    even one that announces that key with a boundary of its own, fails there.
    Without a supplied key the verdict says the signatures were checked under
@@ -1509,3 +1575,80 @@ signed, `signed=partial` when an unsigned prefix comes first, and
 `signed=false` when no record carries a signature. A pack whose records
 carry no signature still verifies by hash. `record-signatures-v1` in
 `VERIFIER_CAPABILITIES` declares this check.
+
+The evidence-key seals of §12 change rules 3 and 4: after an
+`evidence_key_signing_stopped` or `evidence_key_lost` seal, unsigned records
+are accepted until the next `chain_signing_started`, and they are reported
+as such.
+
+## 12. Gateway evidence key
+
+The key of §11 is the gateway's **evidence key**. Besides its records it
+signs, with Ed25519, under domain-separated messages:
+
+- **chain heads**, in `records/head-signatures/<head_sequence:020d>.json`:
+  a `statement` (`format` `meilynx.evidence.chain_head.v1`, `proxy_id`,
+  `chain_id`, `first_sequence`, `head_sequence`, `head_event_hash`,
+  `hash_version`, `key_fingerprint`, `key_seq`, `signed_at`, and `org_id`
+  and `project_id` when the gateway is enrolled) and a `signature`, 128
+  lowercase hex characters, over `"meilynx.evidence.chain_head.v1" 0x00`
+  followed by the statement's RFC 8785 bytes;
+- **pack and OCSF export manifests**: a `signature` member with `scheme`
+  `meilynx.evidence.v1`, `alg` `Ed25519`, `key_fingerprint`, `key_seq` and
+  `value` (64 bytes, standard base64), over
+  `"meilynx.evidence.manifest.v1" 0x00`, the kind (`evidence_pack` or
+  `ocsf_export`), `0x00`, then the RFC 8785 bytes of the manifest without
+  `signature`. An OCSF export manifest signed this way carries
+  `mapping_version` `1+gateway-evidence-key-v1`.
+
+**Attestation.** The control plane attests the key with the project's
+P-256 attestation key. A pack carries every attestation in
+`evidence-keys/attestations.json` (oldest first), each an envelope of a
+`statement` (`format_version` `gateway_evidence_key_attestation.v1`,
+`public_key_jwk`, `fingerprint`, `key_seq`, `reason`, `supersedes`,
+`first_sequences`, `org_id`, `project_id`, `proxy_id`, `not_before`,
+`issued_at`), its `sha256`, the `key_id` (RFC 7638 thumbprint) of the
+attestation key and an ECDSA P-256 `signature` over SHA-256 of the
+statement's RFC 8785 bytes. `reason` is `initial`, `rotation`,
+`re_enrollment` or `acknowledged_loss`; an `acknowledged_loss` attestation
+names the first sequence of each chain it covers in `first_sequences`.
+
+**Pinning.** A reader pins one of two keys out of band:
+
+- the project's attestation key (`--attestation-key`, a P-256 JWK). Every
+  attestation must verify under it, and every record signature, signed head
+  and manifest signature must verify under a key it attests, with the
+  `key_seq` the attestation gives. The verdict prints `SIGNED BY GATEWAY
+  <proxy> (key <fingerprint>, key_seq <n>), key attested by the project key
+  you pinned`;
+- the gateway's own key (`--gateway-key`), for a gateway with no control
+  plane. The verdict says the key was pinned by the reader, not certified.
+
+A manifest signed under `meilynx.evidence.v1` checked with neither is
+cannot evaluate (exit 2).
+
+**Key changes.** The gateway seals each change of key on its chain:
+`evidence_key_rotated` (the last record the old key signs, with a rotation
+statement the old key signed), `evidence_key_lost`,
+`evidence_key_signing_stopped` (signing stops, for example while a new key
+waits for the project's approval) and `evidence_key_rekeyed` (signed by the
+new key after a loss). A key is credited from its
+`chain_signing_started` boundary, after a rotation the previous key signed,
+or, after an acknowledged loss, only from the sequence the attestation
+names; the verdict then prints `KEY DISCONTINUITY at seq N` with the lost
+and the new key. A key that took over from another with neither fails.
+Records after a stop or a loss may be unsigned until the next boundary; a
+record signed while its key was held back is reported as not attested and
+never counted. A pack built while the key is lost or held back has an
+unsigned manifest: it exits 3, or 0 with `--allow-unsigned`, and those
+records never fail it.
+
+**Signed heads and coverage.** A signed head inside the pack must name the
+`event_hash` and `schema_version` of the pack's record at `head_sequence`
+and the key in force there; otherwise the pack fails. A verified signed head
+after the last record of a `chain_to_head` pack is coverage not established
+(exit 4, §6.7), as an anchor is.
+
+A signature shows which gateway key signed. It does not show who held the
+key, or that no record is missing. `gateway-evidence-key-v1` in
+`VERIFIER_CAPABILITIES` declares these checks.

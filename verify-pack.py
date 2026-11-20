@@ -137,6 +137,32 @@ Record signatures:
         python verify-pack.py --records ./records --manifest manifest.json \\
             --chain-signing-key <64 hex characters>
 
+Gateway evidence key (ADR-0113):
+    A gateway's one Ed25519 evidence key signs its records (record_sig), its
+    chain heads (records/head-signatures/<head_sequence:020d>.json) and its
+    pack and OCSF export manifests (a `signature` with scheme
+    meilynx.evidence.v1). The control plane attests the key with the
+    project's P-256 attestation key; the pack carries every attestation in
+    evidence-keys/attestations.json. Pin the project's key once, from the
+    console or GET /api/projects/<id>/evidence-attestation/key:
+        python verify-pack.py --records ./records --manifest manifest.json \\
+            --attestation-key evidence-attestation-key.json
+    Each attestation must verify under it; each record signature, signed
+    head and the manifest signature must then verify under a key it attests
+    (SIGNED BY GATEWAY <proxy> (key ..., key_seq n), key attested by the
+    project key you pinned). A key attested after its loss was acknowledged
+    counts only from the first sequence the attestation names, and the
+    verifier prints a KEY DISCONTINUITY line; a key that replaced another
+    with no rotation the old key signed and no such attestation fails.
+    After evidence_key_signing_stopped or evidence_key_lost, unsigned records
+    are accepted until the next chain_signing_started. A verified signed
+    head after a whole-chain pack's last record is coverage not established
+    (exit 4); one inside the pack that names another hash fails. With no
+    control plane, pin the gateway's own key instead (--gateway-key: hex, an
+    Ed25519 JWK or a PEM public key; --chain-signing-key is its alias), and
+    the verdict says the key was pinned by you, not certified. A pack signed
+    under meilynx.evidence.v1 checked with neither flag cannot be evaluated.
+
 Customer conditions verdict:
     A bank that proposed conditions a vendor accepted holds the SHA-256 of
     its condition set. `--conditions-sha256 HEX` adds one verdict line:
@@ -175,7 +201,9 @@ Signed packs (window B):
     its signed entry timestamp, inclusion proof and signed checkpoint. The
     signature is checked before the records, offline, with no extra install.
     A manifest that says it is signed (window "B", or `signing_deferred` not
-    true, or a `signature` descriptor) fails without a valid bundle.
+    true, or a `signature` descriptor) fails without a valid bundle. A
+    `signature` with scheme meilynx.evidence.v1 is the gateway evidence key's
+    instead (see "Gateway evidence key" above).
 
     By default the signer must be the Meilynx signing workflow, dispatched
     from main:
@@ -208,7 +236,11 @@ Exit codes (the same in --bucket and --records mode; when several apply,
        that authenticity is not established.
     1  verification failed: a record (hash mismatch, chain break, missing or
        unreadable record, content check, two objects holding different
-       bytes for one sequence) or the signature, with the reason:
+       bytes for one sequence), a gateway evidence-key check (an attestation
+       that does not verify under --attestation-key, a signature under a key
+       no attestation covers or not the --gateway-key, a key replaced without
+       acknowledgement, a signed head that contradicts the pack) or the
+       signature, with the reason:
          signature required by manifest but missing
          manifest bytes changed since signing
          untrusted certificate chain
@@ -229,15 +261,17 @@ Exit codes (the same in --bucket and --records mode; when several apply,
        claim or removed-field list this verifier does not read, whose records
        still carry a removed field, or that is checked with --bucket, a
        --conditions-sha256 verdict whose acceptance is not in the pack and
-       was not given with --conditions-acceptance, or a command-line usage
-       error.
+       was not given with --conditions-acceptance, a pack or OCSF export
+       manifest signed by a gateway evidence key checked with neither
+       --attestation-key nor --gateway-key, or a command-line usage error.
     3  unsigned pack: the chain verified, but no signature establishes who
        produced the manifest. Pass --allow-unsigned to accept it. A signed
        pack stripped of its signature and relabelled window A lands here,
        not at 0.
     4  coverage not established: every record verified, but the pack claims
        the whole chain up to its head (manifest `claim`), and a verified
-       chain-head anchor shows the chain reached a later sequence N. The pack
+       chain-head anchor, or a chain head the gateway signed, shows the
+       chain reached a later sequence N. The pack
        was built before that head, or records after its last one were
        removed; nothing in it can say which. Never a pass, and never a
        tampering verdict: get a pack that runs through N. --allow-unsigned
@@ -364,6 +398,11 @@ EVIDENCE_MODE_INDEX_FIELDS = ("sequence", "mode", "source")
 # `local-chain-evidence-v1` reads a pack labelled local-chain-not-write-once,
 # prints that label on every verdict, and judges a verified anchor supplied
 # with it that names a chain head after the pack's last record.
+# `judgment-verdicts-v1` reads v1.21 judgment.verdict records (the verdict
+# receipt of one judgment on one model request), recomputes the digests of
+# the stored uploaded form and of the local-only part, checks the sealed
+# facts against the stored form, and checks the link to the judged record
+# against the pack record at that sequence.
 # `coverage-claim-v1` reads a manifest's `claim`, fails a claim that
 # contradicts the manifest, and reports a verified anchor after a
 # chain_to_head claim as coverage not established (exit 4), never as a
@@ -371,12 +410,17 @@ EVIDENCE_MODE_INDEX_FIELDS = ("sequence", "mode", "source")
 # `evidence-modes-v1` reads a manifest's `evidence_modes`, checks it against
 # the evidence_mode_resolved seals in the pack, and prints each mode and
 # every change of mode.
+# `gateway-evidence-key-v1` (ADR-0113) reads the gateway evidence key: the
+# attestations a pack carries (--attestation-key, the project's pinned P-256
+# key) or a key the reader pins (--gateway-key), the evidence-key seals on the
+# chain (signing stopped, key lost, rotated, rekeyed), signed chain heads,
+# and pack and OCSF export manifests signed under `meilynx.evidence.v1`.
 VERIFIER_CAPABILITIES = frozenset(
     {"chain-anchors-v1", "segmented-records-v1", "decision-receipts-v1", "evaluation-trace-v1",
      "data-reach-evidence-v1", "control-plane-chain-v1", "ocsf-export-v1", "customer-scope-v1",
      "per-tenant-signer-v1", "evidence-class-v1", "content-stripped-v1", "customer-conditions-v1",
      "record-signatures-v1", "compliance-records-v1", "local-chain-evidence-v1", "coverage-claim-v1",
-     "evidence-modes-v1"}
+     "evidence-modes-v1", "gateway-evidence-key-v1", "judgment-verdicts-v1"}
 )
 # The stripped profile of a manifest 1.5 Exchange pack. Mirror of
 # `exchange::STRIPPED_FIELDS` / `WITHHELD_FIELDS` / `STUB_FIELDS` /
@@ -410,7 +454,13 @@ STUB_REASONS = {
     "unreadable_record": "does not parse",
 }
 # OCSF mapping contract versions this verifier reads (contracts/ocsf-mapping.v1.json).
-SUPPORTED_OCSF_MAPPING_VERSIONS = ("1",)
+# `1+gateway-evidence-key-v1` is mapping 1 in a manifest signed by the gateway
+# evidence key (ADR-0113 D10, MEI-3749): a verifier from before it reads only
+# `1`, so it answers "cannot evaluate" for a signed manifest instead of failing
+# its `signed: true` with no detached `.manifest.sig`. A manifest stamped with
+# it must carry the `meilynx.evidence.v1` signature.
+OCSF_SIGNED_MAPPING_VERSION = "1+gateway-evidence-key-v1"
+SUPPORTED_OCSF_MAPPING_VERSIONS = ("1", OCSF_SIGNED_MAPPING_VERSION)
 
 # Exit codes (listed in the module docstring).
 EXIT_OK = 0
@@ -553,6 +603,8 @@ EVENT_KIND_COVERAGE_KEY_INVENTORY = 'coverage.key_inventory'
 EVENT_KIND_DECISION_RECEIPT = 'decision.receipt'
 # The vendor compliance API record kind (v1.20 bucket).
 EVENT_KIND_COMPLIANCE_RECORD = 'compliance.record'
+# The judgment verdict receipt kind (v1.21 bucket).
+EVENT_KIND_JUDGMENT_VERDICT = 'judgment.verdict'
 
 MCP_EVENT_KINDS = {
     EVENT_KIND_MCP_TOOL_CALL,
@@ -583,6 +635,8 @@ SERDE_EVENT_KIND_TO_WIRE = {
     'decision_receipt': EVENT_KIND_DECISION_RECEIPT,
     # Serde snake_case form of the v1.20 kind.
     'compliance_record': EVENT_KIND_COMPLIANCE_RECORD,
+    # Serde snake_case form of the v1.21 kind.
+    'judgment_verdict': EVENT_KIND_JUDGMENT_VERDICT,
 }
 
 
@@ -1266,6 +1320,190 @@ def check_compliance_record(event, stripped=frozenset()):
             f"compliance record {rid}: {len(findings)} stored findings, "
             f"sealed findings_count {fields.get('findings_count')}"
         )
+    return problems
+
+
+# The v1.21 judgment.verdict payload feed: (field, kind) in
+# `JudgmentVerdictFields` struct-definition order. `str` feeds
+# length-prefixed (`encode_len_prefixed_str`, the v1.19 feed), `u64` 8
+# little-endian bytes, `bool` one byte. `uploaded_json` is stored beside
+# them, not fed.
+JUDGMENT_VERDICT_FEED = (
+    ('verdict_id', 'str'), ('judged_event_id', 'str'), ('judged_upload_event_id', 'str'),
+    ('judged_event_hash', 'str'),
+    ('judged_sequence_number', 'u64'), ('rule_id', 'str'), ('judgment', 'str'),
+    ('pack_sha256', 'str'), ('verdict', 'str'), ('source', 'str'), ('reason_code', 'str'),
+    ('enforceable', 'bool'), ('uploaded_sha256', 'str'), ('local_sha256', 'str'),
+)
+# The sealed facts that are also members of the stored uploaded form, as
+# (payload field, path in the uploaded form). Mirror of
+# `JUDGMENT_VERDICT_MIRRORED_FIELDS` in meilynx-core.
+JUDGMENT_VERDICT_MIRRORED_FIELDS = (
+    # The uploaded form names the judged record by the id it is uploaded under.
+    ('verdict_id', ('verdict_id',)), ('judged_upload_event_id', ('judged_event_id',)),
+    ('rule_id', ('rule_id',)), ('judgment', ('judgment',)), ('pack_sha256', ('pack', 'sha256')),
+    ('verdict', ('verdict',)), ('source', ('source',)), ('reason_code', ('reason_code',)),
+    ('enforceable', ('enforceable',)),
+)
+# The one verdict whose uploaded form names no pack version (`pack.version`
+# is null): its pack was not loaded.
+JUDGMENT_VERDICT_NO_PACK_VERSION_REASON = 'pack_unavailable'
+JUDGMENT_VERDICT_LOCAL_SCHEMA = 'judgment_verdict_local.v1'
+JUDGMENT_VERDICT_LOCAL_FIELDS = ('schema', 'reason_text', 'reason_text_withheld', 'spans', 'floor_unavailable')
+
+
+def compute_event_hash_v1_21_judgment_verdict(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    receipt,
+):
+    """v1.21 judgment.verdict hash. `receipt` is a dict matching
+    `JudgmentVerdictFields`. Mirror of
+    `compute_event_hash_v1_21_judgment_verdict` in sqlite.rs: the SAME v1.2
+    prefix, then the event_kind wire-name, then the 14 hashed fields in
+    `JUDGMENT_VERDICT_FEED` order. The stored uploaded form (`uploaded_json`)
+    and the local-only part (`raw_response`) are outside the preimage;
+    `uploaded_sha256` and `local_sha256` bind them (see
+    `check_judgment_verdict`)."""
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_JUDGMENT_VERDICT.encode('utf-8'))
+    for name, kind in JUDGMENT_VERDICT_FEED:
+        value = receipt.get(name)
+        if kind == 'str':
+            if not isinstance(value, str):
+                raise ValueError(f"judgment_verdict.{name} is not a string, so the record has no defined preimage.")
+            h.update(encode_len_prefixed_str(value))
+        elif kind == 'u64':
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2 ** 64:
+                raise ValueError(f"judgment_verdict.{name} is not an unsigned integer, so the record has no defined preimage.")
+            h.update(struct.pack('<Q', value))
+        elif kind == 'bool':
+            if not isinstance(value, bool):
+                raise ValueError(f"judgment_verdict.{name} is not a boolean, so the record has no defined preimage.")
+            h.update(b'\x01' if value else b'\x00')
+    return h.hexdigest()
+
+
+def judgment_verdict_uploaded_sha256(uploaded_json):
+    """SHA-256 over the utf-8 bytes of the stored uploaded form."""
+    return hashlib.sha256(uploaded_json.encode('utf-8')).hexdigest()
+
+
+def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=None):
+    """For a v1.21 record, check what the hash alone cannot.
+
+    The stored uploaded form (`judgment_verdict.uploaded_json`, the receipt
+    without its reason text and spans, as text) hashes to `uploaded_sha256`,
+    is a JSON object, and carries every sealed fact of
+    `JUDGMENT_VERDICT_MIRRORED_FIELDS` with the sealed value; its
+    `judged_event_id` is the sealed `judged_upload_event_id`, the id the
+    judged record is uploaded under. It names no pack version (`pack.version`
+    null) exactly when the verdict is `pack_unavailable`. The stored local-only part (`raw_response`, null when absent)
+    hashes to `local_sha256`; `stripped` names the fields a content-stripped
+    Exchange pack removed, and when `raw_response` is among them that check
+    is left out.
+
+    The link: `judged_sequence_number` is below the record's own `seq`, and
+    when `pack_records` (sequence -> (event_id, event_hash) of the records
+    read so far) holds a record at that sequence, it is the judged record:
+    same event id (not compared for a hash-only stub) and same event hash. A
+    judged record outside the pack's window is not a problem: the receipt's
+    hash still binds the three link values.
+
+    Returns a list of problems; empty means the record checks out. Records on
+    any other schema version return no problems."""
+    if (event.get('schema_version') or 'v1') != 'v1.21':
+        return []
+    fields = event.get('judgment_verdict')
+    if not isinstance(fields, dict):
+        return ['v1.21 record carries no judgment_verdict payload']
+    problems = []
+    vid = fields.get('verdict_id', '?')
+    uploaded_json = fields.get('uploaded_json')
+    if not isinstance(uploaded_json, str):
+        return [f"verdict receipt {vid}: the record stores no uploaded form as text"]
+    got = judgment_verdict_uploaded_sha256(uploaded_json)
+    if got != fields.get('uploaded_sha256'):
+        problems.append(
+            f"verdict receipt {vid}: the stored uploaded form hashes to {got}, "
+            f"not the sealed uploaded_sha256 {fields.get('uploaded_sha256')}"
+        )
+    try:
+        uploaded = json.loads(uploaded_json)
+    except ValueError as e:
+        uploaded = None
+        problems.append(f"verdict receipt {vid}: the stored uploaded form is not JSON: {e}")
+    else:
+        if not isinstance(uploaded, dict):
+            uploaded = None
+            problems.append(f"verdict receipt {vid}: the stored uploaded form is not a JSON object")
+    if uploaded is not None:
+        for name, path in JUDGMENT_VERDICT_MIRRORED_FIELDS:
+            node, present = uploaded, True
+            for key in path:
+                if isinstance(node, dict) and key in node:
+                    node = node[key]
+                else:
+                    present = False
+                    break
+            sealed = fields.get(name)
+            if not present or type(node) is not type(sealed) or node != sealed:
+                problems.append(
+                    f"verdict receipt {vid}: the sealed `{name}` is not the `{'.'.join(path)}` "
+                    f"of the stored uploaded form"
+                )
+        # A pack version is named unless the pack was not loaded.
+        unavailable = fields.get('reason_code') == JUDGMENT_VERDICT_NO_PACK_VERSION_REASON
+        pack = uploaded.get('pack')
+        version = pack.get('version', ...) if isinstance(pack, dict) else ...
+        if unavailable:
+            version_ok = version is None
+        else:
+            version_ok = isinstance(version, int) and not isinstance(version, bool) and 0 <= version < 2 ** 64
+        if not version_ok:
+            problems.append(
+                f"verdict receipt {vid}: the stored uploaded form names a pack version on a "
+                f"{JUDGMENT_VERDICT_NO_PACK_VERSION_REASON} verdict, or none on another verdict"
+            )
+    if 'raw_response' not in stripped:
+        stored = event.get('raw_response')
+        got = sha256_jcs(stored)
+        if got != fields.get('local_sha256'):
+            problems.append(
+                f"verdict receipt {vid}: the stored local part hashes to {got}, "
+                f"not the sealed local_sha256 {fields.get('local_sha256')}"
+            )
+        if isinstance(stored, dict):
+            if (stored.get('schema') != JUDGMENT_VERDICT_LOCAL_SCHEMA
+                    or sorted(stored.keys()) != sorted(JUDGMENT_VERDICT_LOCAL_FIELDS)):
+                problems.append(
+                    f"verdict receipt {vid}: the stored local part is not a "
+                    f"{JUDGMENT_VERDICT_LOCAL_SCHEMA} object"
+                )
+        elif stored is not None:
+            problems.append(f"verdict receipt {vid}: the stored local part is not an object")
+    judged_seq = fields.get('judged_sequence_number')
+    if seq is not None and isinstance(judged_seq, int) and not isinstance(judged_seq, bool):
+        if judged_seq >= seq:
+            problems.append(
+                f"verdict receipt {vid}: names a judged record at sequence {judged_seq}, "
+                f"which is not before its own sequence {seq}"
+            )
+        elif pack_records is not None and judged_seq in pack_records:
+            judged_id, judged_hash = pack_records[judged_seq]
+            id_ok = judged_id == STUB_EVENT_ID or judged_id == fields.get('judged_event_id')
+            if not id_ok or judged_hash != fields.get('judged_event_hash'):
+                problems.append(
+                    f"verdict receipt {vid}: does not link to the pack's record at sequence "
+                    f"{judged_seq}: that record has another event id or event hash"
+                )
     return problems
 
 
@@ -3188,7 +3426,7 @@ def compute_event_hash_dispatch(
     mcp_event=None, coverage=None, join_context=None, content=None,
     identity=None, coverage_key_inventory=None, decision_receipt=None,
     evaluation_trace=None, customer=None, policy_version=None, model_executed=None,
-    compliance_record=None,
+    compliance_record=None, judgment_verdict=None,
 ):
     """Python mirror of compute_event_hash_dispatch in sqlite.rs.
 
@@ -3233,6 +3471,16 @@ def compute_event_hash_dispatch(
         isinstance(evaluation_trace, dict) and isinstance(evaluation_trace.get('outcomes_sha256_jcs'), str)
     ):
         raise ValueError("evaluation_trace has no outcomes_sha256_jcs, so the record has no defined preimage.")
+    # Fail closed. The verdict receipt payload is hashed only by the v1.21
+    # judgment.verdict hasher; anywhere else it would sit on the record
+    # unhashed.
+    if judgment_verdict is not None and (
+        schema_version != 'v1.21' or event_kind != EVENT_KIND_JUDGMENT_VERDICT
+    ):
+        raise ValueError(
+            f"judgment_verdict payload present on a {schema_version!r} "
+            f"{event_kind!r} event — it is hashed only in the v1.21 judgment.verdict bucket."
+        )
     # Fail closed. The compliance-record payload is hashed only by the v1.20
     # compliance.record hasher; anywhere else it would sit on the record
     # unhashed.
@@ -3516,6 +3764,28 @@ def compute_event_hash_dispatch(
             total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
             cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
             coverage_key_inventory,
+        )
+    if schema_version == 'v1.21':
+        # v1.21 introduces exactly one new event class: judgment.verdict.
+        # Same kind-only gate posture as v1.8, v1.13, v1.15 and v1.20.
+        if event_kind != EVENT_KIND_JUDGMENT_VERDICT:
+            raise ValueError(
+                f"schema_version v1.21 is defined only for "
+                f"judgment.verdict events; got event_kind {event_kind!r}"
+            )
+        if not isinstance(judgment_verdict, dict):
+            raise ValueError("JudgmentVerdict event missing judgment_verdict payload")
+        if any(p is not None for p in (auth_session, admin_action, mcp_event, coverage)):
+            raise ValueError(
+                "a v1.21 judgment.verdict event carries another kind's payload; "
+                "it would ride the record unhashed."
+            )
+        return compute_event_hash_v1_21_judgment_verdict(
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            judgment_verdict,
         )
     if schema_version == 'v1.20':
         # v1.20 introduces exactly one new event class: compliance.record.
@@ -4397,6 +4667,179 @@ def run_self_test():
         print('SELF-TEST assertion 37c PASS: misplaced or missing compliance payloads are refused')
     else:
         print(f'SELF-TEST assertion 37c FAIL: only {rejected} of 4 refused', file=sys.stderr)
+        ok = False
+
+    # Assertion 39a — v1.21 judgment.verdict fixture (direct fn), paired with
+    # the Rust mei3936_v1_21_judgment_verdict_fixture_hash_pinned literal. The
+    # stored uploaded form is the RFC 8785 text of the fixture receipt, so the
+    # two digests also pin the canonical form across the two languages.
+    v121_uploaded_json = jcs_dumps(_V1_21_JUDGMENT_VERDICT_FIXTURE_UPLOADED)
+    v121_payload = dict(
+        _V1_21_JUDGMENT_VERDICT_FIXTURE_PAYLOAD,
+        uploaded_sha256=judgment_verdict_uploaded_sha256(v121_uploaded_json),
+        local_sha256=sha256_jcs(_V1_21_JUDGMENT_VERDICT_FIXTURE_LOCAL),
+        uploaded_json=v121_uploaded_json,
+    )
+    v121_args = dict(
+        sequence_number=7, timestamp_utc='2026-12-01T10:00:03.000000+00:00',
+        event_id='01234567-89ab-cdef-0123-456789abcdef',
+        request_id='01234567-89ab-cdef-0123-456789abcdef', model_requested='',
+        action='allow', input_tokens=0, output_tokens=0, total_tokens=None,
+        cache_creation_input_tokens=None, cache_read_input_tokens=None,
+        cached_input_tokens=None, reasoning_tokens=None, estimated_cost_usd=None,
+        previous_hash='b' * 64,
+    )
+    got_v121 = compute_event_hash_v1_21_judgment_verdict(receipt=v121_payload, **v121_args)
+    if (got_v121 == V1_21_JUDGMENT_VERDICT_FIXTURE_HASH
+            and v121_payload['uploaded_sha256'] == V1_21_FIXTURE_UPLOADED_SHA256
+            and v121_payload['local_sha256'] == V1_21_FIXTURE_LOCAL_SHA256):
+        print('SELF-TEST assertion 39a PASS: v1.21 judgment.verdict fixture hash and stored digests match')
+    else:
+        print('SELF-TEST assertion 39a FAIL: v1.21 judgment.verdict fixture drift', file=sys.stderr)
+        print(f'  expected: {V1_21_JUDGMENT_VERDICT_FIXTURE_HASH}', file=sys.stderr)
+        print(f'  got:      {got_v121}', file=sys.stderr)
+        print(f"  uploaded_sha256 {v121_payload['uploaded_sha256']}, local_sha256 {v121_payload['local_sha256']}",
+              file=sys.stderr)
+        ok = False
+
+    # Assertion 39b — a full v1.21 record through recompute_event_hash (the
+    # production path) with a Z-suffix timestamp. Its stored uploaded form
+    # and local part are bound by their sealed digests, its sealed facts are
+    # the stored form's, and its link names the pack record at the judged
+    # sequence. The checks pass on the intact record and catch every edit.
+    v121_event = dict(
+        schema_version='v1.21', event_kind='judgment_verdict',
+        timestamp_utc='2026-12-01T10:00:03.000000Z',
+        event_id='01234567-89ab-cdef-0123-456789abcdef',
+        request_id='01234567-89ab-cdef-0123-456789abcdef', model_requested='', action='allow',
+        input_tokens=0, output_tokens=0, judgment_verdict=v121_payload,
+        raw_response=_V1_21_JUDGMENT_VERDICT_FIXTURE_LOCAL,
+    )
+    judged_id = v121_payload['judged_event_id']
+    judged_seq = v121_payload['judged_sequence_number']
+    v121_pack = {judged_seq: (judged_id, 'a' * 64)}
+    intact = check_judgment_verdict(v121_event, frozenset(), 7, v121_pack)
+
+    def with_payload(**changes):
+        return dict(v121_event, judgment_verdict=dict(v121_payload, **changes))
+
+    def with_form(reason_code, pack_version, **form):
+        """The fixture receipt with another reason code and pack version, its
+        stored form rewritten and re-digested so only those two differ."""
+        uploaded = dict(_V1_21_JUDGMENT_VERDICT_FIXTURE_UPLOADED, reason_code=reason_code, **form)
+        uploaded['pack'] = dict(uploaded['pack'], version=pack_version)
+        text = jcs_dumps(uploaded)
+        return with_payload(uploaded_json=text, uploaded_sha256=judgment_verdict_uploaded_sha256(text),
+                            reason_code=reason_code, verdict=uploaded['verdict'], source=uploaded['source'])
+
+    # A pack_unavailable receipt as the gateway seals it: INDETERMINATE, no
+    # source, no question and no backend, and no pack version.
+    unavailable = dict(verdict='INDETERMINATE', source='none', questions=[], backend=None)
+
+    extra_local = dict(_V1_21_JUDGMENT_VERDICT_FIXTURE_LOCAL, note='free text')
+    edits = {
+        'an edited reason text': dict(v121_event, raw_response=dict(
+            _V1_21_JUDGMENT_VERDICT_FIXTURE_LOCAL, reason_text='another reason')),
+        'a dropped local part': dict(v121_event, raw_response=None),
+        'a local part with another key': dict(
+            with_payload(local_sha256=sha256_jcs(extra_local)), raw_response=extra_local),
+        'an edited uploaded form': with_payload(uploaded_json=v121_uploaded_json.replace('FLAG', 'PASS')),
+        # No sealed fact mirrors the latency: only the digest catches this one.
+        'an edited member of the uploaded form that no sealed fact mirrors': with_payload(
+            uploaded_json=v121_uploaded_json.replace('"latency_ms":212', '"latency_ms":213')),
+        'a dropped uploaded form': with_payload(uploaded_json=None),
+        'an uploaded form that is not an object': with_payload(
+            uploaded_json='[]', uploaded_sha256=judgment_verdict_uploaded_sha256('[]')),
+        'no pack version on a clause_violated verdict': with_form('clause_violated', None),
+        'a pack version on a pack_unavailable verdict': with_form(
+            JUDGMENT_VERDICT_NO_PACK_VERSION_REASON, 12, **unavailable),
+    }
+    for name, _path in JUDGMENT_VERDICT_MIRRORED_FIELDS:
+        sealed = v121_payload[name]
+        edits[f'a sealed {name} that is not the stored form\'s'] = with_payload(
+            **{name: (not sealed) if isinstance(sealed, bool) else sealed + 'x'})
+    caught = {name: bool(check_judgment_verdict(e, frozenset(), 7, v121_pack)) for name, e in edits.items()}
+    link_cases = {
+        'another hash at the judged sequence': (7, {judged_seq: (judged_id, '0' * 64)}),
+        'another event id at the judged sequence': (7, {judged_seq: ('evt-other', 'a' * 64)}),
+        'a judged sequence that is its own': (judged_seq, v121_pack),
+        'a judged sequence after its own': (judged_seq - 1, v121_pack),
+    }
+    link_caught = {name: bool(check_judgment_verdict(v121_event, frozenset(), seq, pack))
+                   for name, (seq, pack) in link_cases.items()}
+    same_ids = with_form('clause_violated', 12, judged_event_id=judged_id)
+    same_ids['judgment_verdict']['judged_upload_event_id'] = judged_id
+    accepted = {
+        'the judged record outside the pack window': check_judgment_verdict(v121_event, frozenset(), 7, {}),
+        'a hash-only stub at the judged sequence': check_judgment_verdict(
+            v121_event, frozenset(), 7, {judged_seq: (STUB_EVENT_ID, 'a' * 64)}),
+        'a stripped pack without the local part': check_judgment_verdict(
+            dict(v121_event, raw_response=None), frozenset({'raw_response'}), 7, v121_pack),
+        'a pack_unavailable verdict with no pack version': check_judgment_verdict(
+            with_form(JUDGMENT_VERDICT_NO_PACK_VERSION_REASON, None, **unavailable), frozenset(), 7, v121_pack),
+        # A gateway that uploads nothing for the judged record seals its
+        # chain id as the upload id too.
+        'the same id for the chain and the upload': check_judgment_verdict(
+            same_ids, frozenset(), 7, v121_pack),
+    }
+    direct = compute_event_hash_v1_21_judgment_verdict(receipt=v121_payload, **v121_args)
+    if (recompute_event_hash(v121_event, 7, 'b' * 64) == direct and not intact
+            and all(caught.values()) and all(link_caught.values())
+            and not any(accepted.values())
+            and '"latency_ms":212' in v121_uploaded_json
+            and v121_payload['judged_upload_event_id'] != v121_payload['judged_event_id']
+            and len(caught) == 9 + len(JUDGMENT_VERDICT_MIRRORED_FIELDS)):
+        print('SELF-TEST assertion 39b PASS: v1.21 judgment.verdict recomputes, and its stored forms and '
+              'its link are checked')
+    else:
+        print(f'SELF-TEST assertion 39b FAIL: intact {intact}, '
+              f'not caught {[n for n, c in caught.items() if not c]}, '
+              f'link not caught {[n for n, c in link_caught.items() if not c]}, '
+              f'refused {[(n, p) for n, p in accepted.items() if p]}', file=sys.stderr)
+        ok = False
+
+    # Assertion 39c — the fail-closed invariants: the payload on any other
+    # version or kind, v1.21 on another kind, v1.21 without a payload, a
+    # payload with a field of the wrong type, and another kind's payload on a
+    # v1.21 record are refused by the dispatcher. Every string is fed with
+    # its length, so two adjacent strings cannot trade bytes.
+    rejected = 0
+    base_args = (7, '2026-12-01T10:00:03+00:00', 'e', 'r', '', 'allow', 0, 0,
+                 None, None, None, None, None, None, 'b' * 64)
+    refusals = (
+        # Only the guard refuses this one: the v1.1 hasher reads no payload,
+        # so without it the receipt would ride an llm_request unhashed.
+        dict(version='v1.1', event_kind=EVENT_KIND_LLM_REQUEST, judgment_verdict=v121_payload),
+        dict(version='v1.20', event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=v121_payload),
+        dict(version='v1.21', event_kind=EVENT_KIND_LLM_REQUEST, judgment_verdict=v121_payload),
+        dict(version='v1.21', event_kind=EVENT_KIND_LLM_REQUEST, judgment_verdict=None),
+        dict(version='v1.21', event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=None),
+        dict(version='v1.21', event_kind=EVENT_KIND_JUDGMENT_VERDICT,
+             judgment_verdict=dict(v121_payload, enforceable='true')),
+        dict(version='v1.21', event_kind=EVENT_KIND_JUDGMENT_VERDICT,
+             judgment_verdict=dict(v121_payload, judged_sequence_number='6')),
+        dict(version='v1.21', event_kind=EVENT_KIND_JUDGMENT_VERDICT,
+             judgment_verdict=dict(v121_payload, verdict=None)),
+        dict(version='v1.21', event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=v121_payload,
+             admin_action={'action_type': 'x', 'actor': 'y', 'description': 'z', 'metadata_json': '{}'}),
+        dict(version='v1.22', event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=v121_payload),
+    )
+    for refusal in refusals:
+        kwargs = dict(refusal)
+        version = kwargs.pop('version')
+        try:
+            compute_event_hash_dispatch(version, *base_args, **kwargs)
+        except ValueError:
+            rejected += 1
+    traded_a = dict(v121_payload, rule_id='judgment.clinical', judgment='-boundaryclinical-boundary@3')
+    traded_b = dict(v121_payload, rule_id='judgment.clinical-boundary', judgment='clinical-boundary@3')
+    traded = (compute_event_hash_v1_21_judgment_verdict(receipt=traded_a, **v121_args)
+              != compute_event_hash_v1_21_judgment_verdict(receipt=traded_b, **v121_args))
+    if rejected == len(refusals) and traded and 'judgment-verdicts-v1' in VERIFIER_CAPABILITIES:
+        print('SELF-TEST assertion 39c PASS: misplaced, missing and malformed verdict payloads are refused')
+    else:
+        print(f'SELF-TEST assertion 39c FAIL: only {rejected} of {len(refusals)} refused, '
+              f'adjacent strings distinct {traded}', file=sys.stderr)
         ok = False
 
     # Assertion 28a — v1.15 decision.receipt fixture (direct fn),
@@ -5515,6 +5958,62 @@ _V1_20_COMPLIANCE_RECORD_FIXTURE_PAYLOAD = dict(
     scan_status='no_text', findings_count=0, findings_sha256='2' * 64, fetched_at=1791000000,
 )
 
+V1_21_JUDGMENT_VERDICT_FIXTURE_HASH = "81d1d57382030a1294d8ba8df84eb788332f77dfe8bf3ae2b679bf8e4a46fc41"
+V1_21_FIXTURE_UPLOADED_SHA256 = "0c51284026816cc2d8a655066f50974aaa394fe4d56a03f0d2f04509fa51cac3"
+V1_21_FIXTURE_LOCAL_SHA256 = "554f3d8083ee02d79f757c87d8f981aa0e77f643ca706efaac5787a9cfa8626a"
+# The uploaded form of the fixture receipt (judgment_verdict.v1 without its
+# reason text and spans). The record stores its RFC 8785 text. It names the
+# judged record by the id that record is uploaded under, which on a gateway
+# that replaces event ids in its uploads is not the chain id.
+_V1_21_JUDGMENT_VERDICT_FIXTURE_UPLOADED = {
+    "schema": "judgment_verdict.v1",
+    "verdict_id": "jv_0123456789abcdef0123456789abcdef",
+    "judged_event_id": "3f9a1c0b7e2d4a65",
+    "rule_id": "judgment.clinical-boundary",
+    "judgment": "clinical-boundary@3",
+    "pack": {"version": 12, "sha256": "16ab3dd0776ecfaa867bc6aa52af0d255670b0baca0abfe02e42671aeabd1eeb"},
+    "verdict": "FLAG",
+    "source": "judge",
+    "reason_code": "clause_violated",
+    "enforceable": True,
+    "questions": [{
+        "id": "TH-SCOPE-4.2-a",
+        "clause_sha256": "1f101f0564b21282fb944a41111b2e7159e427d2fab3caa011d32bd296db1e50",
+        "outcome": "FLAG", "p": 0.93, "p_pass": 0.05, "flag_at": 0.8, "pass_at": 0.1,
+    }],
+    "execution": "gateway",
+    "backend": {
+        "id": "fixture:tessel-judge@1", "distribution": "native", "validated": True,
+        "prompt_version": "judge_prompt.v1",
+        "prompt_sha256": "3b1f3c0d5a9e7b2c4d6f8a1b3c5d7e9f0a2b4c6d8e0f1a3b5c7d9e1f3a5b7c9d",
+        "validation_run": "vr_01JFIXTURE",
+        "validation_sha256": "9d7c5b3a1f0e8d6c4b2a0f9e7d5c3b1a8f6e4d2c0b9a7f5e3d1c0b8a6f4e2d0c",
+    },
+    "timing": "before_delivery",
+    "rollout_stage": "shadow",
+    "action_taken": "allow",
+    "latency_ms": 212,
+    "evaluated_at": "2026-12-01T10:00:02Z",
+}
+_V1_21_JUDGMENT_VERDICT_FIXTURE_LOCAL = {
+    "schema": "judgment_verdict_local.v1",
+    "reason_text": "TH-SCOPE-4.2-a: The reply changes a dose. KINGFISHER-3936-reason-marker",
+    "reason_text_withheld": False,
+    "spans": [{"input": "reply", "start": 10, "end": 54}],
+    "floor_unavailable": False,
+}
+# The hashed fields; the two digests and the stored form are filled from the
+# two fixtures above.
+_V1_21_JUDGMENT_VERDICT_FIXTURE_PAYLOAD = dict(
+    verdict_id='jv_0123456789abcdef0123456789abcdef',
+    judged_event_id='5f0c6f0e-0b7a-4c57-9d6c-3d1a4c0e9a11',
+    judged_upload_event_id='3f9a1c0b7e2d4a65',
+    judged_event_hash='a' * 64, judged_sequence_number=6,
+    rule_id='judgment.clinical-boundary', judgment='clinical-boundary@3',
+    pack_sha256='16ab3dd0776ecfaa867bc6aa52af0d255670b0baca0abfe02e42671aeabd1eeb',
+    verdict='FLAG', source='judge', reason_code='clause_violated', enforceable=True,
+)
+
 V1_15_DECISION_RECEIPT_FIXTURE_HASH = "4e93ecd462a3acd7a0a73e1fe98317a35fe0da3c1876e8389d4b63c668450682"
 _V1_15_DECISION_RECEIPT_FIXTURE_EVIDENCE = [
     {"chain_id": "chain-1", "content_digests": {"payload_sha256_jcs": "c" * 64}, "event_hash": "1" * 64,
@@ -5938,6 +6437,7 @@ def recompute_event_hash(event, seq, previous_hash):
         policy_version=event.get('policy_version'),
         model_executed=event.get('model_executed'),
         compliance_record=event.get('compliance_record'),
+        judgment_verdict=event.get('judgment_verdict'),
     )
 
 
@@ -6471,6 +6971,109 @@ def boundary_key_of(event):
     return raw, None
 
 
+# The evidence-key seals a gateway writes on its chain (ADR-0113 D7, D9).
+# `evidence_key_signing_stopped` is signed by the key in force; records after
+# it may be unsigned until the next chain_signing_started, and a record signed
+# in that stretch is checked but never credited as attested (the key awaits
+# a tenant's acknowledgement). `evidence_key_lost` is sealed unsigned: the key
+# its boundary named is gone, and records after it may be unsigned until the
+# next chain_signing_started. `evidence_key_rotated` is the last record signed
+# by the old key and carries a key-rotation statement the old key signed.
+# `evidence_key_rekeyed` is signed by the new key (no old key is left to sign
+# it); its public key is the one the next chain_signing_started announces.
+EVIDENCE_KEY_SIGNING_STOPPED = 'evidence_key_signing_stopped'
+EVIDENCE_KEY_LOST = 'evidence_key_lost'
+EVIDENCE_KEY_ROTATED = 'evidence_key_rotated'
+EVIDENCE_KEY_REKEYED = 'evidence_key_rekeyed'
+EVIDENCE_KEY_SEALS = (EVIDENCE_KEY_SIGNING_STOPPED, EVIDENCE_KEY_LOST, EVIDENCE_KEY_ROTATED, EVIDENCE_KEY_REKEYED)
+KEY_ROTATION_FORMAT = 'meilynx.evidence.key_rotation.v1'
+KEY_ROTATION_DOMAIN = KEY_ROTATION_FORMAT.encode('ascii') + b'\x00'
+_FINGERPRINT_RE = re.compile(r'sha256:[0-9a-f]{64}')
+_SIG_HEX_RE = re.compile(r'[0-9a-f]{128}')
+_UTC_SECOND_RE = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ')
+
+
+def _is_fingerprint(value):
+    return isinstance(value, str) and _FINGERPRINT_RE.fullmatch(value) is not None
+
+
+def _is_count(value):
+    """A non-negative integer that is not a JSON boolean."""
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _seq_range(seqs):
+    return f'seq={seqs[0]}' if len(seqs) == 1 else f'seq={seqs[0]}..{seqs[-1]}'
+
+
+def evidence_seal_of(event):
+    """(action_type, metadata) for one of EVIDENCE_KEY_SEALS, with metadata
+    None when it is not a JSON object; (None, None) for any other record."""
+    admin = event.get('admin_action')
+    if not isinstance(admin, dict) or admin.get('action_type') not in EVIDENCE_KEY_SEALS:
+        return None, None
+    try:
+        meta = json.loads(admin.get('metadata_json') or '{}')
+    except ValueError:
+        meta = None
+    return admin['action_type'], (meta if isinstance(meta, dict) else None)
+
+
+def key_rotation_message(statement):
+    """The bytes the old key signs for a rotation (ADR-0113 D7)."""
+    return KEY_ROTATION_DOMAIN + jcs_dumps(statement).encode('utf-8')
+
+
+def key_rotation_problem(statement, signature, old_key):
+    """None when `statement` is a well-formed key-rotation statement and
+    `signature` (128 lowercase hex) verifies under `old_key` (raw 32 bytes);
+    with `old_key` None only the shape is checked. Else the problem."""
+    if not isinstance(statement, dict):
+        return 'the key-rotation statement is not a JSON object'
+    if statement.get('format') != KEY_ROTATION_FORMAT:
+        return f"the key-rotation statement's format is {statement.get('format')!r}, not {KEY_ROTATION_FORMAT!r}"
+    if not (_is_fingerprint(statement.get('old_fingerprint')) and _is_fingerprint(statement.get('new_fingerprint'))):
+        return 'the key-rotation statement carries no well-formed old_fingerprint and new_fingerprint'
+    new_key = parse_chain_key(statement.get('new_public_key'))
+    if new_key is None or chain_key_fingerprint(new_key) != statement['new_fingerprint']:
+        return "the key-rotation statement's new_public_key is not the key its new_fingerprint names"
+    if not isinstance(statement.get('proxy_id'), str) or not statement['proxy_id']:
+        return 'the key-rotation statement names no proxy_id'
+    if not (_is_count(statement.get('new_key_seq')) and statement['new_key_seq'] >= 1):
+        return 'the key-rotation statement carries no new_key_seq of 1 or more'
+    if not (isinstance(statement.get('rotated_at'), str) and _UTC_SECOND_RE.fullmatch(statement['rotated_at'])):
+        return 'the key-rotation statement carries no rotated_at (YYYY-MM-DDTHH:MM:SSZ)'
+    if not (isinstance(signature, str) and _SIG_HEX_RE.fullmatch(signature)):
+        return 'the key-rotation signature is not 128 lowercase hex characters'
+    if old_key is not None:
+        if chain_key_fingerprint(old_key) != statement['old_fingerprint']:
+            return (f"the key-rotation statement names the old key {statement['old_fingerprint']}, not the key "
+                    f"in force {chain_key_fingerprint(old_key)}")
+        if not ed25519_verify(old_key, key_rotation_message(statement), bytes.fromhex(signature)):
+            return f"the key-rotation statement does not verify under the old key {statement['old_fingerprint']}"
+    return None
+
+
+def _seal_metadata_problem(action, meta):
+    """None when an evidence-key seal's metadata has the fields ADR-0113
+    defines for it, else the problem."""
+    if action == EVIDENCE_KEY_SIGNING_STOPPED:
+        if not _is_fingerprint(meta.get('fingerprint')) or not isinstance(meta.get('reason'), str):
+            return f'{action} carries no well-formed fingerprint and reason'
+    elif action == EVIDENCE_KEY_LOST:
+        if (not _is_fingerprint(meta.get('expected_fingerprint')) or meta.get('found') not in ('missing', 'different')
+                or not (meta.get('found_fingerprint') is None or _is_fingerprint(meta.get('found_fingerprint')))):
+            return f'{action} carries no well-formed expected_fingerprint, found and found_fingerprint'
+    elif action == EVIDENCE_KEY_REKEYED:
+        if (not _is_fingerprint(meta.get('lost_fingerprint')) or not _is_fingerprint(meta.get('new_fingerprint'))
+                or not (_is_count(meta.get('new_key_seq')) and meta['new_key_seq'] >= 1)):
+            return f'{action} carries no well-formed lost_fingerprint, new_fingerprint and new_key_seq'
+    elif action == EVIDENCE_KEY_ROTATED:
+        if not isinstance(meta.get('statement'), dict) or not isinstance(meta.get('signature'), str):
+            return f'{action} carries no key-rotation statement and signature'
+    return None
+
+
 class RecordSignatureWalk:
     """Record signatures over one walk, in sequence order. Mirror of
     `SignatureWalk` in meilynx-audit/src/verification.rs.
@@ -6484,10 +7087,21 @@ class RecordSignatureWalk:
     record must verify under it: it commits to every earlier hash, so a
     consistent rewrite anywhere before it, even one that forges a boundary
     for a key of its own, fails there. Without one, the verdict says the
-    signatures were checked under the key the chain itself announces."""
+    signatures were checked under the key the chain itself announces.
 
-    def __init__(self, pinned=()):
+    The evidence-key seals (ADR-0113) open an unsigned stretch: after
+    `evidence_key_signing_stopped` or `evidence_key_lost`, unsigned records
+    are accepted until the next boundary. A record signed after
+    `evidence_key_signing_stopped` must verify and is marked pending (never
+    credited as attested). A record signed while the key is lost (the
+    `evidence_key_rekeyed` seal) is checked under the key the next boundary
+    announces. A rotation seal's statement must verify under the key in force.
+    `facts` lists every checked signature as (seq, chain_id, fingerprint or
+    None when unchecked, pending), for the attestation check after the walk."""
+
+    def __init__(self, pinned=(), pinned_label=None):
         self.pinned = {chain_key_fingerprint(k): k for k in pinned}
+        self.pinned_label = pinned_label
         self.active = None
         self.unsigned_prefix = []
         self.signed = 0
@@ -6496,42 +7110,140 @@ class RecordSignatureWalk:
         self.boundaries = []
         self.first_bad = None
         self.newest_fingerprint = None
+        self.newest_seq = None
+        # ADR-0113: None before any boundary, then signing / stopped / lost.
+        self.mode = None
+        self.facts = []
+        self.boundary_events = []
+        self.rotations = []
+        self.rekeys = []
+        self.losses = []
+        self.stops = []
+        self.stretches = []
+        self.deferred = []
+
+    def _credit(self, seq, chain_id, key, pending):
+        fp = chain_key_fingerprint(key)
+        self.signed += 1
+        self.facts.append((seq, chain_id, fp, pending))
+        if pending:
+            self.stretches[-1]['signed'].append(seq)
+        if self.newest_seq is None or seq > self.newest_seq:
+            self.newest_seq, self.newest_fingerprint = seq, fp
+
+    def _open_stretch(self, kind, seq):
+        self.stretches.append({'kind': kind, 'seq': seq, 'unsigned': [], 'signed': []})
+
+    def _resolve_deferred(self, key, boundary_seq):
+        """Check the signatures sealed while the key was lost under the key
+        the boundary at `boundary_seq` announces."""
+        problems = []
+        fp = chain_key_fingerprint(key)
+        for seq, chain_id, event_hash, sig, expected in self.deferred:
+            if expected is not None and expected != fp:
+                problems.append(f'evidence_key_rekeyed at seq={seq} names the new key {expected}, but '
+                                f'chain_signing_started at seq={boundary_seq} announces {fp}')
+            elif ed25519_verify(key, record_sig_message(chain_id, seq, event_hash), bytes.fromhex(sig)):
+                self._credit(seq, chain_id, key, False)
+            else:
+                problems.append(f'record_sig of seq={seq}, sealed after the evidence key was lost, does not verify '
+                                f'under the key chain_signing_started announces at seq={boundary_seq} ({fp})')
+        self.deferred = []
+        return problems
 
     def check(self, seq, event):
         """Problems for one record whose hash verified; [] when it checks out."""
         raw, problem = boundary_key_of(event)
         if problem:
             return [problem]
+        action, meta = evidence_seal_of(event)
+        if action is not None:
+            problem = f'{action} carries no well-formed metadata' if meta is None else _seal_metadata_problem(action, meta)
+            if problem:
+                return [problem]
+        chain_id = record_chain_id(event)
+        problems = []
         if raw is not None:
+            problems += self._resolve_deferred(raw, seq)
             self.active = raw
+            self.mode = 'signing'
             self.boundaries.append((seq, chain_key_fingerprint(raw)))
+            try:
+                boundary_meta = json.loads(event['admin_action'].get('metadata_json') or '{}')
+            except ValueError:
+                boundary_meta = {}
+            self.boundary_events.append({'seq': seq, 'chain': chain_id, 'fingerprint': chain_key_fingerprint(raw),
+                                         'meta': boundary_meta})
+        elif action == EVIDENCE_KEY_LOST:
+            if self.active is not None and meta['expected_fingerprint'] != chain_key_fingerprint(self.active):
+                problems.append(f"evidence_key_lost names the expected key {meta['expected_fingerprint']}, but the key "
+                                f"in force is {chain_key_fingerprint(self.active)}")
+            self.losses.append({'seq': seq, 'chain': chain_id, 'expected': meta['expected_fingerprint'],
+                                'found': meta['found'], 'found_fingerprint': meta.get('found_fingerprint')})
+            self.active, self.mode = None, 'lost'
+            self._open_stretch('lost', seq)
+        elif action == EVIDENCE_KEY_REKEYED:
+            self.rekeys.append({'seq': seq, 'chain': chain_id, 'lost': meta['lost_fingerprint'],
+                                'new': meta['new_fingerprint'], 'new_key_seq': meta['new_key_seq']})
+            if self.mode != 'lost':
+                self._open_stretch('rekeyed', seq)
+            self.active, self.mode = None, 'lost'
         sig = event.get('record_sig')
         if sig is None:
+            if action == EVIDENCE_KEY_REKEYED:
+                return problems + ['evidence_key_rekeyed carries no record_sig; the new key signs it']
+            if self.mode in ('stopped', 'lost'):
+                self.stretches[-1]['unsigned'].append(seq)
+                return problems
             if self.started_at is not None:
-                return [f'unsigned record after signing started at seq={self.started_at} '
-                        f'(a record_sig was removed, or the chain was rewritten without the key)']
+                return problems + [f'unsigned record after signing started at seq={self.started_at} '
+                                   f'(a record_sig was removed, or the chain was rewritten without the key)']
             self.unsigned_prefix.append(seq)
-            return []
+            return problems
         if self.started_at is None:
             self.started_at = seq
-        if not (isinstance(sig, str) and len(sig) == 128 and all(c in '0123456789abcdef' for c in sig)):
-            return ['record_sig is not 128 lowercase hex characters']
-        chain_id = record_chain_id(event)
+        if not (isinstance(sig, str) and _SIG_HEX_RE.fullmatch(sig)):
+            return problems + ['record_sig is not 128 lowercase hex characters']
         if chain_id is None:
-            return [f"record source {event.get('source')!r} names no chain this verifier knows"]
+            return problems + [f"record source {event.get('source')!r} names no chain this verifier knows"]
+        event_hash = event.get('event_hash') or ''
+        if self.mode == 'lost':
+            # No key is in force; the next boundary announces the one that signed it.
+            expected = meta['new_fingerprint'] if action == EVIDENCE_KEY_REKEYED else None
+            self.deferred.append((seq, chain_id, event_hash, sig, expected))
+            return problems
+        pending = self.mode == 'stopped'
         keys = [self.active] if self.active is not None else list(self.pinned.values())
-        if not keys:
+        key = None
+        if keys:
+            msg = record_sig_message(chain_id, seq, event_hash)
+            key = next((k for k in keys if ed25519_verify(k, msg, bytes.fromhex(sig))), None)
+            if key is None:
+                fingerprints = ', '.join(chain_key_fingerprint(k) for k in keys)
+                return problems + [f'record_sig does not verify under the chain signing key ({fingerprints})']
+            self._credit(seq, chain_id, key, pending)
+        else:
             self.unchecked += 1
             self.signed += 1
-            return []
-        msg = record_sig_message(chain_id, seq, event.get('event_hash') or '')
-        for key in keys:
-            if ed25519_verify(key, msg, bytes.fromhex(sig)):
-                self.signed += 1
-                self.newest_fingerprint = chain_key_fingerprint(key)
-                return []
-        fingerprints = ', '.join(chain_key_fingerprint(k) for k in keys)
-        return [f'record_sig does not verify under the chain signing key ({fingerprints})']
+            self.facts.append((seq, chain_id, None, pending))
+        if action == EVIDENCE_KEY_SIGNING_STOPPED:
+            if key is not None and meta['fingerprint'] != chain_key_fingerprint(key):
+                problems.append(f"evidence_key_signing_stopped names the key {meta['fingerprint']}, but it is signed "
+                                f"by {chain_key_fingerprint(key)}")
+            self.stops.append({'seq': seq, 'chain': chain_id, 'fingerprint': meta['fingerprint'],
+                               'reason': meta['reason']})
+            self.mode = 'stopped'
+            self._open_stretch('stopped', seq)
+        elif action == EVIDENCE_KEY_ROTATED:
+            statement, signature = meta['statement'], meta['signature']
+            problem = key_rotation_problem(statement, signature, key)
+            if problem:
+                problems.append(problem)
+            else:
+                self.rotations.append({'seq': seq, 'chain': chain_id, 'old': statement['old_fingerprint'],
+                                       'new': statement['new_fingerprint'], 'new_key_seq': statement['new_key_seq'],
+                                       'statement': statement, 'signature': signature, 'verified': key is not None})
+        return problems
 
     def note_failure(self, seq, event_id, problem):
         if self.first_bad is None:
@@ -6540,12 +7252,34 @@ class RecordSignatureWalk:
     def state(self):
         if self.signed == 0:
             return 'false'
-        return 'partial' if self.unsigned_prefix else 'true'
+        return 'partial' if self.unsigned_prefix or any(s['unsigned'] for s in self.stretches) else 'true'
 
     def finish(self):
         """(problems, lines): the walk-level check and the summary lines."""
         problems, lines = [], []
-        if self.pinned and self.signed and self.newest_fingerprint not in self.pinned:
+        # Signatures sealed after a lost key that no later boundary resolved.
+        for seq, chain_id, event_hash, sig, expected in self.deferred:
+            msg = record_sig_message(chain_id, seq, event_hash)
+            key = next((k for fp, k in self.pinned.items() if (expected is None or fp == expected)
+                        and ed25519_verify(k, msg, bytes.fromhex(sig))), None)
+            if key is not None:
+                self._credit(seq, chain_id, key, False)
+            elif self.pinned:
+                problems.append(f'record_sig of seq={seq}, sealed after the evidence key was lost, verifies under no '
+                                f'pinned key, and no chain_signing_started after it announces its key')
+            else:
+                self.unchecked += 1
+                self.signed += 1
+                self.facts.append((seq, chain_id, None, False))
+        self.deferred = []
+        # A key the control plane held back (its pending_acknowledgement stop
+        # seal is on the chain) is judged after the walk as not attested
+        # (ADR-0113 D9); the newest signature of any other key must verify
+        # under a pinned key.
+        held = {s['fingerprint'] for s in self.stops if s['reason'] == 'pending_acknowledgement'}
+        judged = [(seq, fp) for seq, _, fp, _ in self.facts if fp is not None and fp not in held]
+        newest_fingerprint = max(judged)[1] if judged else None
+        if self.pinned and judged and newest_fingerprint not in self.pinned:
             problems.append(
                 'the newest signed record does not verify under the pinned chain signing key '
                 f"({', '.join(sorted(self.pinned))}); the chain was re-signed under another key")
@@ -6558,7 +7292,7 @@ class RecordSignatureWalk:
                 how = (f'{self.unchecked} not checked: no chain_signing_started in this pack and no '
                        f'--chain-signing-key')
             elif self.pinned:
-                how = 'checked, the newest under the pinned key'
+                how = f"checked, the newest under {self.pinned_label or 'the pinned key'}"
             else:
                 how = ('checked under the key the chain announces; pin it with --chain-signing-key '
                        '(the proxy publishes it on /readyz)')
@@ -6567,6 +7301,16 @@ class RecordSignatureWalk:
                          f'{how}; chain_signing_started: {bounds}')
         else:
             lines.append('SIGNATURES signed=false: no record in this pack carries a record_sig')
+        for stretch in self.stretches:
+            seal = {'stopped': EVIDENCE_KEY_SIGNING_STOPPED, 'lost': EVIDENCE_KEY_LOST,
+                    'rekeyed': EVIDENCE_KEY_REKEYED}[stretch['kind']]
+            if stretch['unsigned']:
+                lines.append(f"SIGNATURES unsigned after {seal} at seq={stretch['seq']}: "
+                             f"{len(stretch['unsigned'])} record(s) {_seq_range(stretch['unsigned'])}, accepted "
+                             f"until the next chain_signing_started, verified by hash only")
+            if stretch['signed']:
+                lines.append(f"SIGNATURES signed while pending, not attested: {len(stretch['signed'])} record(s) "
+                             f"{_seq_range(stretch['signed'])} after {seal} at seq={stretch['seq']}")
         if self.first_bad is not None:
             seq, event_id, problem = self.first_bad
             lines.append(f'SIGNATURES first bad signature: seq={seq} event_id={event_id}: {problem}')
@@ -6575,7 +7319,7 @@ class RecordSignatureWalk:
 
 def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=False, holders=None,
                          receipts_out=None, records_out=None, stripped=frozenset(), cannot_evaluate_out=None,
-                         stubs=None, chain_keys=(), signatures_out=None):
+                         stubs=None, chain_keys=(), signatures_out=None, chain_keys_label=None):
     """Walk each event in the manifest, fetch its record through `fetch(seq)`,
     recompute the hash and check the chain linkage. Source-agnostic: `fetch`
     is the only thing that differs between the GCS and the offline path, so
@@ -6610,9 +7354,12 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
     `chain_keys` are the chain signing public keys the reader pinned
     (--chain-signing-key), as raw 32-byte keys. Every record's `record_sig`
     is checked (RecordSignatureWalk); `signatures_out`, when given, receives
-    the walk's verdict (`state`: true / false / partial)."""
+    the walk's verdict (`state`: true / false / partial) and the walk itself
+    (`walk`), which the gateway evidence-key check reads after the walk.
+    `chain_keys_label` names the pinned keys in the SIGNATURES line when they
+    are not the reader's own (the attested keys of --attestation-key)."""
     stubs = stubs or {}
-    sig_walk = RecordSignatureWalk(chain_keys)
+    sig_walk = RecordSignatureWalk(chain_keys, chain_keys_label)
     hash_version = manifest.get('hash_version', '')
     if hash_version not in SUPPORTED_HASH_VERSIONS:
         print(
@@ -6788,6 +7535,14 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             report(f"FAIL seq={seq}: {problem}")
             all_passed = False
             content_ok = False
+        # A v1.21 record's hash covers the digests of the verdict receipt's
+        # stored uploaded form and local-only part, and its link to the
+        # judged record; this checks the stored forms still match and the
+        # link names the pack's record at that sequence.
+        for problem in check_judgment_verdict(event, stripped, seq, pack_records):
+            report(f"FAIL seq={seq}: {problem}")
+            all_passed = False
+            content_ok = False
         # A v1.16 record's hash covers the digest of its evaluation
         # outcomes; this checks the stored outcomes still match it.
         for problem in check_evaluation_trace(event):
@@ -6865,6 +7620,7 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
         all_passed = False
     if signatures_out is not None:
         signatures_out['state'] = sig_walk.state()
+        signatures_out['walk'] = sig_walk
 
     # Each receipt's evidence against the records in
     # this pack, then the manifest's receipt index against the receipts.
@@ -13131,6 +13887,766 @@ def _tsa_certificates(resp):
 
 
 # ---------------------------------------------------------------------------
+# Gateway evidence key (ADR-0113, MEI-3749)
+#
+# A gateway holds one Ed25519 evidence key. It signs every record
+# (`record_sig`, above), its chain heads and its pack and OCSF export
+# manifests, each under a domain-separated message. The control plane attests
+# the public key with the project's P-256 attestation key; a reader pins that
+# key once (--attestation-key) and checks every attestation the pack carries
+# under it, offline. Without a control plane the reader pins the gateway's
+# own key (--gateway-key; --chain-signing-key is its alias), and the verdict
+# says the key was pinned by the reader, not certified. A pack signed under
+# `meilynx.evidence.v1` checked with neither is exit 2: nothing in the pack
+# can say whose key it is (ADR-0065 D3).
+#
+# Pack layout: evidence-keys/attestations.json (every attestation envelope,
+# oldest first), evidence-keys/rotations.json (optional; the chain's
+# evidence_key_rotated seals are authoritative) beside manifest.json, and
+# records/head-signatures/{head_sequence:020}.json, one signed chain head
+# each.
+#
+# What a key is credited for. `initial` and `re_enrollment`: from the key's
+# chain_signing_started boundary. `rotation`: from the boundary after the
+# evidence_key_rotated seal whose statement verifies under the previously
+# attested key. `acknowledged_loss`: only from `first_sequences[chain]`; the
+# key's signatures below it are reported as not attested and never counted,
+# and the verifier prints the discontinuity. A key that took over from
+# another (a rekey, or a boundary for a different key) with no verifying
+# rotation and no acknowledged_loss attestation fails the pack.
+# ---------------------------------------------------------------------------
+
+EVIDENCE_SIGNATURE_SCHEME = 'meilynx.evidence.v1'
+EVIDENCE_MANIFEST_DOMAIN = b'meilynx.evidence.manifest.v1\x00'
+EVIDENCE_MANIFEST_KIND_PACK = 'evidence_pack'
+EVIDENCE_MANIFEST_KIND_OCSF = 'ocsf_export'
+CHAIN_HEAD_FORMAT = 'meilynx.evidence.chain_head.v1'
+CHAIN_HEAD_DOMAIN = CHAIN_HEAD_FORMAT.encode('ascii') + b'\x00'
+ATTESTATION_FORMAT_VERSION = 'gateway_evidence_key_attestation.v1'
+ATTESTATION_REASONS = ('initial', 'rotation', 're_enrollment', 'acknowledged_loss')
+EVIDENCE_KEYS_DIR = 'evidence-keys'
+ATTESTATIONS_FILE = 'attestations.json'
+ROTATIONS_FILE = 'rotations.json'
+HEAD_SIGNATURES_DIR = 'head-signatures'
+_HEAD_SIGNATURE_NAME = re.compile(r'\d{20}\.json')
+_ED25519_SPKI_PREFIX = bytes.fromhex('302a300506032b6570032100')
+NO_PINNED_KEY = 'cannot evaluate: no pinned key'
+ATTESTED_BY_PIN = 'key attested by the project key you pinned'
+PINNED_NOT_CERTIFIED = 'key pinned by reader, not certified'
+
+
+def _b64url_bytes(text):
+    if not isinstance(text, str) or not re.fullmatch(r'[A-Za-z0-9_-]*', text):
+        raise ValueError('not base64url')
+    return base64.urlsafe_b64decode(text + '=' * (-len(text) % 4))
+
+
+def _b64url_text(raw):
+    return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+
+
+def p256_jwk_thumbprint(jwk):
+    """RFC 7638 thumbprint of a P-256 JWK: base64url SHA-256 over its required
+    members in lexicographic order, no whitespace."""
+    canonical = '{"crv":"P-256","kty":"EC","x":%s,"y":%s}' % (json.dumps(jwk['x']), json.dumps(jwk['y']))
+    return _b64url_text(hashlib.sha256(canonical.encode('ascii')).digest())
+
+
+def load_attestation_pin(text):
+    """(point, thumbprint) of a project's attestation key: a P-256 JWK, bare
+    or as the control plane serves it ({"keyId": ..., "jwk": {...}}). A
+    stated keyId must be the key's thumbprint. Raises ValueError."""
+    doc = json.loads(text)
+    stated = None
+    if isinstance(doc, dict) and 'jwk' in doc:
+        stated = doc.get('keyId', doc.get('key_id'))
+        doc = doc['jwk']
+    if not isinstance(doc, dict) or doc.get('kty') != 'EC' or doc.get('crv') != 'P-256':
+        raise ValueError('the attestation key must be a P-256 EC JWK')
+    x, y = _b64url_bytes(doc.get('x')), _b64url_bytes(doc.get('y'))
+    if len(x) != 32 or len(y) != 32:
+        raise ValueError('the P-256 JWK coordinates must be 32 bytes each')
+    point = (int.from_bytes(x, 'big'), int.from_bytes(y, 'big'))
+    if not _on_curve(P256, point):
+        raise ValueError('the attestation key is not a point on P-256')
+    thumbprint = p256_jwk_thumbprint(doc)
+    if stated is not None and stated != thumbprint:
+        raise ValueError(f'keyId {stated!r} is not the RFC 7638 thumbprint of the key ({thumbprint})')
+    return point, thumbprint
+
+
+def ed25519_jwk_key(jwk):
+    """The raw 32-byte key of an Ed25519 OKP JWK (RFC 8037), or None."""
+    if not isinstance(jwk, dict) or jwk.get('kty') != 'OKP' or jwk.get('crv') != 'Ed25519':
+        return None
+    try:
+        raw = _b64url_bytes(jwk.get('x'))
+    except (ValueError, binascii.Error):
+        return None
+    return raw if len(raw) == 32 and _b64url_text(raw) == jwk.get('x') else None
+
+
+def parse_gateway_key(spec):
+    """A gateway evidence key the reader pins: 64 lowercase hex characters, or
+    a file holding the key as hex, an Ed25519 JWK (bare or under "jwk") or a
+    PEM public key. Raises ValueError."""
+    raw = parse_chain_key(spec)
+    if raw is not None:
+        return raw
+    path = Path(spec)
+    if not path.is_file():
+        raise ValueError(f'{spec!r} is neither 64 lowercase hex characters nor a key file')
+    text = path.read_text(encoding='utf-8').strip()
+    raw = parse_chain_key(text)
+    if raw is not None:
+        return raw
+    if text.startswith('-----BEGIN PUBLIC KEY-----'):
+        body = text[len('-----BEGIN PUBLIC KEY-----'):]
+        if '-----END PUBLIC KEY-----' not in body:
+            raise ValueError(f'{spec}: unterminated PEM public key')
+        der = base64.b64decode(''.join(body.split('-----END PUBLIC KEY-----')[0].split()), validate=True)
+        if len(der) != 44 or not der.startswith(_ED25519_SPKI_PREFIX):
+            raise ValueError(f'{spec}: the PEM public key is not an Ed25519 key')
+        return der[len(_ED25519_SPKI_PREFIX):]
+    doc = json.loads(text)
+    if isinstance(doc, dict) and isinstance(doc.get('jwk'), dict):
+        doc = doc['jwk']
+    raw = ed25519_jwk_key(doc)
+    if raw is None:
+        raise ValueError(f'{spec}: not an Ed25519 OKP JWK')
+    return raw
+
+
+def verify_attestation(envelope, pins):
+    """One attestation envelope against the pinned attestation keys `pins`
+    ([(point, thumbprint)]). Returns (attestation, None) or (None, problem).
+    The signature covers the statement's RFC 8785 bytes (SHA-256, P-256,
+    64-byte r || s, standard base64), under the pinned key whose thumbprint
+    is the envelope's key_id; the envelope's own public_key_jwk is never
+    trusted."""
+    if not isinstance(envelope, dict) or not isinstance(envelope.get('statement'), dict):
+        return None, 'the envelope carries no statement object'
+    statement = envelope['statement']
+    try:
+        canonical = jcs_dumps(statement).encode('utf-8')
+    except ValueError as exc:
+        return None, f'the statement has no RFC 8785 form ({exc})'
+    digest = hashlib.sha256(canonical)
+    if envelope.get('sha256') != digest.hexdigest():
+        return None, "sha256 is not the SHA-256 of the statement's RFC 8785 bytes"
+    pin = next((p for p in pins if p[1] == envelope.get('key_id')), None)
+    if pin is None:
+        return None, (f"signed by attestation key {envelope.get('key_id')!r}, not the project key you pinned "
+                      f"({', '.join(p[1] for p in pins)})")
+    try:
+        raw = base64.b64decode(envelope.get('signature') or '', validate=True)
+    except (binascii.Error, ValueError, TypeError):
+        raw = b''
+    if len(raw) != 64 or not ecdsa_verify(P256, pin[0], digest.digest(), int.from_bytes(raw[:32], 'big'),
+                                          int.from_bytes(raw[32:], 'big')):
+        return None, f'the attestation signature does not verify under the project key you pinned ({pin[1]})'
+    if statement.get('format_version') != ATTESTATION_FORMAT_VERSION:
+        return None, f"format_version {statement.get('format_version')!r} is not {ATTESTATION_FORMAT_VERSION!r}"
+    key = ed25519_jwk_key(statement.get('public_key_jwk'))
+    if key is None:
+        return None, 'public_key_jwk is not an Ed25519 OKP JWK'
+    if statement.get('fingerprint') != chain_key_fingerprint(key):
+        return None, 'fingerprint is not the SHA-256 of the key public_key_jwk carries'
+    if not (_is_count(statement.get('key_seq')) and statement['key_seq'] >= 1):
+        return None, 'key_seq is not an integer of 1 or more'
+    reason = statement.get('reason')
+    if reason not in ATTESTATION_REASONS:
+        return None, f"reason {reason!r} is not one of {', '.join(ATTESTATION_REASONS)}"
+    supersedes = statement.get('supersedes')
+    if not (supersedes is None or _is_fingerprint(supersedes)):
+        return None, 'supersedes is neither null nor a key fingerprint'
+    first = statement.get('first_sequences')
+    if not (first is None or (isinstance(first, dict) and all(isinstance(c, str) and _is_count(s)
+                                                               for c, s in first.items()))):
+        return None, 'first_sequences is neither null nor a map of chain to sequence'
+    if reason == 'acknowledged_loss' and not first:
+        return None, 'an acknowledged_loss attestation names no first_sequences'
+    for field in ('org_id', 'project_id', 'proxy_id', 'not_before', 'issued_at'):
+        if not isinstance(statement.get(field), str) or not statement[field]:
+            return None, f'{field} is missing'
+    return {'statement': statement, 'key': key, 'fingerprint': statement['fingerprint'],
+            'key_seq': statement['key_seq'], 'reason': reason, 'supersedes': supersedes,
+            'first_sequences': first or {}, 'org_id': statement['org_id'], 'project_id': statement['project_id'],
+            'proxy_id': statement['proxy_id'], 'issued_at': statement['issued_at'], 'key_id': pin[1]}, None
+
+
+class EvidenceKeys:
+    """The keys a reader trusts for one pack. `mode`: `attested` (with
+    --attestation-key: the attested keys), `pinned` (--gateway-key only), or
+    `none`. `table` maps each attested fingerprint to its key, key_seq,
+    reasons, proxy ids and acknowledged_loss attestations."""
+
+    def __init__(self, pins=(), gateway_keys=()):
+        self.pins = list(pins)
+        self.gateway_keys = {chain_key_fingerprint(k): k for k in gateway_keys}
+        self.mode = 'attested' if self.pins else 'pinned' if self.gateway_keys else 'none'
+        self.attestations = []
+        self.table = {}
+        self.rotations_file = []
+        self.failures = []
+        self.present = False
+        self.missing = False
+        self.manifest_proxy = None
+        self.pinned_key_seqs = {}
+
+    def walk_keys(self):
+        """The keys the record walk checks a signature under when no boundary
+        is in force: the reader's gateway pins and the attested keys."""
+        return list(self.gateway_keys.values()) + [e['key'] for e in self.table.values()
+                                                   if chain_key_fingerprint(e['key']) not in self.gateway_keys]
+
+    def signed_before_assignment(self, fingerprint, key_seq):
+        """The raw key when `fingerprint` is attested as acknowledged_loss
+        and the signature names another key_seq: a fresh incarnation signs at
+        first boot under the key_seq it gave itself, before the control plane
+        assigns one (ADR-0113 D5 and D9 edits of 2026-11-16). Such a signature
+        is held back, never credited and never failed. Else None."""
+        entry = self.table.get(fingerprint) if self.mode == 'attested' else None
+        if entry is None or not entry['ack'] or key_seq == entry['key_seq']:
+            return None
+        return entry['key']
+
+    def resolve(self, fingerprint, key_seq):
+        """(raw key, None) for a key this reader trusts, else (None, problem)."""
+        if self.mode == 'attested':
+            entry = self.table.get(fingerprint)
+            if entry is None:
+                return None, (f'key {fingerprint} is covered by no attestation in this pack that verifies under the '
+                              f'project key you pinned')
+            if key_seq != entry['key_seq']:
+                return None, f"names key {fingerprint} as key_seq {key_seq!r}; its attestation says {entry['key_seq']}"
+            return entry['key'], None
+        if self.mode == 'pinned':
+            key = self.gateway_keys.get(fingerprint)
+            if key is None:
+                return None, (f"key {fingerprint} is not the gateway key you pinned "
+                              f"({', '.join(sorted(self.gateway_keys))})")
+            return key, None
+        return None, (f'{NO_PINNED_KEY}; pass --attestation-key (the project\'s attestation key) or --gateway-key '
+                      f'(the gateway\'s own key)')
+
+    def proxy_for(self, fingerprint, preferred=None):
+        entry = self.table.get(fingerprint)
+        if entry is None:
+            return preferred or 'unnamed'
+        return preferred if preferred in entry['proxy_ids'] else entry['proxy_ids'][-1]
+
+    def describe(self, fingerprint):
+        """The SIGNED BY line for one key."""
+        if self.mode == 'attested':
+            entry = self.table[fingerprint]
+            return (f"SIGNED BY GATEWAY {self.proxy_for(fingerprint, self.manifest_proxy)} "
+                    f"(key {fingerprint}, key_seq {entry['key_seq']}), {ATTESTED_BY_PIN}")
+        key_seq = self.pinned_key_seqs.get(fingerprint, 'unknown')
+        return (f"SIGNED BY GATEWAY {self.manifest_proxy or 'unnamed'} (key {fingerprint}, "
+                f"key_seq {key_seq}), {PINNED_NOT_CERTIFIED}")
+
+
+def load_evidence_keys(pack_dir, pins, gateway_keys, report=print):
+    """Read evidence-keys/ beside the manifest and check every attestation
+    under the pinned project keys. Failures land in `failures`, judged by
+    evaluate_gateway_evidence after the walk."""
+    keys = EvidenceKeys(pins, gateway_keys)
+    base = Path(pack_dir) / EVIDENCE_KEYS_DIR
+    envelopes, rotations = None, []
+    for name in (ATTESTATIONS_FILE, ROTATIONS_FILE):
+        path = base / name
+        if not path.is_file():
+            continue
+        keys.present = True
+        try:
+            doc = json.loads(path.read_bytes())
+        except ValueError as exc:
+            keys.failures.append(f'FAIL evidence keys: {EVIDENCE_KEYS_DIR}/{name} is not JSON ({exc})')
+            continue
+        if not isinstance(doc, list):
+            keys.failures.append(f'FAIL evidence keys: {EVIDENCE_KEYS_DIR}/{name} is not a JSON array')
+            continue
+        if name == ATTESTATIONS_FILE:
+            envelopes = doc
+        else:
+            rotations = doc
+    if keys.mode != 'attested':
+        if envelopes:
+            report(f'EVIDENCE KEYS: {len(envelopes)} attestation(s) in {EVIDENCE_KEYS_DIR}/{ATTESTATIONS_FILE}, not '
+                   f'checked: pass --attestation-key with the project\'s attestation key to check them')
+        return keys
+    if envelopes is None:
+        keys.missing = True
+        report(f'EVIDENCE KEYS: the pack carries no {EVIDENCE_KEYS_DIR}/{ATTESTATIONS_FILE}; no key in it is attested')
+    for n, envelope in enumerate(envelopes or []):
+        attestation, problem = verify_attestation(envelope, keys.pins)
+        if problem:
+            keys.failures.append(f'FAIL attestation {n} in {EVIDENCE_KEYS_DIR}/{ATTESTATIONS_FILE}: {problem}')
+            continue
+        keys.attestations.append(attestation)
+    projects = sorted({(a['org_id'], a['project_id']) for a in keys.attestations})
+    if len(projects) > 1:
+        keys.failures.append(f'FAIL evidence keys: the attestations name more than one organization or project '
+                             f'({projects})')
+    for a in keys.attestations:
+        entry = keys.table.setdefault(a['fingerprint'], {'key': a['key'], 'key_seq': a['key_seq'], 'reasons': set(),
+                                                         'proxy_ids': [], 'ack': [], 'supersedes': []})
+        if entry['key_seq'] != a['key_seq']:
+            keys.failures.append(f"FAIL evidence keys: {a['fingerprint']} is attested as key_seq {entry['key_seq']} "
+                                 f"and as key_seq {a['key_seq']}")
+        entry['reasons'].add(a['reason'])
+        if a['proxy_id'] not in entry['proxy_ids']:
+            entry['proxy_ids'].append(a['proxy_id'])
+        if a['reason'] == 'acknowledged_loss':
+            entry['ack'].append(a)
+        if a['supersedes'] and a['supersedes'] not in entry['supersedes']:
+            entry['supersedes'].append(a['supersedes'])
+    for n, item in enumerate(rotations):
+        if isinstance(item, dict) and isinstance(item.get('statement'), dict):
+            keys.rotations_file.append((item['statement'], item.get('signature')))
+        else:
+            keys.failures.append(f'FAIL evidence keys: entry {n} of {EVIDENCE_KEYS_DIR}/{ROTATIONS_FILE} carries no '
+                                 f'statement')
+    if keys.attestations:
+        listed = '; '.join(f"{fp} key_seq {e['key_seq']} ({', '.join(sorted(e['reasons']))})"
+                           for fp, e in sorted(keys.table.items(), key=lambda kv: kv[1]['key_seq']))
+        report(f"EVIDENCE KEYS: {len(keys.attestations)} attestation(s) verified under the project key you pinned "
+               f"({', '.join(sorted({a['key_id'] for a in keys.attestations}))}): {listed}")
+    return keys
+
+
+def evidence_manifest_message(kind, manifest):
+    """The bytes a `meilynx.evidence.v1` manifest signature covers: the domain
+    tag, the kind, and the manifest's RFC 8785 bytes without `signature`."""
+    body = {k: v for k, v in manifest.items() if k != 'signature'}
+    return EVIDENCE_MANIFEST_DOMAIN + kind.encode('ascii') + b'\x00' + jcs_dumps(body).encode('utf-8')
+
+
+def is_evidence_signed(manifest):
+    descriptor = manifest.get('signature') if isinstance(manifest, dict) else None
+    return isinstance(descriptor, dict) and descriptor.get('scheme') == EVIDENCE_SIGNATURE_SCHEME
+
+
+def check_evidence_manifest_signature(manifest, kind, keys):
+    """(status, line, fingerprint) for a manifest signed under
+    `meilynx.evidence.v1`: PASSED, FAILED, or CANNOT_EVALUATE with no pin."""
+    descriptor = manifest['signature']
+    fingerprint, key_seq = descriptor.get('key_fingerprint'), descriptor.get('key_seq')
+    if (descriptor.get('alg') != 'Ed25519' or not _is_fingerprint(fingerprint)
+            or not (_is_count(key_seq) and key_seq >= 1)):
+        return FAILED, (f'FAIL {kind} manifest signature: the {EVIDENCE_SIGNATURE_SCHEME} descriptor carries no alg '
+                        f'Ed25519, key_fingerprint and key_seq'), None
+    try:
+        value = base64.b64decode(descriptor.get('value') or '', validate=True)
+    except (binascii.Error, ValueError, TypeError):
+        value = b''
+    if len(value) != 64:
+        return FAILED, f'FAIL {kind} manifest signature: value is not 64 bytes of standard base64', None
+    if keys is None or keys.mode == 'none':
+        return CANNOT_EVALUATE, (f'CANNOT EVALUATE {kind} manifest signature: {NO_PINNED_KEY}. It is signed by '
+                                 f'gateway key {fingerprint} (key_seq {key_seq}); nothing in the pack can say whose '
+                                 f'key that is. Pass --attestation-key (the project\'s attestation key) or '
+                                 f'--gateway-key (the gateway\'s own key).'), None
+    early = keys.signed_before_assignment(fingerprint, key_seq)
+    key, problem = (early, None) if early is not None else keys.resolve(fingerprint, key_seq)
+    if problem:
+        return FAILED, f'FAIL {kind} manifest signature: {problem}', None
+    try:
+        message = evidence_manifest_message(kind, manifest)
+    except ValueError as exc:
+        return FAILED, f'FAIL {kind} manifest signature: the manifest has no RFC 8785 form ({exc})', None
+    if early is not None:
+        if not ed25519_verify(key, message, value):
+            return FAILED, (f'FAIL {kind} manifest signature: does not verify under {fingerprint} (the manifest '
+                            f'changed after signing, or another key signed it)'), None
+        return CANNOT_EVALUATE, (f"NOT ATTESTED: the {kind} manifest is signed by gateway key {fingerprint} as "
+                                 f"key_seq {key_seq}, before the control plane gave the key key_seq "
+                                 f"{keys.table[fingerprint]['key_seq']} and before it was approved; reported, not "
+                                 f"counted"), None
+    if not ed25519_verify(key, message, value):
+        return FAILED, (f'FAIL {kind} manifest signature: does not verify under {fingerprint} (the manifest '
+                        f'changed after signing, or another key signed it)'), None
+    return PASSED, f'SIGNATURE OK: the {kind} manifest is signed by gateway key {fingerprint} (key_seq {key_seq})', \
+        fingerprint
+
+
+def load_head_signatures(records_dir):
+    """[(file name, document or None, problem or None)] under
+    records/head-signatures/, sorted by name."""
+    if records_dir is None:
+        return []
+    directory = Path(records_dir) / HEAD_SIGNATURES_DIR
+    if not directory.is_dir():
+        return []
+    out = []
+    for path in sorted(directory.iterdir()):
+        if not path.is_file():
+            continue
+        if not _HEAD_SIGNATURE_NAME.fullmatch(path.name):
+            out.append((path.name, None, 'is not named {head_sequence:020}.json'))
+            continue
+        try:
+            out.append((path.name, json.loads(path.read_bytes()), None))
+        except ValueError as exc:
+            out.append((path.name, None, f'is not JSON ({exc})'))
+    return out
+
+
+def chain_head_parts(doc, name):
+    """(statement, signature bytes, None), or (None, None, problem)."""
+    if not isinstance(doc, dict) or not isinstance(doc.get('statement'), dict):
+        return None, None, 'carries no statement object'
+    st = doc['statement']
+    if st.get('format') != CHAIN_HEAD_FORMAT:
+        return None, None, f"format {st.get('format')!r} is not {CHAIN_HEAD_FORMAT!r}"
+    for field in ('proxy_id', 'chain_id', 'hash_version', 'signed_at'):
+        if not isinstance(st.get(field), str) or not st[field]:
+            return None, None, f'{field} is missing'
+    # A gateway with no attestation (air-gapped) names no organization or
+    # project; the reader then pins its key (--gateway-key).
+    for field in ('org_id', 'project_id'):
+        if field in st and (not isinstance(st[field], str) or not st[field]):
+            return None, None, f'{field} is not a non-empty string'
+    if not (_is_count(st.get('first_sequence')) and _is_count(st.get('head_sequence'))
+            and st['first_sequence'] <= st['head_sequence']):
+        return None, None, 'first_sequence and head_sequence are not sequences with first <= head'
+    if not (isinstance(st.get('head_event_hash'), str) and _EVENT_HASH_RE.fullmatch(st['head_event_hash'])):
+        return None, None, 'head_event_hash is not 64 lowercase hex characters'
+    if not _is_fingerprint(st.get('key_fingerprint')) or not (_is_count(st.get('key_seq')) and st['key_seq'] >= 1):
+        return None, None, 'carries no well-formed key_fingerprint and key_seq'
+    if name != f"{st['head_sequence']:020d}.json":
+        return None, None, f"the file name does not match head_sequence {st['head_sequence']}"
+    sig = doc.get('signature')
+    if not (isinstance(sig, str) and _SIG_HEX_RE.fullmatch(sig)):
+        return None, None, 'signature is not 128 lowercase hex characters'
+    return st, bytes.fromhex(sig), None
+
+
+def evaluate_gateway_evidence(manifest, keys, walk, records, records_dir, report=print):
+    """The gateway evidence-key verdict over a pack, after the record walk.
+    `records` is seq -> record as the walk read it. Prints its lines and
+    returns (evidence_status, signature_status, verdict): evidence_status is
+    PASSED, FAILED, CANNOT_EVALUATE or COVERAGE_NOT_ESTABLISHED (a verified
+    signed head after a chain_to_head pack's last record); signature_status
+    is the `meilynx.evidence.v1` manifest signature's (None when the manifest
+    is not signed under it); verdict is the SIGNED BY line for the key that
+    signed the manifest, or None."""
+    failures = list(keys.failures)
+    discontinuities, lines, notes, cannot = [], [], [], []
+    attested = keys.mode == 'attested'
+    table = keys.table
+    keys.manifest_proxy = manifest.get('proxy_id') if isinstance(manifest.get('proxy_id'), str) else None
+    descriptor = manifest.get('signature') if is_evidence_signed(manifest) else None
+    keys.pinned_key_seqs = {}
+    for b in walk.boundary_events:
+        if _is_count(b['meta'].get('key_seq')):
+            keys.pinned_key_seqs[b['fingerprint']] = b['meta']['key_seq']
+    if descriptor is not None and _is_count(descriptor.get('key_seq')):
+        keys.pinned_key_seqs.setdefault(descriptor.get('key_fingerprint'), descriptor['key_seq'])
+    chains = sorted({c for c in (record_chain_id(e) for e in records.values() if isinstance(e, dict)) if c})
+    seqs = sorted(records)
+    hi = manifest.get('to_sequence') if _is_count(manifest.get('to_sequence')) else (seqs[-1] if seqs else None)
+    to_head = claim_scope(manifest) == CLAIM_CHAIN_TO_HEAD
+
+    if attested and keys.attestations:
+        for field in ('org_id', 'project_id'):
+            named = sorted({a[field] for a in keys.attestations})
+            if isinstance(manifest.get(field), str) and manifest[field] not in named:
+                failures.append(f"FAIL evidence keys: the manifest names {field} {manifest[field]!r}; the "
+                                f"attestations name {', '.join(named)}")
+
+    # Rotations, verified under the attested old key: (old, new) -> seal seq
+    # (None for a statement only in rotations.json).
+    links = {}
+    if attested:
+        for r in walk.rotations:
+            old = table.get(r['old'])
+            if old is None:
+                failures.append(f"FAIL seq={r['seq']}: evidence_key_rotated names the old key {r['old']}, which no "
+                                f"attestation in this pack covers")
+                continue
+            problem = key_rotation_problem(r['statement'], r['signature'], old['key'])
+            if problem:
+                failures.append(f"FAIL seq={r['seq']}: {problem}")
+                continue
+            links.setdefault((r['old'], r['new']), r['seq'])
+        for statement, signature in keys.rotations_file:
+            old = table.get(statement.get('old_fingerprint'))
+            problem = key_rotation_problem(statement, signature, old['key'] if old else None)
+            if problem:
+                failures.append(f'FAIL {EVIDENCE_KEYS_DIR}/{ROTATIONS_FILE}: {problem}')
+            elif old is None:
+                notes.append(f"NOTICE {EVIDENCE_KEYS_DIR}/{ROTATIONS_FILE}: a rotation from "
+                             f"{statement['old_fingerprint']}, which no attestation covers, was not used")
+            else:
+                links.setdefault((statement['old_fingerprint'], statement['new_fingerprint']), None)
+
+    def first_boundary(fingerprint, chain, after=None):
+        for b in walk.boundary_events:
+            if b['fingerprint'] == fingerprint and b['chain'] == chain and (after is None or b['seq'] > after):
+                return b['seq']
+        return None
+
+    def credit_start(fingerprint, chain):
+        """The first sequence on `chain` from which a signature by the key is
+        attested, -1 for the whole pack, None for never."""
+        entry = table[fingerprint]
+        if entry['ack']:
+            starts = [a['first_sequences'][chain] for a in entry['ack'] if chain in a['first_sequences']]
+            return min(starts) if starts else None
+        if 'rotation' in entry['reasons']:
+            for old in entry['supersedes']:
+                seal = links.get((old, fingerprint))
+                if seal is not None:
+                    boundary = first_boundary(fingerprint, chain, seal)
+                    return boundary if boundary is not None else seal + 1
+        boundary = first_boundary(fingerprint, chain)
+        return boundary if boundary is not None else -1
+
+    def key_in_force(chain, seq):
+        """The key the chain's own seals put in force at `seq`, or None."""
+        events = sorted([(b['seq'], b['fingerprint']) for b in walk.boundary_events if b['chain'] == chain]
+                        + [(r['seq'], r['new']) for r in walk.rekeys if r['chain'] == chain]
+                        + [(lost['seq'], None) for lost in walk.losses if lost['chain'] == chain])
+        current = None
+        for s, fingerprint in events:
+            if s > seq:
+                break
+            current = fingerprint
+        return current
+
+    # Pending is not tampering (ADR-0113 D9): a key the control plane held
+    # back seals evidence_key_signing_stopped {reason: pending_acknowledgement}
+    # as the last record it signs. Its signatures up to that seal (and any it
+    # made while pending) are reported as not attested, never failed; a key
+    # that signs with no attestation and no such seal still fails.
+    held_back, announced = {}, {}
+    for stop in walk.stops:
+        if stop['reason'] == 'pending_acknowledgement':
+            key = (stop['chain'], stop['fingerprint'])
+            held_back[key] = max(held_back.get(key, stop['seq']), stop['seq'])
+    for b in walk.boundary_events:
+        raw = parse_chain_key(b['meta'].get('public_key')) if isinstance(b['meta'], dict) else None
+        if raw is not None and chain_key_fingerprint(raw) == b['fingerprint']:
+            announced[b['fingerprint']] = raw
+
+    def held_before(chain, fingerprint, seq, pending=False):
+        stop = held_back.get((chain, fingerprint))
+        return stop is not None and fingerprint not in table and (seq <= stop or pending)
+
+    credited = {}
+    if attested:
+        below, unattested, unchecked, held = {}, {}, [], {}
+        for seq, chain, fingerprint, pending in walk.facts:
+            if fingerprint is None:
+                unchecked.append(seq)
+            elif held_before(chain, fingerprint, seq, pending):
+                held.setdefault((fingerprint, chain), []).append(seq)
+            elif fingerprint not in table:
+                unattested.setdefault(fingerprint, []).append(seq)
+            elif not pending:
+                start = credit_start(fingerprint, chain)
+                if start is None or seq < start:
+                    below.setdefault((fingerprint, chain, start), []).append(seq)
+                else:
+                    credited.setdefault(fingerprint, []).append(seq)
+        for fingerprint, signed in unattested.items():
+            failures.append(f'FAIL signatures: {len(signed)} record(s) {_seq_range(signed)} verify under {fingerprint}, '
+                            f'a key no attestation in this pack covers')
+        for (fingerprint, chain), signed in held.items():
+            notes.append(f'NOT ATTESTED (signed before the key was held back): {len(signed)} record(s) '
+                         f'{_seq_range(signed)} signed by {fingerprint}, a key the control plane held back pending '
+                         f'acknowledgement at seq={held_back[(chain, fingerprint)]} on chain {chain}; reported, not '
+                         f'counted')
+        if unchecked:
+            failures.append(f'FAIL signatures: {len(unchecked)} record(s) {_seq_range(unchecked)} carry a record_sig '
+                            f'no attested key in this pack checks')
+        for (fingerprint, chain, start), signed in sorted(below.items(), key=lambda kv: kv[1][0]):
+            where = (f'before seq {start}, the first sequence its acknowledged_loss attestation covers on chain {chain}'
+                     if start is not None else f'on chain {chain}, which its acknowledged_loss attestation does not cover')
+            notes.append(f"NOT ATTESTED: {len(signed)} record(s) {_seq_range(signed)} signed by {fingerprint} "
+                         f"(key_seq {table[fingerprint]['key_seq']}) {where}; reported, not counted")
+
+        # A key that took over with no rotation the old key signed and no
+        # acknowledged_loss attestation.
+        acknowledged = {fp for fp, e in table.items() if e['ack']}
+        for chain in chains:
+            events = sorted([(b['seq'], 1, 'boundary', b['fingerprint'], None) for b in walk.boundary_events
+                             if b['chain'] == chain]
+                            + [(r['seq'], 0, 'rekey', r['new'], r['lost']) for r in walk.rekeys if r['chain'] == chain]
+                            + [(lost['seq'], 0, 'lost', None, lost['expected']) for lost in walk.losses
+                               if lost['chain'] == chain])
+            previous, judged = None, set()
+            for seq, _, kind, fingerprint, other in events:
+                if kind == 'lost':
+                    previous = previous or other
+                    continue
+                if kind == 'rekey':
+                    if fingerprint not in acknowledged:
+                        failures.append(f'FAIL seq={seq}: key replaced without acknowledgement: evidence_key_rekeyed '
+                                        f'replaces {other} with {fingerprint}, and no acknowledged_loss attestation '
+                                        f'for {fingerprint} is in this pack')
+                    judged.add(fingerprint)
+                    previous = fingerprint
+                    continue
+                if previous is not None and fingerprint != previous and fingerprint not in judged:
+                    if (previous, fingerprint) not in links and fingerprint not in acknowledged:
+                        failures.append(f'FAIL seq={seq}: key replaced without acknowledgement: chain_signing_started '
+                                        f'announces {fingerprint} after {previous}, with no rotation the old key '
+                                        f'signed and no acknowledged_loss attestation for {fingerprint} in this pack')
+                    judged.add(fingerprint)
+                previous = fingerprint
+
+        for fingerprint, entry in sorted(table.items(), key=lambda kv: kv[1]['key_seq']):
+            for a in entry['ack']:
+                for chain in chains:
+                    if chain not in a['first_sequences']:
+                        continue
+                    old = a['supersedes']
+                    old_seq = table[old]['key_seq'] if old in table else a['key_seq'] - 1
+                    discontinuities.append(f"KEY DISCONTINUITY at seq {a['first_sequences'][chain]}: key {old} "
+                                 f"(key_seq {old_seq}) lost; replaced by {fingerprint} (key_seq {a['key_seq']}), "
+                                 f"acknowledged {a['issued_at'][:10]}")
+        for fingerprint in sorted(credited, key=lambda fp: table[fp]['key_seq']):
+            lines.append(keys.describe(fingerprint))
+            lines.append(f'  {len(credited[fingerprint])} record signature(s) credited, '
+                         f'{_seq_range(credited[fingerprint])}')
+    elif keys.mode == 'pinned':
+        for seq, chain, fingerprint, pending in walk.facts:
+            if fingerprint in keys.gateway_keys and not pending:
+                credited.setdefault(fingerprint, []).append(seq)
+        for fingerprint in sorted(credited):
+            lines.append(keys.describe(fingerprint))
+            lines.append(f'  {len(credited[fingerprint])} record signature(s) under the key you pinned, '
+                         f'{_seq_range(credited[fingerprint])}')
+
+    # Signed chain heads.
+    beyond, heads_ok, heads_unchecked = [], [], 0
+    for name, doc, problem in load_head_signatures(records_dir):
+        if problem:
+            failures.append(f'FAIL signed head {HEAD_SIGNATURES_DIR}/{name}: {problem}')
+            continue
+        statement, signature, problem = chain_head_parts(doc, name)
+        if problem:
+            failures.append(f'FAIL signed head {HEAD_SIGNATURES_DIR}/{name}: {problem}')
+            continue
+        head_seq, fingerprint, chain = statement['head_sequence'], statement['key_fingerprint'], statement['chain_id']
+        if keys.mode == 'none':
+            heads_unchecked += 1
+            continue
+        held_head = attested and held_before(chain, fingerprint, head_seq) and fingerprint in announced
+        # Signed under a key_seq the gateway gave itself before the control
+        # plane assigned one: below the first covered sequence (judged below)
+        # it is reported, never failed (ADR-0113 D9 edit 2026-11-16).
+        early = None if held_head else keys.signed_before_assignment(fingerprint, statement['key_seq'])
+        if early is not None:
+            start = credit_start(fingerprint, chain)
+            if start is not None and head_seq >= start:
+                early = None
+        key, problem = ((announced[fingerprint], None) if held_head else (early, None) if early is not None
+                        else keys.resolve(fingerprint, statement['key_seq']))
+        if problem:
+            failures.append(f'FAIL signed head seq={head_seq}: {problem}')
+            continue
+        try:
+            message = CHAIN_HEAD_DOMAIN + jcs_dumps(statement).encode('utf-8')
+        except ValueError as exc:
+            failures.append(f'FAIL signed head seq={head_seq}: the statement has no RFC 8785 form ({exc})')
+            continue
+        if not ed25519_verify(key, message, signature):
+            failures.append(f'FAIL signed head seq={head_seq}: the signature does not verify under {fingerprint}')
+            continue
+        if (attested and keys.attestations
+                and statement.get('project_id') not in {a['project_id'] for a in keys.attestations}):
+            failures.append(f"FAIL signed head seq={head_seq}: names project {statement.get('project_id')!r}, not "
+                            f"the attested project")
+            continue
+        if chain not in chains:
+            notes.append(f'NOTICE signed head seq={head_seq}: names chain {chain}, which no record in this pack is on; '
+                         f'not judged')
+            continue
+        if hi is not None and head_seq > hi:
+            if to_head:
+                beyond.append(head_seq)
+                lines.append(f'COVERAGE signed head seq={head_seq}: a chain head signed by {fingerprint} names chain '
+                             f'{chain} at seq={head_seq}, after this pack\'s last record seq={hi}; the pack claims the '
+                             f'chain only up to seq={hi}')
+            else:
+                notes.append(f'NOTICE signed head seq={head_seq}: after this window\'s last record seq={hi}; not judged')
+            continue
+        record = records.get(head_seq)
+        if record is None:
+            notes.append(f'NOTICE signed head seq={head_seq}: the record at that sequence is not in this pack; its '
+                         f'hash was not compared')
+            continue
+        if statement['head_event_hash'] != record.get('event_hash'):
+            failures.append(f"FAIL signed head seq={head_seq}: names head_event_hash "
+                            f"{statement['head_event_hash'][:16]}..., but the pack's record at seq={head_seq} has "
+                            f"{str(record.get('event_hash'))[:16]}...; a head the gateway signed contradicts the pack")
+            continue
+        if statement['hash_version'] != record.get('schema_version'):
+            failures.append(f"FAIL signed head seq={head_seq}: names hash_version {statement['hash_version']!r}, but "
+                            f"the record at seq={head_seq} is {record.get('schema_version')!r}")
+            continue
+        in_force = key_in_force(chain, head_seq)
+        if in_force is not None and in_force != fingerprint:
+            failures.append(f'FAIL signed head seq={head_seq}: signed by {fingerprint}, but the key in force at '
+                            f'seq={head_seq} is {in_force}')
+            continue
+        if held_head:
+            notes.append(f'NOT ATTESTED (signed before the key was held back): signed head seq={head_seq} by '
+                         f'{fingerprint}; reported, not counted')
+            continue
+        if attested:
+            start = credit_start(fingerprint, chain)
+            if start is None or head_seq < start:
+                notes.append(f'NOT ATTESTED: signed head seq={head_seq} by {fingerprint} is below the first sequence '
+                             f'its attestation covers; reported, not counted')
+                continue
+        heads_ok.append(head_seq)
+    if heads_ok:
+        lines.append(f'SIGNED HEADS: {len(heads_ok)} verified ({_seq_range(sorted(heads_ok))}), each matching the '
+                     f'pack\'s record at its head_sequence')
+    if heads_unchecked:
+        notes.append(f'NOTICE: {heads_unchecked} signed chain head(s) not checked: no pinned key')
+
+    # The manifest signature.
+    signature_status, verdict = None, None
+    if descriptor is not None:
+        signature_status, line, fingerprint = check_evidence_manifest_signature(
+            manifest, EVIDENCE_MANIFEST_KIND_PACK, keys)
+        lines.append(line)
+        if signature_status == PASSED:
+            verdict = keys.describe(fingerprint)
+            if attested:
+                entry = table[fingerprint]
+                if keys.manifest_proxy and keys.manifest_proxy not in entry['proxy_ids']:
+                    notes.append(f"NOTICE: the manifest names proxy {keys.manifest_proxy}; the attestations of "
+                                 f"{fingerprint} name {', '.join(entry['proxy_ids'])}")
+    elif keys.mode == 'attested' and keys.missing and not failures:
+        cannot.append(f'CANNOT EVALUATE gateway evidence key: --attestation-key was given, but the pack carries no '
+                      f'{EVIDENCE_KEYS_DIR}/{ATTESTATIONS_FILE}')
+
+    for line in discontinuities + notes + lines + cannot + failures:
+        report(line)
+    if beyond:
+        report(f'COVERAGE NOT ESTABLISHED through seq={max(beyond)}: the gateway signed a chain head at '
+               f'seq={max(beyond)}, but this pack claims the chain only up to its head at seq={hi}. The pack was '
+               f'built before that head, or records after seq={hi} were removed; nothing in the pack can say which. '
+               f'Get a pack that runs through seq={max(beyond)}.')
+    if failures:
+        status = FAILED
+    elif cannot:
+        status = CANNOT_EVALUATE
+    elif beyond:
+        status = COVERAGE_NOT_ESTABLISHED
+    else:
+        status = PASSED
+    return status, signature_status, verdict
+
+
+# ---------------------------------------------------------------------------
 # OCSF evidence export
 # ---------------------------------------------------------------------------
 
@@ -13186,6 +14702,27 @@ def verify_ocsf_manifest_signature(manifest_bytes, signature_b64, public_point):
     return ecdsa_verify(P256, public_point, hashlib.sha256(manifest_bytes).digest(), r, s_)
 
 
+def ocsf_signed_record_entries(manifest):
+    """({sequence: event_hash}, None) for the `records` of an OCSF manifest
+    signed under `meilynx.evidence.v1` (ADR-0113 D3: every record entry
+    carries its event_hash), else (None, problem)."""
+    entries = manifest.get('records')
+    if not isinstance(entries, list) or not entries:
+        return None, 'a manifest signed by the gateway evidence key names no records'
+    out = {}
+    for n, entry in enumerate(entries):
+        seq = entry.get('sequence') if isinstance(entry, dict) else None
+        if not _is_count(seq) or seq in out:
+            return None, f'records[{n}] names no sequence, or one listed twice'
+        if not (isinstance(entry.get('event_hash'), str) and _EVENT_HASH_RE.fullmatch(entry['event_hash'])):
+            return None, f'records[{n}] (seq={seq}) carries no event_hash'
+        out[seq] = entry['event_hash']
+    last = manifest.get('last_record')
+    if isinstance(last, dict) and out.get(last.get('sequence')) != last.get('event_hash'):
+        return None, 'last_record does not name the event_hash its entry in records names'
+    return out, None
+
+
 def load_ocsf_export(path):
     """The export manifests `path` names: a `.manifest.json` file, a day's
     `index.json` (its `manifests` keys resolved against the sink root that
@@ -13229,7 +14766,7 @@ def load_ocsf_export(path):
     return out
 
 
-def verify_ocsf_export(entries, pack_chain, pack_records, public_point=None, quiet=False):
+def verify_ocsf_export(entries, pack_chain, pack_records, public_point=None, quiet=False, evidence_keys=None):
     """Check an OCSF export against the pack. `entries` is what
     load_ocsf_export returned; `pack_chain` the pack's chain name;
     `pack_records` sequence -> the pack record (as verify_manifest_with
@@ -13237,7 +14774,14 @@ def verify_ocsf_export(entries, pack_chain, pack_records, public_point=None, qui
     PASSED, FAILED or CANNOT_EVALUATE; signature is PASSED (every manifest
     signed and verified), FAILED (a signature did not verify, or a manifest
     says it is signed and has no `.sig`), UNSIGNED (at least one manifest
-    unsigned, or signed with no public key given), or CANNOT_EVALUATE."""
+    unsigned, or signed with no public key given), or CANNOT_EVALUATE.
+
+    A manifest whose `signature` names the scheme `meilynx.evidence.v1` is
+    signed by the gateway evidence key (ADR-0113 D3): it is checked under the
+    keys in `evidence_keys` (EvidenceKeys), and with no pinned key it cannot
+    be evaluated. Any other manifest keeps the legacy ADR-0090 D4 form: a
+    detached ECDSA P-256 `.manifest.sig` over its bytes, checked under
+    `public_point`."""
     import gzip
 
     def report(line):
@@ -13282,7 +14826,20 @@ def verify_ocsf_export(entries, pack_chain, pack_records, public_point=None, qui
         # Signature.
         sig_path = mpath.with_name(mpath.name[:-len('.manifest.json')] + '.manifest.sig') \
             if mpath.name.endswith('.manifest.json') else mpath.with_suffix('.sig')
-        if m.get('signed'):
+        signed_entries = None
+        if version == OCSF_SIGNED_MAPPING_VERSION and not is_evidence_signed(m):
+            report(f"FAIL {label}: mapping_version {version!r} names a manifest signed by the gateway evidence key, "
+                   f"and it carries no {EVIDENCE_SIGNATURE_SCHEME} signature (removed after signing)")
+            sig_statuses.append(FAILED)
+        elif is_evidence_signed(m):
+            status, line, _ = check_evidence_manifest_signature(m, EVIDENCE_MANIFEST_KIND_OCSF, evidence_keys)
+            report(line.replace(f'{EVIDENCE_MANIFEST_KIND_OCSF} manifest', label, 1))
+            sig_statuses.append(status)
+            signed_entries, problem = ocsf_signed_record_entries(m)
+            if problem:
+                report(f"FAIL {label}: {problem}")
+                content_ok = False
+        elif m.get('signed'):
             if not sig_path.exists():
                 report(f"FAIL {label}: manifest says it is signed but {sig_path.name} is missing")
                 sig_statuses.append(FAILED)
@@ -13346,11 +14903,23 @@ def verify_ocsf_export(entries, pack_chain, pack_records, public_point=None, qui
                 content_ok = False
                 continue
             sequences.add(seq)
+            if signed_entries is not None and signed_entries.get(seq) != chain.get('event_hash'):
+                report(f"FAIL {label} line {n} seq={seq}: the signed manifest names event_hash "
+                       f"{str(signed_entries.get(seq))[:16]}..., the event {str(chain.get('event_hash'))[:16]}...")
+                content_ok = False
             if chain_id != pack_chain or seq not in pack_records:
                 outside += 1
                 continue
             record = pack_records[seq]
             problems = []
+            if signed_entries is not None:
+                try:
+                    recomputed = recompute_event_hash(record, seq, record.get('previous_hash'))
+                except (KeyError, TypeError, ValueError):
+                    recomputed = record.get('event_hash')
+                if signed_entries.get(seq) != recomputed:
+                    problems.append(f"the signed manifest's event_hash for seq={seq} is not the pack record's "
+                                    f"recomputed hash")
             if chain.get('event_id') != record.get('event_id'):
                 problems.append(f"meilynx.chain.event_id {chain.get('event_id')!r} != pack {record.get('event_id')!r}")
             if chain.get('event_hash') != record.get('event_hash'):
@@ -13378,6 +14947,10 @@ def verify_ocsf_export(entries, pack_chain, pack_records, public_point=None, qui
             report(f"FAIL {label}: record_count mismatch (manifest {m.get('record_count')}, object holds "
                    f"{len(sequences)} distinct sequences)")
             content_ok = False
+        if signed_entries is not None and set(signed_entries) != sequences:
+            report(f"FAIL {label}: the signed manifest's records name {len(signed_entries)} sequence(s), the object "
+                   f"holds {len(sequences)} other or more")
+            content_ok = False
         if sequences and (min(sequences) != first_seq or max(sequences) != last_seq):
             report(f"FAIL {label}: object sequences span {min(sequences)}..{max(sequences)}, manifest says "
                    f"{first_seq}..{last_seq}")
@@ -13392,6 +14965,8 @@ def verify_ocsf_export(entries, pack_chain, pack_records, public_point=None, qui
         content_status = PASSED if content_ok else FAILED
     if FAILED in sig_statuses:
         signature_status = FAILED
+    elif CANNOT_EVALUATE in sig_statuses:
+        signature_status = CANNOT_EVALUATE
     elif UNSIGNED in sig_statuses or not sig_statuses:
         signature_status = UNSIGNED
     else:
@@ -13781,6 +15356,663 @@ def record_signature_self_test():
     return ok
 
 
+# ── Gateway evidence key: TEST-ONLY signers, vectors and fixtures ──────────
+# Nothing below is used to verify a pack. The self-test builds signed packs in
+# process, so it needs signers: Ed25519 is _ed25519_self_test_keypair above;
+# P-256 ECDSA here uses RFC 6979 deterministic nonces (HMAC-SHA-256), checked
+# against the RFC's own vector before it signs anything.
+
+# The control plane's attestation statement fixture, copied from
+# meilynx-platform tests/fixtures/gateway-evidence-key-attestation.v1.json:
+# `canonical` is the RFC 8785 text the attestation signature covers, and this
+# verifier's jcs_dumps of `statement` must produce exactly those bytes.
+GATEWAY_ATTESTATION_FIXTURE_STATEMENT = {
+    'format_version': 'gateway_evidence_key_attestation.v1',
+    'org_id': '7d1c0f5e-3b8a-4f62-9a4e-2c6b1d8e9f01',
+    'project_id': '0b6f8f2e-3a43-4b8b-9b39-1c0f6f3f2a10',
+    'proxy_id': 'pxy_fixture01',
+    'public_key_jwk': {'kty': 'OKP', 'crv': 'Ed25519', 'x': '11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo'},
+    'fingerprint': 'sha256:21fe31dfa154a261626bf854046fd2271b7bed4b6abe45aa58877ef47f9721b9',
+    'key_seq': 2,
+    'not_before': '2026-11-16T06:00:00Z',
+    'supersedes': 'sha256:39f713d0a644253f04529421b9f51b9b08979d08295959c4f3990ee617f5139f',
+    'reason': 'acknowledged_loss',
+    'first_sequences': {'proxy': 4458},
+    'issued_at': '2026-11-16T06:00:00Z',
+}
+GATEWAY_ATTESTATION_FIXTURE_CANONICAL = (
+    '{"fingerprint":"sha256:21fe31dfa154a261626bf854046fd2271b7bed4b6abe45aa58877ef47f9721b9",'
+    '"first_sequences":{"proxy":4458},"format_version":"gateway_evidence_key_attestation.v1",'
+    '"issued_at":"2026-11-16T06:00:00Z","key_seq":2,"not_before":"2026-11-16T06:00:00Z",'
+    '"org_id":"7d1c0f5e-3b8a-4f62-9a4e-2c6b1d8e9f01","project_id":"0b6f8f2e-3a43-4b8b-9b39-1c0f6f3f2a10",'
+    '"proxy_id":"pxy_fixture01","public_key_jwk":{"crv":"Ed25519","kty":"OKP",'
+    '"x":"11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"},"reason":"acknowledged_loss",'
+    '"supersedes":"sha256:39f713d0a644253f04529421b9f51b9b08979d08295959c4f3990ee617f5139f"}'
+)
+# The fixture's superseded key: RFC 8032 section 7.1 TEST 2.
+RFC8032_TEST2_PUBLIC = bytes.fromhex('3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c')
+
+# RFC 6979 appendix A.2.5: P-256, SHA-256, message "sample".
+RFC6979_P256_PRIVATE = 0xC9AFA9D845BA75166B5C215767B1D6934E50C3DB36E89B127B8A622B120F6721
+RFC6979_P256_SAMPLE_K = 0xA6E3C57DD01ABE90086538398355DD4C3B17AA873382B0F24D6129493D8AAD60
+RFC6979_P256_SAMPLE_R = 0xEFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716
+RFC6979_P256_SAMPLE_S = 0xF7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8
+
+
+def _rfc6979_nonce(private, h1, q):
+    """RFC 6979 section 3.2 with HMAC-SHA-256, for a 256-bit group order."""
+    import hmac
+
+    def mac(key, data):
+        return hmac.new(key, data, hashlib.sha256).digest()
+
+    def bits2int(b):
+        value = int.from_bytes(b, 'big')
+        excess = len(b) * 8 - q.bit_length()
+        return value >> excess if excess > 0 else value
+
+    x = private.to_bytes(32, 'big')
+    z = bits2int(h1) % q
+    h = z.to_bytes(32, 'big')
+    v, k = b'\x01' * 32, b'\x00' * 32
+    k = mac(k, v + b'\x00' + x + h)
+    v = mac(k, v)
+    k = mac(k, v + b'\x01' + x + h)
+    v = mac(k, v)
+    while True:
+        v = mac(k, v)
+        nonce = bits2int(v)
+        if 1 <= nonce < q:
+            return nonce
+        k = mac(k, v + b'\x00')
+        v = mac(k, v)
+
+
+def _p256_self_test_sign(private, message):
+    """ECDSA P-256 over SHA-256 of `message`, RFC 6979 nonce: 64 bytes r || s.
+    TEST-ONLY: the self-test signs synthetic attestations with it."""
+    h1 = hashlib.sha256(message).digest()
+    e = int.from_bytes(h1, 'big')
+    k = _rfc6979_nonce(private, h1, P256.n)
+    r = _ec_mul(P256, k, P256.g)[0] % P256.n
+    s_ = pow(k, -1, P256.n) * (e + r * private) % P256.n
+    return r.to_bytes(32, 'big') + s_.to_bytes(32, 'big')
+
+
+def _p256_self_test_jwk(private):
+    x, y = _ec_mul(P256, private, P256.g)
+    return {'kty': 'EC', 'crv': 'P-256', 'x': _b64url_text(x.to_bytes(32, 'big')),
+            'y': _b64url_text(y.to_bytes(32, 'big'))}
+
+
+def gateway_evidence_key_self_test():
+    """The gateway evidence key (ADR-0113) end to end on synthetic packs built
+    here: the test signers (38a), the platform's attestation fixture (38b),
+    the attestation pin (38c), and the command line's exit codes over a
+    signed pack with the right pin (38d), a wrong pin (38e), no pin (38f), a
+    reader-pinned gateway key (38g), an unsigned pack (38h), a tampered
+    record (38i), a truncated pack against a later signed head (38j), a
+    manifest re-signed by an unattested key (38k), a rotation (38l), an
+    acknowledged rekey (38m), an unacknowledged one (38n), records signed
+    below an acknowledged key's first covered sequence (38o), the unsigned
+    stretches after evidence_key_signing_stopped and evidence_key_lost (38p),
+    OCSF export manifests in both signature forms (38q), and the capability
+    (38r). MEI-3749 slice 3: a pack built while a fresh key is held back
+    (38s), the same with another key of the project attested (38t), a key
+    that signs with no attestation and no stop seal (38u), a signed head with
+    no organization or project under a reader-pinned key (38v), and the
+    record entries of a signed OCSF manifest (38w)."""
+    import contextlib
+    import gzip
+    import io
+    import subprocess
+    import tempfile
+    ok = True
+
+    def check(label, passed, what, detail=''):
+        nonlocal ok
+        if passed:
+            print(f'SELF-TEST assertion {label} PASS: {what}')
+        else:
+            print(f'SELF-TEST assertion {label} FAIL: {what} {detail}', file=sys.stderr)
+            ok = False
+
+    # 38a — the test-only signers agree with their published vectors.
+    sample = b'sample'
+    k = _rfc6979_nonce(RFC6979_P256_PRIVATE, hashlib.sha256(sample).digest(), P256.n)
+    sig = _p256_self_test_sign(RFC6979_P256_PRIVATE, sample)
+    q = _ec_mul(P256, RFC6979_P256_PRIVATE, P256.g)
+    check('38a', k == RFC6979_P256_SAMPLE_K
+          and sig == RFC6979_P256_SAMPLE_R.to_bytes(32, 'big') + RFC6979_P256_SAMPLE_S.to_bytes(32, 'big')
+          and ecdsa_verify(P256, q, hashlib.sha256(sample).digest(), RFC6979_P256_SAMPLE_R, RFC6979_P256_SAMPLE_S)
+          and not ecdsa_verify(P256, q, hashlib.sha256(b'other').digest(), RFC6979_P256_SAMPLE_R,
+                               RFC6979_P256_SAMPLE_S),
+          'the test-only P-256 signer reproduces RFC 6979 A.2.5 (nonce, r and s) and the verifier accepts it',
+          f'k={k:x} sig={sig.hex()}')
+
+    # 38b — the platform's attestation statement fixture.
+    fixture_key = ed25519_jwk_key(GATEWAY_ATTESTATION_FIXTURE_STATEMENT['public_key_jwk'])
+    check('38b', jcs_dumps(GATEWAY_ATTESTATION_FIXTURE_STATEMENT) == GATEWAY_ATTESTATION_FIXTURE_CANONICAL
+          and fixture_key == RFC8032_TEST1_PUBLIC
+          and chain_key_fingerprint(fixture_key) == GATEWAY_ATTESTATION_FIXTURE_STATEMENT['fingerprint']
+          and chain_key_fingerprint(RFC8032_TEST2_PUBLIC) == GATEWAY_ATTESTATION_FIXTURE_STATEMENT['supersedes'],
+          "the platform fixture's canonical text is this verifier's RFC 8785 form of its statement, and its key "
+          "and fingerprints are RFC 8032 TEST 1 and TEST 2",
+          jcs_dumps(GATEWAY_ATTESTATION_FIXTURE_STATEMENT))
+
+    fp = chain_key_fingerprint
+    key_a = _ed25519_self_test_keypair(RFC8032_TEST1_SEED)
+    key_b = _ed25519_self_test_keypair(b'\x0b' * 32)
+    key_x = _ed25519_self_test_keypair(b'\x07' * 32)
+    attestation_d = 0x3C1D5E7F90A2B4C6D8E0F1A3B5C7D9EB0D2F4A6C8E1B3D5F7A9C0E2B4D6F8A1C
+    wrong_d = 0x2B4D6F8A1C3E5A7C9E0B2D4F6A8C1E3B5D7F9A0C2E4B6D8F1A3C5E7B9D0F2A4C
+    org, project, proxy = 'c0ba17e5-0a1b-4c2d-8e3f-4a5b6c7d8e01', 'f3a7c2d1-5e6f-4a8b-9c0d-1e2f3a4b5c6d', 'pxy_tessel01'
+    attestation_jwk, wrong_jwk = _p256_self_test_jwk(attestation_d), _p256_self_test_jwk(wrong_d)
+    attestation_kid = p256_jwk_thumbprint(attestation_jwk)
+
+    # 38c — the attestation pin: bare and as the control plane serves it.
+    refused = None
+    try:
+        load_attestation_pin(json.dumps({'keyId': 'not-the-thumbprint', 'jwk': attestation_jwk}))
+    except ValueError as exc:
+        refused = str(exc)
+    bare = load_attestation_pin(json.dumps(attestation_jwk))
+    wrapped = load_attestation_pin(json.dumps({'keyId': attestation_kid, 'jwk': dict(attestation_jwk, kid='x')}))
+    check('38c', bare == wrapped and bare[1] == attestation_kid and refused is not None and 'thumbprint' in refused,
+          'the attestation pin reads a bare P-256 JWK and the {keyId, jwk} form, and refuses a keyId that is not the '
+          "key's RFC 7638 thumbprint", f'{bare} {wrapped} {refused}')
+
+    def seal(action, meta):
+        return {'admin_action': {'action_type': action, 'actor': 'system:self-test', 'description': action,
+                                 'metadata_json': json.dumps(meta, sort_keys=True)}}
+
+    def boundary(key, key_seq, **extra):
+        return seal(CHAIN_SIGNING_STARTED, dict({'algorithm': 'ed25519', 'public_key': key[0].hex(),
+                                                 'public_key_fingerprint': fp(key[0]), 'key_seq': key_seq}, **extra))
+
+    def build(steps):
+        """steps: [(admin-action fields, or None for a model request; signer or None)]."""
+        records, prev = [], genesis_hash()
+        for seq, (extra, signer) in enumerate(steps):
+            r = {'schema_version': 'v1.1', 'source': 'proxy', 'event_id': f'evt-{seq}', 'request_id': f'req-{seq}',
+                 'timestamp_utc': f'2026-11-16T06:00:{seq:02d}Z', 'model_requested': 'gpt-6-luna',
+                 'action': 'allow', 'input_tokens': 1, 'output_tokens': 2}
+            if extra:
+                r.update(schema_version='v1.3', event_kind='admin_action', model_requested='', **extra)
+            r['sequence_number'], r['previous_hash'] = seq, prev
+            r['event_hash'] = recompute_event_hash(r, seq, prev)
+            if signer is not None:
+                r['record_sig'] = signer[1](record_sig_message('proxy', seq, r['event_hash'])).hex()
+            prev = r['event_hash']
+            records.append(r)
+        return records
+
+    def attest(key, key_seq, reason, supersedes=None, first=None, d=attestation_d,
+               issued='2026-11-16T06:00:00Z'):
+        statement = {'format_version': ATTESTATION_FORMAT_VERSION, 'org_id': org, 'project_id': project,
+                     'proxy_id': proxy, 'public_key_jwk': {'kty': 'OKP', 'crv': 'Ed25519', 'x': _b64url_text(key[0])},
+                     'fingerprint': fp(key[0]), 'key_seq': key_seq, 'not_before': issued, 'supersedes': supersedes,
+                     'reason': reason, 'first_sequences': first, 'issued_at': issued}
+        canonical = jcs_dumps(statement).encode('utf-8')
+        jwk = _p256_self_test_jwk(d)
+        return {'schema_version': '1', 'statement': statement, 'sha256': hashlib.sha256(canonical).hexdigest(),
+                'signature': base64.b64encode(_p256_self_test_sign(d, canonical)).decode('ascii'),
+                'key_id': p256_jwk_thumbprint(jwk), 'public_key_jwk': jwk}
+
+    def rotation(old, new, new_key_seq):
+        statement = {'format': KEY_ROTATION_FORMAT, 'proxy_id': proxy, 'old_fingerprint': fp(old[0]),
+                     'new_fingerprint': fp(new[0]), 'new_public_key': new[0].hex(), 'new_key_seq': new_key_seq,
+                     'rotated_at': '2026-11-16T07:00:00Z'}
+        return {'statement': statement, 'signature': old[1](key_rotation_message(statement)).hex()}
+
+    def head(signer, key_seq, record, **override):
+        statement = dict({'format': CHAIN_HEAD_FORMAT, 'org_id': org, 'project_id': project, 'proxy_id': proxy,
+                          'chain_id': 'proxy', 'hash_version': record['schema_version'], 'first_sequence': 0,
+                          'head_sequence': record['sequence_number'], 'head_event_hash': record['event_hash'],
+                          'key_fingerprint': fp(signer[0]), 'key_seq': key_seq,
+                          'signed_at': '2026-11-16T08:00:00Z'}, **override)
+        return {'statement': statement, 'signature': signer[1](CHAIN_HEAD_DOMAIN + jcs_dumps(statement)
+                                                               .encode('utf-8')).hex()}
+
+    def sign_manifest(manifest, signer, key_seq, kind=EVIDENCE_MANIFEST_KIND_PACK):
+        value = signer[1](evidence_manifest_message(kind, manifest))
+        return dict(manifest, signature={'scheme': EVIDENCE_SIGNATURE_SCHEME, 'alg': 'Ed25519',
+                                         'key_fingerprint': fp(signer[0]), 'key_seq': key_seq,
+                                         'value': base64.b64encode(value).decode('ascii')})
+
+    def manifest_for(records, signer=None, key_seq=1):
+        hi = len(records) - 1
+        manifest = {
+            'schema_version': '1.4', 'hash_version': 'v1', 'hash_algorithm': 'SHA-256', 'prefix': 'audit/proxy/',
+            'evidence_class': LOCAL_CHAIN_EVIDENCE_CLASS, 'window': 'A', 'signing_deferred': True,
+            'from_sequence': 0, 'to_sequence': hi,
+            'claim': {'scope': CLAIM_CHAIN_TO_HEAD, 'from_sequence': 0, 'to_sequence': hi},
+            'anchoring': {'state': 'unanchored', 'chains': [{
+                'chain': 'proxy', 'reason': 'no_anchors_found', 'anchored_through_seq': None,
+                'unanchored_tail': {'from_seq': 0, 'to_seq': hi}, 'anchors': [], 'seals': []}]},
+            'org_id': org, 'project_id': project, 'proxy_id': proxy,
+            'events': [{'sequence': r['sequence_number'], 'event_id': r['event_id'],
+                        'stored_event_hash': r['event_hash'], 'recomputed_event_hash': r['event_hash']}
+                       for r in records],
+        }
+        return sign_manifest(manifest, signer, key_seq) if signer is not None else manifest
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        packs = [0]
+
+        def pack(records, manifest, attestations=None, rotations=None, heads=()):
+            packs[0] += 1
+            root = tmp / f'pack{packs[0]}'
+            rdir = root / 'records'
+            rdir.mkdir(parents=True)
+            for r in records:
+                (rdir / record_file_name(r['sequence_number'])).write_bytes(json.dumps(r).encode('utf-8'))
+            (root / 'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+            if attestations is not None or rotations is not None:
+                (root / EVIDENCE_KEYS_DIR).mkdir()
+            if attestations is not None:
+                (root / EVIDENCE_KEYS_DIR / ATTESTATIONS_FILE).write_text(json.dumps(attestations), encoding='utf-8')
+            if rotations is not None:
+                (root / EVIDENCE_KEYS_DIR / ROTATIONS_FILE).write_text(json.dumps(rotations), encoding='utf-8')
+            if heads:
+                (rdir / HEAD_SIGNATURES_DIR).mkdir()
+                for h in heads:
+                    name = f"{h['statement']['head_sequence']:020d}.json"
+                    (rdir / HEAD_SIGNATURES_DIR / name).write_text(json.dumps(h), encoding='utf-8')
+            return root
+
+        def cli(root, *extra):
+            run = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--manifest',
+                                  str(root / 'manifest.json'), '--records', str(root / 'records'), *extra],
+                                 capture_output=True, text=True)
+            return run.returncode, run.stdout + run.stderr
+
+        pin = tmp / 'attestation-key.json'
+        pin.write_text(json.dumps({'keyId': attestation_kid, 'jwk': attestation_jwk}), encoding='utf-8')
+        wrong_pin = tmp / 'wrong-attestation-key.json'
+        wrong_pin.write_text(json.dumps(wrong_jwk), encoding='utf-8')
+        attested = ('--attestation-key', str(pin))
+        signed_by_a = (f'SIGNED BY GATEWAY {proxy} (key {fp(key_a[0])}, key_seq 1), key attested by the project key '
+                       f'you pinned')
+
+        # A first key: an unsigned startup record, the boundary, three signed
+        # records, a signed head at the last one, a signed manifest.
+        simple = build([(None, None), (boundary(key_a, 1), key_a), (None, key_a), (None, key_a), (None, key_a)])
+        simple_root = pack(simple, manifest_for(simple, key_a), [attest(key_a, 1, 'initial')],
+                           heads=[head(key_a, 1, simple[4])])
+
+        # 38d — the right pin, without --allow-unsigned.
+        code, out = cli(simple_root, *attested)
+        check('38d', code == EXIT_OK and signed_by_a in out and 'SIGNED HEADS: 1 verified (seq=4)' in out
+              and '4 record signature(s) credited, seq=1..4' in out and 'FAIL' not in out,
+              'a signed pack with the right attestation pin exits 0 without --allow-unsigned and names the gateway, '
+              'the key and its key_seq', out)
+
+        # 38e — a wrong pin, either kind.
+        code, out = cli(simple_root, '--attestation-key', str(wrong_pin))
+        gw_code, gw_out = cli(simple_root, '--gateway-key', key_x[0].hex())
+        check('38e', code == EXIT_FAIL and 'not the project key you pinned' in out
+              and gw_code == EXIT_FAIL and 'is not the gateway key you pinned' in gw_out,
+              'a wrong attestation pin, or a wrong gateway key, exits 1', out + gw_out)
+
+        # 38f — no pin.
+        code, out = cli(simple_root)
+        allow_code, _ = cli(simple_root, '--allow-unsigned')
+        check('38f', code == EXIT_CANNOT_EVALUATE and allow_code == EXIT_CANNOT_EVALUATE
+              and 'cannot evaluate: no pinned key' in out,
+              'a pack signed by a gateway evidence key, checked with neither pin, exits 2 (with or without '
+              '--allow-unsigned)', out)
+
+        # 38g — the gateway key pinned by the reader, in every accepted form.
+        jwk_file = tmp / 'gateway-key.jwk'
+        jwk_file.write_text(json.dumps({'kty': 'OKP', 'crv': 'Ed25519', 'x': _b64url_text(key_a[0])}), encoding='utf-8')
+        pem_file = tmp / 'gateway-key.pem'
+        pem_file.write_text('-----BEGIN PUBLIC KEY-----\n'
+                            + base64.b64encode(_ED25519_SPKI_PREFIX + key_a[0]).decode('ascii')
+                            + '\n-----END PUBLIC KEY-----\n', encoding='utf-8')
+        runs = [cli(simple_root, '--gateway-key', key_a[0].hex()), cli(simple_root, '--chain-signing-key', key_a[0].hex()),
+                cli(simple_root, '--gateway-key', str(jwk_file)), cli(simple_root, '--gateway-key', str(pem_file))]
+        check('38g', all(c == EXIT_OK and f'(key {fp(key_a[0])}, key_seq 1), key pinned by reader, not certified' in o
+                         for c, o in runs),
+              'a reader-pinned gateway key (hex, the --chain-signing-key alias, a JWK file, a PEM file) exits 0 and '
+              'says the key is pinned by the reader, not certified', '\n'.join(o for _, o in runs))
+
+        # 38h — unsigned: no record_sig, no manifest signature, no keys.
+        plain = build([(None, None)] * 3)
+        plain_root = pack(plain, manifest_for(plain))
+        code, out = cli(plain_root)
+        allow_code, _ = cli(plain_root, '--allow-unsigned')
+        unsigned_manifest = pack(simple, manifest_for(simple), [attest(key_a, 1, 'initial')])
+        attested_code, attested_out = cli(unsigned_manifest, *attested)
+        check('38h', code == EXIT_UNSIGNED and allow_code == EXIT_OK and attested_code == EXIT_UNSIGNED
+              and signed_by_a in attested_out,
+              'an unsigned pack exits 3 (0 with --allow-unsigned); attested record signatures under an unsigned '
+              'manifest are reported and still exit 3', out + attested_out)
+
+        # 38i — a record edited after the pack was signed.
+        tampered = [dict(r) for r in simple]
+        tampered[3]['model_requested'] = 'tampered'
+        code, out = cli(pack(tampered, manifest_for(simple, key_a), [attest(key_a, 1, 'initial')]), *attested)
+        check('38i', code == EXIT_FAIL and 'FAIL seq=3: hash recomputation disagrees with manifest' in out,
+              'a tampered record in a signed pack exits 1', out)
+
+        # 38j — a pack built at seq=3 and a head the gateway signed at seq=4:
+        # coverage not established. A signed head inside the pack naming
+        # another hash fails it.
+        truncated = pack(simple[:4], manifest_for(simple[:4], key_a), [attest(key_a, 1, 'initial')],
+                         heads=[head(key_a, 1, simple[4])])
+        code, out = cli(truncated, *attested)
+        contradicted = pack(simple, manifest_for(simple, key_a), [attest(key_a, 1, 'initial')],
+                            heads=[head(key_a, 1, simple[3], head_event_hash=simple[4]['event_hash'])])
+        bad_code, bad_out = cli(contradicted, *attested)
+        check('38j', code == EXIT_COVERAGE_NOT_ESTABLISHED and 'COVERAGE NOT ESTABLISHED through seq=4' in out
+              and bad_code == EXIT_FAIL and 'FAIL signed head seq=3: names head_event_hash' in bad_out,
+              'a truncated pack against a later signed head exits 4; a signed head inside the pack that names '
+              'another hash exits 1', out + bad_out)
+
+        # 38k — the manifest re-signed by a key no attestation covers.
+        code, out = cli(pack(simple, manifest_for(simple, key_x), [attest(key_a, 1, 'initial')]), *attested)
+        check('38k', code == EXIT_FAIL and 'covered by no attestation' in out,
+              'a manifest re-signed by an unattested key exits 1', out)
+
+        # 38l — a rotation A -> B: the old key signs the statement and the
+        # seal, the new key's boundary follows.
+        rotated = rotation(key_a, key_b, 2)
+        rotation_steps = [(None, None), (boundary(key_a, 1), key_a), (None, key_a),
+                          (seal(EVIDENCE_KEY_ROTATED, rotated), key_a), (boundary(key_b, 2), key_b),
+                          (None, key_b), (None, key_b)]
+        chain = build(rotation_steps)
+        rotation_attestations = [attest(key_a, 1, 'initial'),
+                                 attest(key_b, 2, 'rotation', supersedes=fp(key_a[0]), issued='2026-11-16T07:00:05Z')]
+        code, out = cli(pack(chain, manifest_for(chain, key_b, 2), rotation_attestations, [rotated],
+                             heads=[head(key_a, 1, chain[3]), head(key_b, 2, chain[6])]), *attested)
+        forged = dict(rotated, signature=key_a[1](b'another statement').hex())
+        bad_chain = build(rotation_steps[:3] + [(seal(EVIDENCE_KEY_ROTATED, forged), key_a)] + rotation_steps[4:])
+        bad_code, bad_out = cli(pack(bad_chain, manifest_for(bad_chain, key_b, 2), rotation_attestations), *attested)
+        silent = build(rotation_steps[:3] + [(None, key_a)] + rotation_steps[4:])
+        silent_code, silent_out = cli(pack(silent, manifest_for(silent, key_b, 2), rotation_attestations), *attested)
+        check('38l', code == EXIT_OK and signed_by_a in out
+              and f'SIGNED BY GATEWAY {proxy} (key {fp(key_b[0])}, key_seq 2), key attested' in out
+              and 'SIGNED HEADS: 2 verified' in out
+              and bad_code == EXIT_FAIL and 'does not verify under the old key' in bad_out
+              and silent_code == EXIT_FAIL and 'key replaced without acknowledgement' in silent_out,
+              'a rotation chain exits 0 with both keys credited; a rotation statement the old key did not sign, or a '
+              'new key with no rotation seal, exits 1', out + bad_out + silent_out)
+
+        # 38m — an acknowledged rekey. Key A is lost at seq=3; records go on
+        # unsigned; the rekey (signed by B) and B's boundary follow; B stops
+        # signing while it awaits acknowledgement; on approval B starts again
+        # with first_sequences {proxy: 11}.
+        rekey_steps = [
+            (None, None),
+            (boundary(key_a, 1), key_a),
+            (None, key_a),
+            (seal(EVIDENCE_KEY_LOST, {'expected_fingerprint': fp(key_a[0]), 'found': 'missing',
+                                      'found_fingerprint': None}), None),
+            (None, None),
+            (seal(EVIDENCE_KEY_REKEYED, {'lost_fingerprint': fp(key_a[0]), 'new_fingerprint': fp(key_b[0]),
+                                         'new_key_seq': 2, 'reason': 'volume replaced'}), key_b),
+            (boundary(key_b, 2), key_b),
+            (None, key_b),
+            (seal(EVIDENCE_KEY_SIGNING_STOPPED, {'reason': 'pending_acknowledgement', 'fingerprint': fp(key_b[0])}),
+             key_b),
+            (None, None),
+            (None, key_b),
+            (boundary(key_b, 2, reason='attested', first_sequences={'proxy': 11}), key_b),
+            (None, key_b),
+            (None, key_b),
+        ]
+        rekeyed = build(rekey_steps)
+        acknowledged = [attest(key_a, 1, 'initial'),
+                        attest(key_b, 2, 'acknowledged_loss', supersedes=fp(key_a[0]), first={'proxy': 11},
+                               issued='2026-11-17T09:30:00Z')]
+        code, out = cli(pack(rekeyed, manifest_for(rekeyed, key_b, 2), acknowledged), *attested)
+        discontinuity = (f'KEY DISCONTINUITY at seq 11: key {fp(key_a[0])} (key_seq 1) lost; replaced by '
+                         f'{fp(key_b[0])} (key_seq 2), acknowledged 2026-11-17')
+        check('38m', code == EXIT_OK and out.count('KEY DISCONTINUITY') == 1 and discontinuity in out
+              and f'NOT ATTESTED: 4 record(s) seq=5..8 signed by {fp(key_b[0])}' in out
+              and '3 record signature(s) credited, seq=11..13' in out,
+              'an acknowledged rekey exits 0, prints exactly one KEY DISCONTINUITY line, and credits the new key only '
+              'from first_sequences', out)
+
+        # 38n — the same rekey with no acknowledged_loss attestation.
+        code, out = cli(pack(rekeyed, manifest_for(rekeyed), acknowledged[:1]), *attested)
+        check('38n', code == EXIT_FAIL and 'key replaced without acknowledgement' in out,
+              'a rekey with no acknowledged_loss attestation in the pack exits 1', out)
+
+        # 38o — a fresh key whose only signatures are below its first covered
+        # sequence: reported, never credited, and no pass from them.
+        early = build([(None, None), (boundary(key_b, 2), key_b), (None, key_b), (None, key_b)])
+        late = [attest(key_a, 1, 'initial'),
+                attest(key_b, 2, 'acknowledged_loss', supersedes=fp(key_a[0]), first={'proxy': 99})]
+        code, out = cli(pack(early, manifest_for(early), late), *attested)
+        check('38o', code == EXIT_UNSIGNED and 'NOT ATTESTED: 3 record(s) seq=1..3' in out
+              and 'credited' not in out and 'KEY DISCONTINUITY at seq 99' in out,
+              'records signed by a new key below its first_sequences are reported as not attested and do not make '
+              'the pack pass (exit 3, unsigned manifest)', out)
+
+        # 38p — the walk: unsigned stretches after the two seals are
+        # accepted; an unsigned record after a boundary still fails; a record
+        # signed while pending must verify.
+        def walk(records, keys=()):
+            manifest = {'hash_version': 'v1', 'prefix': 'audit/proxy/',
+                        'events': [{'sequence': r['sequence_number'], 'recomputed_event_hash': r['event_hash']}
+                                   for r in records]}
+            buf = io.StringIO()
+            d = tmp / f'walk{len(list(tmp.iterdir()))}'
+            d.mkdir()
+            for r in records:
+                (d / record_file_name(r['sequence_number'])).write_bytes(json.dumps(r).encode('utf-8'))
+            with contextlib.redirect_stdout(buf):
+                passed = verify_manifest_with(local_fetcher(d), manifest, chain_keys=keys)
+            return passed, buf.getvalue()
+
+        passed, out = walk(rekeyed)
+        stripped = build(rekey_steps[:12] + [(None, None), (None, key_b)])
+        stripped_passed, stripped_out = walk(stripped)
+        bad_pending = [dict(r) for r in rekeyed]
+        bad_pending[10]['record_sig'] = key_x[1](record_sig_message('proxy', 10, rekeyed[10]['event_hash'])).hex()
+        pending_passed, pending_out = walk(bad_pending)
+        check('38p', passed and 'SIGNATURES unsigned after evidence_key_lost at seq=3: 2 record(s) seq=3..4' in out
+              and 'SIGNATURES unsigned after evidence_key_signing_stopped at seq=8: 1 record(s) seq=9' in out
+              and 'SIGNATURES signed while pending, not attested: 1 record(s) seq=10' in out
+              and not stripped_passed and 'FAIL seq=12: unsigned record after signing started' in stripped_out
+              and not pending_passed and 'FAIL seq=10: record_sig does not verify' in pending_out,
+              'unsigned records after evidence_key_lost and evidence_key_signing_stopped are accepted; after the next '
+              'boundary they fail; a record signed while pending must verify', out + stripped_out + pending_out)
+
+        # 38q — OCSF export manifests: the legacy detached P-256 form through
+        # the command line, and the gateway-key form under each pin.
+        def export(root, records, signature=None, legacy_d=None):
+            lines = [json.dumps({'class_uid': 6003, 'meilynx': {'chain': {
+                'chain_id': 'proxy', 'sequence_number': r['sequence_number'], 'event_id': r['event_id'],
+                'event_hash': r['event_hash'], 'previous_hash': r['previous_hash']}, 'digests': {}}})
+                for r in records]
+            buf = io.BytesIO()
+            with gzip.GzipFile(fileobj=buf, mode='wb', mtime=0) as gz:
+                gz.write(('\n'.join(lines) + '\n').encode('utf-8'))
+            obj = buf.getvalue()
+            first, last = records[0]['sequence_number'], records[-1]['sequence_number']
+            name = f'{first:020d}-{last:020d}.ndjson.gz'
+            manifest = {'export_id': 'exp_selftest', 'proxy_external_id': proxy, 'chain_id': 'proxy',
+                        'first_sequence': first, 'last_sequence': last, 'record_count': len(records),
+                        'event_count': len(records), 'object': f'ocsf/v1/{proxy}/proxy/{name}',
+                        'object_sha256': hashlib.sha256(obj).hexdigest(),
+                        'mapping_version': OCSF_SIGNED_MAPPING_VERSION if signature is not None else '1',
+                        'signed': legacy_d is not None or signature is not None,
+                        'public_key_id': 'k1' if legacy_d is not None else None}
+            if signature is not None:
+                manifest['records'] = [{'sequence': r['sequence_number'], 'event_id': r['event_id'],
+                                        'event_hash': r['event_hash']} for r in records]
+                manifest = sign_manifest(manifest, signature[0], signature[1], EVIDENCE_MANIFEST_KIND_OCSF)
+            root.mkdir(parents=True)
+            (root / name).write_bytes(obj)
+            mbytes = jcs_dumps(manifest).encode('utf-8')
+            (root / f'{name}.manifest.json').write_bytes(mbytes)
+            if legacy_d is not None:
+                (root / f'{name}.manifest.sig').write_text(
+                    base64.b64encode(_p256_self_test_sign(legacy_d, mbytes)).decode('ascii'), encoding='utf-8')
+            return root / f'{name}.manifest.json'
+
+        legacy_jwk = tmp / 'ocsf-export-key.jwk'
+        legacy_jwk.write_text(json.dumps(wrong_jwk), encoding='utf-8')
+        legacy = export(tmp / 'ocsf-legacy', simple[1:4], legacy_d=wrong_d)
+        legacy_code, legacy_out = cli(simple_root, *attested, '--ocsf-export', str(legacy),
+                                      '--ocsf-public-key', str(legacy_jwk))
+        gateway_export = export(tmp / 'ocsf-gateway', simple[1:4], signature=(key_a, 1))
+        entries = load_ocsf_export(gateway_export)
+        records_by_seq = {r['sequence_number']: r for r in simple}
+        keys = load_evidence_keys(simple_root, [load_attestation_pin(pin.read_text())], [], report=lambda line: None)
+        statuses = [verify_ocsf_export(entries, 'proxy', records_by_seq, quiet=True, evidence_keys=keys),
+                    verify_ocsf_export(entries, 'proxy', records_by_seq, quiet=True, evidence_keys=EvidenceKeys()),
+                    verify_ocsf_export(entries, 'proxy', records_by_seq, quiet=True,
+                                       evidence_keys=EvidenceKeys(gateway_keys=[key_x[0]]))]
+        edited = json.loads(gateway_export.read_bytes())
+        edited['export_id'] = 'exp_other'
+        gateway_export.write_bytes(jcs_dumps(edited).encode('utf-8'))
+        statuses.append(verify_ocsf_export(load_ocsf_export(gateway_export), 'proxy', records_by_seq, quiet=True,
+                                           evidence_keys=keys))
+        check('38q', legacy_code == EXIT_OK and 'manifest signature verified' in legacy_out
+              and statuses == [(PASSED, PASSED), (PASSED, CANNOT_EVALUATE), (PASSED, FAILED), (PASSED, FAILED)],
+              'a legacy P-256 OCSF manifest still verifies (exit 0); a gateway-key OCSF manifest verifies under the '
+              'attested key, cannot be evaluated with no pin, and fails under another key or once edited',
+              f'{legacy_code} {statuses} {legacy_out}')
+
+        # 38s — pending is not tampering. A fresh key signs from its boundary,
+        # the control plane holds it back (the stop seal is the last record it
+        # signs), records go on unsigned; the pack is unsigned and carries no
+        # attestation of the key.
+        stop = seal(EVIDENCE_KEY_SIGNING_STOPPED, {'reason': 'pending_acknowledgement', 'fingerprint': fp(key_b[0])})
+        held = build([(None, None), (boundary(key_b, 1), key_b), (None, key_b), (None, key_b), (stop, key_b),
+                      (None, None), (None, None)])
+        held_root = pack(held, manifest_for(held), [], heads=[head(key_b, 1, held[3])])
+        code, out = cli(held_root, *attested)
+        allow_code, allow_out = cli(held_root, *attested, '--allow-unsigned')
+        pinned_code, pinned_out = cli(held_root, '--gateway-key', key_b[0].hex())
+        check('38s', code == EXIT_UNSIGNED and allow_code == EXIT_OK and pinned_code == EXIT_UNSIGNED
+              and f'NOT ATTESTED (signed before the key was held back): 4 record(s) seq=1..4 signed by {fp(key_b[0])}'
+              in out and 'NOT ATTESTED (signed before the key was held back): signed head seq=3' in out
+              and 'FAIL' not in out + allow_out + pinned_out,
+              'a pack built while its key is held back exits 3 (0 with --allow-unsigned), never 1; its signatures '
+              'before the stop seal are reported as not attested', out + allow_out + pinned_out)
+
+        # 38t — the same while the project holds another attested key (the
+        # new key of a fresh incarnation awaiting a tenant's approval).
+        code, out = cli(pack(held, manifest_for(held), [attest(key_a, 1, 'initial')]), *attested)
+        check('38t', code == EXIT_UNSIGNED and 'FAIL' not in out and 'signed before the key was held back' in out,
+              'signatures by an unattested key before its pending_acknowledgement stop are not a failure', out)
+
+        # 38u — silent replacement: a key signs with no attestation and no
+        # stop seal, after an attested key, and on its own.
+        replaced = build([(None, None), (boundary(key_a, 1), key_a), (None, key_a), (boundary(key_x, 1), key_x),
+                          (None, key_x)])
+        code, out = cli(pack(replaced, manifest_for(replaced), [attest(key_a, 1, 'initial')]), *attested)
+        alone = build([(None, None), (boundary(key_x, 1), key_x), (None, key_x)])
+        alone_code, alone_out = cli(pack(alone, manifest_for(alone), []), *attested)
+        other_stop = build([(None, None), (boundary(key_x, 1), key_x), (None, key_x),
+                            (seal(EVIDENCE_KEY_SIGNING_STOPPED, {'reason': 'operator', 'fingerprint': fp(key_x[0])}),
+                             key_x)])
+        other_code, other_out = cli(pack(other_stop, manifest_for(other_stop), []), *attested)
+        check('38u', code == EXIT_FAIL and 'key replaced without acknowledgement' in out
+              and alone_code == EXIT_FAIL and 'a key no attestation in this pack covers' in alone_out
+              and other_code == EXIT_FAIL and 'a key no attestation in this pack covers' in other_out,
+              'a key that signs with no attestation and no pending_acknowledgement stop exits 1, after an attested '
+              'key or on its own', out + alone_out + other_out)
+
+        # 38v — a gateway with no attestation names no organization or
+        # project in its signed heads; a reader-pinned key checks them.
+        def bare_head(signer, record, **fields):
+            statement = {k: v for k, v in head(signer, 1, record)['statement'].items()
+                         if k not in ('org_id', 'project_id')}
+            statement.update(fields)
+            return {'statement': statement,
+                    'signature': signer[1](CHAIN_HEAD_DOMAIN + jcs_dumps(statement).encode('utf-8')).hex()}
+        bare_manifest = {k: v for k, v in manifest_for(simple).items() if k not in ('org_id', 'project_id')}
+        code, out = cli(pack(simple, sign_manifest(bare_manifest, key_a, 1), heads=[bare_head(key_a, simple[4])]),
+                        '--gateway-key', key_a[0].hex())
+        bad_code, bad_out = cli(pack(simple, sign_manifest(bare_manifest, key_a, 1),
+                                     heads=[bare_head(key_a, simple[4], org_id='')]), '--gateway-key', key_a[0].hex())
+        check('38v', code == EXIT_OK and 'SIGNED HEADS: 1 verified (seq=4)' in out
+              and bad_code == EXIT_FAIL and 'org_id is not a non-empty string' in bad_out,
+              'a signed head with no org_id or project_id verifies under the reader-pinned gateway key; an empty '
+              'org_id fails', out + bad_out)
+
+        # 38w — every record entry of a signed OCSF manifest carries its
+        # event_hash, and it is the pack record's recomputed hash.
+        def entries_status(edit):
+            root = tmp / f'ocsf-entries-{len(list(tmp.iterdir()))}'
+            path = export(root, simple[1:4], signature=(key_a, 1))
+            m = json.loads(path.read_bytes())
+            edit(m)
+            path.write_bytes(jcs_dumps(sign_manifest(m, key_a, 1, EVIDENCE_MANIFEST_KIND_OCSF)).encode('utf-8'))
+            return verify_ocsf_export(load_ocsf_export(path), 'proxy', records_by_seq, quiet=True, evidence_keys=keys)
+        missing = entries_status(lambda m: m['records'][1].pop('event_hash'))
+        other = entries_status(lambda m: m['records'][1].update(event_hash=simple[0]['event_hash']))
+        absent = entries_status(lambda m: m.pop('records'))
+        check('38w', missing[0] == FAILED and other[0] == FAILED and absent[0] == FAILED
+              and missing[1] == other[1] == PASSED,
+              'a signed OCSF manifest whose record entry carries no event_hash, names another hash, or lists no '
+              'records fails on content even when its signature verifies', f'{missing} {other} {absent}')
+
+        # 38x — the signed form's mapping_version (what makes a verifier from
+        # before ADR-0113 answer "cannot evaluate") with its signature removed
+        # fails; mapping 1 still reads a gateway-key manifest.
+        stripped_path = export(tmp / 'ocsf-stripped', simple[1:4], signature=(key_a, 1))
+        stripped_m = json.loads(stripped_path.read_bytes())
+        stripped_m.pop('signature')
+        stripped_path.write_bytes(jcs_dumps(stripped_m).encode('utf-8'))
+        stripped_status = verify_ocsf_export(load_ocsf_export(stripped_path), 'proxy', records_by_seq, quiet=True,
+                                             evidence_keys=keys)
+        v1_path = export(tmp / 'ocsf-v1-signed', simple[1:4], signature=(key_a, 1))
+        v1_m = json.loads(v1_path.read_bytes())
+        v1_m['mapping_version'] = '1'
+        v1_path.write_bytes(jcs_dumps(sign_manifest(v1_m, key_a, 1, EVIDENCE_MANIFEST_KIND_OCSF)).encode('utf-8'))
+        v1_status = verify_ocsf_export(load_ocsf_export(v1_path), 'proxy', records_by_seq, quiet=True,
+                                       evidence_keys=keys)
+        check('38x', stripped_status[1] == FAILED and v1_status == (PASSED, PASSED),
+              f'a manifest stamped {OCSF_SIGNED_MAPPING_VERSION} with no signature fails; a gateway-key manifest '
+              f'of mapping 1 still verifies', f'{stripped_status} {v1_status}')
+
+        # 38y — a fresh incarnation (ADR-0113 D9 edit 2026-11-16): at first
+        # boot its key signs as key_seq 1, the only one it knows, until the
+        # control plane holds it back and assigns key_seq 4; approved, it
+        # signs from first_sequences as 4. The early record, head and OCSF
+        # manifest signatures are reported as not attested, never failed; a
+        # head at or after first_sequences that still names 1 fails.
+        fresh_steps = [(None, None), (boundary(key_b, 1), key_b), (None, key_b), (None, key_b),
+                       (stop, key_b), (None, None), (None, None),
+                       (boundary(key_b, 4, reason='attested', first_sequences={'proxy': 7}), key_b),
+                       (None, key_b)]
+        fresh = build(fresh_steps)
+        approved = [attest(key_b, 4, 'acknowledged_loss', supersedes=fp(key_a[0]), first={'proxy': 7})]
+        fresh_root = pack(fresh, manifest_for(fresh, key_b, 4), approved,
+                          heads=[head(key_b, 1, fresh[3]), head(key_b, 4, fresh[8])])
+        code, out = cli(fresh_root, *attested)
+        late_root = pack(fresh, manifest_for(fresh, key_b, 4), approved, heads=[head(key_b, 1, fresh[8])])
+        late_code, late_out = cli(late_root, *attested)
+        fresh_keys = load_evidence_keys(fresh_root, [load_attestation_pin(pin.read_text())], [],
+                                        report=lambda line: None)
+        early_ocsf = export(tmp / 'ocsf-fresh', fresh[1:4], signature=(key_b, 1))
+        ocsf_status = verify_ocsf_export(load_ocsf_export(early_ocsf), 'proxy',
+                                         {r['sequence_number']: r for r in fresh}, quiet=True,
+                                         evidence_keys=fresh_keys)
+        check('38y', code == EXIT_OK and 'FAIL' not in out
+              and f'KEY DISCONTINUITY at seq 7: key {fp(key_a[0])} (key_seq 3) lost; replaced by {fp(key_b[0])} '
+                  f'(key_seq 4)' in out
+              and f'NOT ATTESTED: 4 record(s) seq=1..4 signed by {fp(key_b[0])} (key_seq 4)' in out
+              and 'NOT ATTESTED: signed head seq=3' in out and 'SIGNED HEADS: 1 verified (seq=8)' in out
+              and late_code == EXIT_FAIL and 'names key' in late_out and 'as key_seq 1' in late_out
+              and ocsf_status[1] == CANNOT_EVALUATE,
+              'a fresh incarnation\'s first-boot signatures under key_seq 1 are reported as not attested once the key '
+              'is approved as key_seq 4 (exit 0); a head past first_sequences naming 1 fails; an early OCSF manifest '
+              'is not attested (cannot evaluate), never failed', f'{out}\n{late_out}\n{ocsf_status}')
+
+    check('38r', 'gateway-evidence-key-v1' in VERIFIER_CAPABILITIES,
+          'VERIFIER_CAPABILITIES advertises gateway-evidence-key-v1')
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Meilynx Integrity Pack reproducer — independently verifies GCS WORM audit chain.'
@@ -13797,15 +16029,33 @@ def main():
     )
     parser.add_argument('--manifest', help='Path to manifest.json')
     parser.add_argument(
+        '--gateway-key',
         '--chain-signing-key',
+        dest='gateway_key',
         action='append',
         default=[],
-        metavar='HEX',
+        metavar='KEY',
         help=(
-            "The proxy's chain signing public key (64 lowercase hex characters, as /readyz "
-            "publishes it in chain_signing_public_key). Repeat for a chain signed under more than "
-            "one key. The newest signed record must verify under one of them; without it, record "
+            "The gateway's evidence (chain signing) public key, pinned by you: 64 lowercase hex "
+            "characters, as /readyz publishes it in chain_signing_public_key, or a file holding it as an "
+            "Ed25519 JWK or a PEM public key. --chain-signing-key is an alias. Repeat for a chain signed "
+            "under more than one key. The newest signed record must verify under one of them, and so must "
+            "the signed chain heads and a manifest signed under meilynx.evidence.v1; the verdict says the "
+            "key was pinned by you, not certified. Without it (and without --attestation-key), record "
             "signatures are checked under the key the chain itself announces."
+        ),
+    )
+    parser.add_argument(
+        '--attestation-key',
+        action='append',
+        default=[],
+        metavar='JWK',
+        help=(
+            "The project's evidence attestation key (ADR-0113), pinned once out of band: a file holding "
+            "the P-256 JWK, bare or as the control plane serves it ({\"keyId\": ..., \"jwk\": {...}}). "
+            "Every attestation in evidence-keys/attestations.json must verify under it; the records, "
+            "chain heads and manifest are then checked under the keys it attests. Repeat after a rotation "
+            "of the attestation key."
         ),
     )
     parser.add_argument(
@@ -13938,13 +16188,20 @@ def main():
         ok = anchor_self_test() and ok
         ok = ocsf_export_self_test() and ok
         ok = record_signature_self_test() and ok
+        ok = gateway_evidence_key_self_test() and ok
         sys.exit(0 if ok else 1)
 
     if not (args.bucket or args.records) or not args.manifest:
         parser.error("--manifest plus one of --bucket / --records is required (or use --self-test)")
-    chain_keys = [parse_chain_key(k) for k in args.chain_signing_key]
-    if any(k is None for k in chain_keys):
-        parser.error("--chain-signing-key must be 64 lowercase hex characters (the raw Ed25519 public key)")
+    try:
+        chain_keys = [parse_gateway_key(k) for k in args.gateway_key]
+    except (OSError, ValueError, binascii.Error) as exc:
+        parser.error(f"--gateway-key / --chain-signing-key must be 64 lowercase hex characters (the raw Ed25519 "
+                     f"public key) or a file holding an Ed25519 JWK or PEM public key ({exc})")
+    try:
+        attestation_pins = [load_attestation_pin(Path(k).read_text(encoding='utf-8')) for k in args.attestation_key]
+    except (OSError, ValueError, KeyError, TypeError, binascii.Error) as exc:
+        parser.error(f"--attestation-key must be a file holding the project's P-256 attestation key as a JWK ({exc})")
     if args.conditions_sha256 is not None and not _SHA256_HEX.fullmatch(args.conditions_sha256):
         parser.error("--conditions-sha256 must be 64 lowercase hex characters")
     if args.conditions_acceptance and args.conditions_sha256 is None:
@@ -14006,9 +16263,16 @@ def main():
         sys.exit(EXIT_CANNOT_EVALUATE)
 
     signed = pack_is_signed(manifest)
-    signature_status = (
-        report_pack_signature(manifest, manifest_bytes, manifest_path, args) if signed else UNSIGNED
-    )
+    # A manifest signed by the gateway evidence key (ADR-0113) is judged
+    # after the walk, under the keys the attestations (or the reader) name.
+    gateway_signed = is_evidence_signed(manifest)
+    evidence_keys = load_evidence_keys(manifest_path.parent, attestation_pins, chain_keys)
+    if gateway_signed:
+        signature_status = UNSIGNED
+    else:
+        signature_status = (
+            report_pack_signature(manifest, manifest_bytes, manifest_path, args) if signed else UNSIGNED
+        )
 
     if args.records:
         try:
@@ -14051,6 +16315,9 @@ def main():
     hash_version = manifest.get('hash_version', '')
     pack_full_records = {}
     control_plane_records = {}
+    evidence_status = None
+    gateway_verdict = None
+    records_dir = Path(args.records) if args.records and Path(args.records).is_dir() else None
     if hash_version not in SUPPORTED_HASH_VERSIONS:
         print(
             f"ERROR: This reproducer supports hash_version {SUPPORTED_HASH_VERSIONS}. "
@@ -14062,10 +16329,24 @@ def main():
     else:
         receipts = {}
         stripped_problems = []
+        signatures = {}
         passed = verify_manifest_with(fetch, manifest, require_manifest_hash=signed, holders=holders,
                                       receipts_out=receipts, records_out=pack_full_records,
                                       stripped=stripped, cannot_evaluate_out=stripped_problems,
-                                      stubs=manifest_stubs(manifest), chain_keys=chain_keys)
+                                      stubs=manifest_stubs(manifest), chain_keys=evidence_keys.walk_keys(),
+                                      signatures_out=signatures,
+                                      chain_keys_label=('the keys the attestations name'
+                                                        if evidence_keys.mode == 'attested' else None))
+        # The gateway evidence key: attestations, evidence-key seals, signed
+        # heads and the manifest signature. A pack with none of them, checked
+        # without --attestation-key, keeps the record-signature check above.
+        if (gateway_signed or evidence_keys.mode == 'attested' or evidence_keys.present
+                or load_head_signatures(records_dir)):
+            print()
+            evidence_status, gateway_signature, gateway_verdict = evaluate_gateway_evidence(
+                manifest, evidence_keys, signatures['walk'], pack_full_records, records_dir)
+            if gateway_signed:
+                signature_status = gateway_signature
         # The control-plane chain a 1.3 pack carries, then each
         # decision receipt's anchor against it.
         if 'control_plane' in manifest or manifest.get('schema_version') == '1.3':
@@ -14088,9 +16369,11 @@ def main():
     # The verdict counts the hash-only stubs it linked through.
     stub_count = len(manifest_stubs(manifest))
     stubbed = (f", {stub_count} of them as hash-only stubs (linked, hash not recomputed)" if stub_count else "")
-    code = final_exit_code(combine_with_anchor_status(combine_with_anchor_status(chain_status, claim_status),
-                                                      anchor_status),
-                           signature_status, bool(args.allow_unsigned))
+    # The gateway evidence-key verdict (attestations, seals, signed heads)
+    # combines with the chain's by the same precedence.
+    code = final_exit_code(combine_with_anchor_status(
+        combine_with_anchor_status(combine_with_anchor_status(chain_status, claim_status), anchor_status),
+        evidence_status or PASSED), signature_status, bool(args.allow_unsigned))
     # The OCSF export beside the pack. Its verdict
     # combines with the pack's by the same precedence (1 > 2 > 4 > 3 > 0).
     if args.ocsf_export:
@@ -14110,12 +16393,15 @@ def main():
             if entries is not None:
                 export_content, export_signature = verify_ocsf_export(
                     entries, chain_for_prefix(manifest.get('prefix', 'audit/')), pack_full_records,
-                    public_point=public_point)
+                    public_point=public_point, evidence_keys=evidence_keys)
                 export_code = final_exit_code(export_content, export_signature, bool(args.allow_unsigned))
                 if export_content == FAILED:
                     print("\nFAIL: the OCSF export does not match the pack (see above).", file=sys.stderr)
                 elif export_signature == FAILED:
                     print("\nFAIL: an OCSF export manifest signature did not verify (see above).", file=sys.stderr)
+                elif export_signature == CANNOT_EVALUATE:
+                    print(f"\nCANNOT EVALUATE: an OCSF export manifest is signed by a gateway evidence key and "
+                          f"{NO_PINNED_KEY} (see above).", file=sys.stderr)
                 elif export_code == EXIT_UNSIGNED:
                     print("\nOCSF EXPORT OK, AUTHENTICITY NOT ESTABLISHED: the export matches the pack, but a manifest "
                           "is unsigned or its key was not given.", file=sys.stderr)
@@ -14150,6 +16436,15 @@ def main():
             print(f"\nFAIL: the manifest's claim contradicts the manifest (see above).{label}", file=sys.stderr)
         if signature_status == FAILED:
             print(f"\nFAIL: the manifest signature did not verify (see above).{label}", file=sys.stderr)
+        if evidence_status == FAILED:
+            print(f"\nFAIL: the gateway evidence-key check failed (see above).{label}", file=sys.stderr)
+    elif code == EXIT_CANNOT_EVALUATE and gateway_signed and signature_status == CANNOT_EVALUATE:
+        print(f"\nCANNOT EVALUATE: {NO_PINNED_KEY}. This pack is signed by a gateway evidence key; nothing in it "
+              f"can say whose key that is. Pass --attestation-key (the project's attestation key) or "
+              f"--gateway-key (the gateway's own key).{label}", file=sys.stderr)
+    elif code == EXIT_CANNOT_EVALUATE and evidence_status == CANNOT_EVALUATE and chain_status != CANNOT_EVALUATE:
+        print(f"\nCANNOT EVALUATE: the gateway evidence-key check could not be evaluated (see above).{label}",
+              file=sys.stderr)
     elif code == EXIT_CANNOT_EVALUATE and conditions_status == CANNOT_EVALUATE and chain_status != CANNOT_EVALUATE:
         print(f"\nCANNOT EVALUATE: the customer-conditions verdict cannot be evaluated from this pack "
               f"(see above).{label}", file=sys.stderr)
@@ -14159,11 +16454,15 @@ def main():
     elif code == EXIT_COVERAGE_NOT_ESTABLISHED:
         if signature_status != PASSED:
             print(f"\n{UNSIGNED_NOTICE}")
-        print(f"\nINTEGRITY OK, COVERAGE NOT ESTABLISHED: all {count} events verified{stubbed}, but a verified "
-              f"anchor shows the chain went on past the head this pack claims (see above). This is not a "
+        witness = ("a chain head the gateway signed" if evidence_status == COVERAGE_NOT_ESTABLISHED
+                   else "a verified anchor")
+        print(f"\nINTEGRITY OK, COVERAGE NOT ESTABLISHED: all {count} events verified{stubbed}, but {witness} "
+              f"shows the chain went on past the head this pack claims (see above). This is not a "
               f"tampering verdict.{label}", file=sys.stderr)
     elif signature_status == PASSED:
         print(f"\nOK: all {count} events verified{stubbed}, and the manifest signature verified.{label}")
+        if gateway_verdict:
+            print(gateway_verdict)
     else:
         print(f"\n{UNSIGNED_NOTICE}")
         if code == EXIT_OK:

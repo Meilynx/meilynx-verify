@@ -1,0 +1,45 @@
+{
+ "schema_version": "v1.21",
+ "event_kind": "judgment_verdict",
+ "timestamp_utc": "2026-11-03T09:00:01.000000000Z",
+ "event_id": "00000000-0000-0000-0000-000000000001",
+ "request_id": "00000000-0000-0000-0000-000000000001",
+ "model_requested": "",
+ "action": "allow",
+ "input_tokens": 0,
+ "output_tokens": 0,
+ "estimated_cost_usd": null,
+ "judgment_verdict": {
+  "verdict_id": "jv_00000000000000000000000000000001",
+  "judged_event_id": "00000000-0000-4000-8000-0000000f0002",
+  "judged_upload_event_id": "3f9a1c0b7e2d4a65",
+  "judged_event_hash": "9999999999999999999999999999999999999999999999999999999999999999",
+  "judged_sequence_number": 0,
+  "rule_id": "judgment.scope-boundary",
+  "judgment": "scope-boundary@2",
+  "pack_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+  "verdict": "FLAG",
+  "source": "judge",
+  "reason_code": "clause_violated",
+  "enforceable": true,
+  "uploaded_sha256": "7fe553b171f8b60478408a88a685dd1f9777f35752cd076b0b4deda324fdc38a",
+  "local_sha256": "de8862c0c6f9e2dd091ee7224d1c51170a998b18288f29421b36f0e22c47d051",
+  "uploaded_json": "{\"action_taken\":\"allow\",\"backend\":{\"distribution\":\"native\",\"id\":\"fixture:judge@1\",\"prompt_sha256\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"prompt_version\":\"judge_prompt.v1\",\"validated\":true,\"validation_run\":\"vr_01JFIXTURE\",\"validation_sha256\":\"8888888888888888888888888888888888888888888888888888888888888888\"},\"enforceable\":true,\"evaluated_at\":\"2026-11-03T09:00:01Z\",\"execution\":\"gateway\",\"judged_event_id\":\"3f9a1c0b7e2d4a65\",\"judgment\":\"scope-boundary@2\",\"latency_ms\":181,\"pack\":{\"sha256\":\"5555555555555555555555555555555555555555555555555555555555555555\",\"version\":3},\"questions\":[{\"clause_sha256\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"flag_at\":0.8,\"id\":\"Q-SCOPE-1-a\",\"outcome\":\"FLAG\",\"p\":0.93,\"p_pass\":0.05,\"pass_at\":0.1}],\"reason_code\":\"clause_violated\",\"rollout_stage\":\"shadow\",\"rule_id\":\"judgment.scope-boundary\",\"schema\":\"judgment_verdict.v1\",\"source\":\"judge\",\"timing\":\"after_delivery\",\"verdict\":\"FLAG\",\"verdict_id\":\"jv_00000000000000000000000000000001\"}"
+ },
+ "raw_response": {
+  "schema": "judgment_verdict_local.v1",
+  "reason_text": "Q-SCOPE-1-a: synthetic reason.",
+  "reason_text_withheld": false,
+  "spans": [
+   {
+    "input": "reply",
+    "start": 0,
+    "end": 19
+   }
+  ],
+  "floor_unavailable": false
+ },
+ "sequence_number": 1,
+ "previous_hash": "24c1545f3075a72a2ea7016242b8544b2154a312a4fff8cec869449af2702d8f",
+ "event_hash": "615b6c79b150114dfb4713adc9ad45b8210f22f48b3c8c01984c7e1f7162f90b"
+}

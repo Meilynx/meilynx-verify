@@ -1,0 +1,13 @@
+{
+  "runs": [
+    {
+      "args": [
+        "--allow-unsigned"
+      ],
+      "contains": [
+        "FAIL seq=1: verdict receipt jv_00000000000000000000000000000001: does not link to the pack's record at sequence 0: that record has another event id or event hash"
+      ],
+      "exit": 1
+    }
+  ]
+}
