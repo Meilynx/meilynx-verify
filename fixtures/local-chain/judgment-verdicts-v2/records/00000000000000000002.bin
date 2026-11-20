@@ -1,0 +1,41 @@
+{
+ "schema_version": "v1.22",
+ "event_kind": "judgment_verdict",
+ "timestamp_utc": "2026-11-04T09:00:01.500000000Z",
+ "event_id": "00000000-0000-0000-0000-000000000002",
+ "request_id": "00000000-0000-0000-0000-000000000002",
+ "model_requested": "",
+ "action": "allow",
+ "input_tokens": 0,
+ "output_tokens": 0,
+ "estimated_cost_usd": null,
+ "judgment_verdict": {
+  "verdict_id": "jv_00000000000000000000000000000002",
+  "judged_event_id": "00000000-0000-4000-8000-0000000f2000",
+  "judged_upload_event_id": "00000000-0000-4000-8000-0000000f2000",
+  "judged_event_hash": "e6ad80311e23c4fb8669bfdf7926bc4912ab5c9dc8923103412a3d045b69c35c",
+  "judged_sequence_number": 0,
+  "rule_id": "judgment.disclosure",
+  "judgment": "disclosure@1",
+  "pack_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+  "verdict": "PASS",
+  "source": "judge",
+  "reason_code": "ok",
+  "enforceable": true,
+  "uploaded_sha256": "08581621eed0d266d9e69283c437c5e096dff21383d294d3c9c93385fe4e7958",
+  "local_sha256": "98d13312d81bc9f0aba280da4f7d995f54d28f88a2a9eddf806a27c49f71a9b5",
+  "uploaded_json": "{\"action_taken\":\"allow\",\"backend\":{\"distribution\":\"native\",\"id\":\"fixture:judge@1\",\"prompt_sha256\":\"7777777777777777777777777777777777777777777777777777777777777777\",\"prompt_version\":\"judge_prompt.v1\",\"validated\":true,\"validation_run\":\"vr_01JFIXTURE\",\"validation_sha256\":\"8888888888888888888888888888888888888888888888888888888888888888\"},\"enforceable\":true,\"evaluated_at\":\"2026-11-04T09:00:01Z\",\"execution\":\"gateway\",\"input_form\":\"redacted\",\"judged_event_id\":\"00000000-0000-4000-8000-0000000f2000\",\"judgment\":\"disclosure@1\",\"latency_ms\":182,\"pack\":{\"sha256\":\"5555555555555555555555555555555555555555555555555555555555555555\",\"version\":3},\"pool_verdict_id\":null,\"questions\":[{\"clause_sha256\":\"6666666666666666666666666666666666666666666666666666666666666666\",\"flag_at\":0.8,\"id\":\"Q-DISC-1\",\"outcome\":\"PASS\",\"p\":0.02,\"p_pass\":0.97,\"pass_at\":0.1}],\"reason_code\":\"ok\",\"rollout_stage\":\"shadow\",\"rule_id\":\"judgment.disclosure\",\"rule_sha256\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"schema\":\"judgment_verdict.v2\",\"snapshot\":\"forwarded_request\",\"source\":\"judge\",\"stage\":\"pre_request\",\"timing\":\"after_delivery\",\"verdict\":\"PASS\",\"verdict_id\":\"jv_00000000000000000000000000000002\"}"
+ },
+ "raw_response": {
+  "schema": "judgment_verdict_local.v2",
+  "reason_text": "Q-DISC-1: synthetic reason.",
+  "reason_text_withheld": false,
+  "spans": [],
+  "floor_unavailable": false,
+  "judged_input_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+  "floor_triggers": []
+ },
+ "sequence_number": 2,
+ "previous_hash": "5e98cfa5bbd92ca0a89b30fbeac6fd390ee23a8fc6629227a894999d548aee6a",
+ "event_hash": "16f78d2489c1a9d49d884dc1a63a9cbdcd646d5d3dde0f4d52ecc410d411486b"
+}

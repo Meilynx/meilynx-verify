@@ -1,0 +1,48 @@
+{
+ "schema_version": "v1.22",
+ "event_kind": "judgment_verdict",
+ "timestamp_utc": "2026-11-04T09:01:02.000000000Z",
+ "event_id": "00000000-0000-0000-0000-000000000005",
+ "request_id": "00000000-0000-0000-0000-000000000005",
+ "model_requested": "",
+ "action": "allow",
+ "input_tokens": 0,
+ "output_tokens": 0,
+ "estimated_cost_usd": null,
+ "judgment_verdict": {
+  "verdict_id": "jv_00000000000000000000000000000005",
+  "judged_event_id": "00000000-0000-4000-8000-0000000f2000",
+  "judged_upload_event_id": "00000000-0000-4000-8000-0000000f2000",
+  "judged_event_hash": "e6ad80311e23c4fb8669bfdf7926bc4912ab5c9dc8923103412a3d045b69c35c",
+  "judged_sequence_number": 0,
+  "rule_id": "judgment.scope-boundary",
+  "judgment": "scope-boundary@2",
+  "pack_sha256": "5555555555555555555555555555555555555555555555555555555555555555",
+  "verdict": "INDETERMINATE",
+  "source": "none",
+  "reason_code": "raw_input_not_permitted",
+  "enforceable": true,
+  "uploaded_sha256": "4969136d30a0e28dc725b4a2d13ab8e607bb900ea67e790ea43607e8553a690b",
+  "local_sha256": "0939d100ecebdf006c49cdcef4f6a3dae3db4317ace7bcc9f0790e79412b956b",
+  "uploaded_json": "{\"action_taken\":\"allow\",\"backend\":null,\"enforceable\":true,\"evaluated_at\":\"2026-11-04T09:01:02Z\",\"execution\":\"gateway\",\"input_form\":\"raw\",\"judged_event_id\":\"00000000-0000-4000-8000-0000000f2000\",\"judgment\":\"scope-boundary@2\",\"latency_ms\":0,\"pack\":{\"sha256\":\"5555555555555555555555555555555555555555555555555555555555555555\",\"version\":3},\"pool_verdict_id\":null,\"questions\":[],\"reason_code\":\"raw_input_not_permitted\",\"rollout_stage\":\"shadow\",\"rule_id\":\"judgment.scope-boundary\",\"rule_sha256\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"schema\":\"judgment_verdict.v2\",\"snapshot\":\"candidate_reply_partial\",\"source\":\"none\",\"stage\":\"post_response\",\"timing\":\"after_delivery\",\"verdict\":\"INDETERMINATE\",\"verdict_id\":\"jv_00000000000000000000000000000005\"}"
+ },
+ "raw_response": {
+  "schema": "judgment_verdict_local.v2",
+  "reason_text": null,
+  "reason_text_withheld": false,
+  "spans": [],
+  "floor_unavailable": false,
+  "judged_input_sha256": null,
+  "floor_triggers": [
+   {
+    "rule_id": "floor.scope-terms",
+    "term_id": "scope-term-2",
+    "language": "en",
+    "matched": "synthetic term"
+   }
+  ]
+ },
+ "sequence_number": 5,
+ "previous_hash": "6765cb0630d431b6408b49d16e4709c90e9030247b11deb11da58e6958fc2f70",
+ "event_hash": "f5cd229f69e8c240ba2d5db1626e5ddb6c7feda587c78b4de1c99a39e4104e87"
+}

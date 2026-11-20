@@ -1,0 +1,13 @@
+{
+  "runs": [
+    {
+      "args": [
+        "--allow-unsigned"
+      ],
+      "contains": [
+        "FAIL seq=1: verdict receipt jv_00000000000000000000000000000001: a v1.21 record stores a judgment_verdict.v2 form, which only a v1.22 record carries"
+      ],
+      "exit": 1
+    }
+  ]
+}

@@ -1,5 +1,64 @@
 # Changelog
 
+## 0.13.0 (2026-11-20)
+
+- `verify-pack.py` from meilynx-proxy `f80356e`.
+- The self-test's v1.2 authentication fixture uses a fictional address
+  (`fixture-user@example.com`); its pinned hash changes with it. No
+  verification rule changes.
+- **Upgrade before verifying chains or packs written after this release.**
+  A verifier older than 0.13.0 fails every v1.22 record with
+  `judgment_verdict payload present on a 'v1.22' 'judgment.verdict' event`
+  (exit 1). It never reports such a chain as a pass.
+- Chain v1.22 (SPEC §4.3): the same `judgment_verdict` record as v1.21, with
+  the same hash fields; only the `schema_version` stamp differs. The stamp
+  says the receipt also records how the judge was given its input, and
+  obliges the verifier to check those facts:
+  - the uploaded form is `judgment_verdict.v2`, a closed object: exactly its
+    listed keys, each of its type, fixed vocabulary and format (ids, hex
+    digests, an RFC 3339 UTC time, `latency_ms` an unsigned 32-bit integer),
+    `null` only where the format allows it, and `pack`, each entry of
+    `questions` and `backend` closed objects of their own;
+  - its new facts: `stage` (`pre_request`, `post_response` or `tool_call`:
+    where the judgment ran), `input_form` (`redacted` or `raw`, one form for
+    every input of the judge call), `snapshot` (`forwarded_request`,
+    `candidate_reply`, `candidate_reply_partial` or `tool_arguments`: what
+    was judged), `rule_sha256` (the SHA-256 of the rule as delivered to the
+    gateway) and `raw_input_grant` (the organization's permission that
+    covered the backend of a raw judgment);
+  - `raw_input_grant` is present exactly when the input form is `raw` and a
+    backend answered, and absent otherwise (never `null`);
+  - `pool_verdict_id` is always present: `null` in gateway execution; in pool
+    execution the shared pool's verdict id (`jv_` and 32 lowercase hex
+    digits), or `null` only when the gateway settled the verdict itself
+    because the pool issued none (an `INDETERMINATE` not from the judge for a
+    reason of the pool's not answering, or a floor's `FLAG`);
+  - the new reason code `raw_input_not_permitted` (the 17th) is a raw
+    judgment with no covering permission: `INDETERMINATE`, source `none`, no
+    backend, no grant;
+  - each stage judges its own snapshots: `forwarded_request` only at
+    `pre_request`, `candidate_reply` and `candidate_reply_partial` only at
+    `post_response`, and `tool_arguments` exactly at `tool_call`;
+  - `tool_arguments` judges an MCP tool call, the other three snapshots a
+    model request, and the `tool_call` stage an MCP tool call: when the pack
+    holds the judged record, its kind must fit;
+  - the local part is `judgment_verdict_local.v2`, a closed object that adds
+    `judged_input_sha256` (the SHA-256 of the exact input block the backend
+    received; `null` exactly when no backend was sent one) and
+    `floor_triggers` (the rule, term and language ids of the trigger-floor
+    terms that fired; never the matched text).
+  - A v1.21 record whose stored uploaded form is `judgment_verdict.v2` is a
+    v1.22 receipt with its stamp edited (the stamp is outside the hash) and
+    fails. v1.21 receipts written by a v1.21 gateway check as before.
+- `VERIFIER_CAPABILITIES` adds `judgment-verdicts-v2`. Self-test assertions
+  39d to 39f pin the v1.22 fixture and its failure cases.
+- New fixtures under `fixtures/local-chain/`: a chain of a model request, an
+  MCP tool call and four v1.22 receipts (exit 0, or 3 without
+  `--allow-unsigned`), the same chain sealed with four receipts that break
+  the v1.22 rules (exit 1), and the clean chain with one receipt's stamp
+  edited to v1.21 (exit 1).
+- Packs without v1.22 records verify as before.
+
 ## 0.12.0 (2026-11-19)
 
 - `verify-pack.py` from meilynx-proxy `bcbc8eb`.

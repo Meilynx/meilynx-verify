@@ -1,0 +1,33 @@
+{
+ "schema_version": "v1.4",
+ "event_kind": "mcp_tool_call",
+ "timestamp_utc": "2026-11-04T09:01:00.000000000Z",
+ "event_id": "00000000-0000-4000-8000-0000000f2003",
+ "request_id": "00000000-0000-4000-8000-0000000f2103",
+ "model_requested": "",
+ "action": "allow",
+ "input_tokens": 0,
+ "output_tokens": 0,
+ "estimated_cost_usd": null,
+ "findings": [],
+ "messages": [],
+ "response_text": null,
+ "mcp_event": {
+  "virtual_server": "research",
+  "upstream_slug": "market-data",
+  "method": "tools/call",
+  "tool_name": "market-data__get_positions",
+  "jsonrpc_id": "7",
+  "protocol_version": "2026-07-28",
+  "decision": null,
+  "reason": null,
+  "payload_sha256_jcs": "c4a6ffe4176495be741e98fab2218bd3fb1add7926dc7f5299ff4d0ad0b0ae33",
+  "mcp_bundle_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "correlated_event_id": null,
+  "error_code": null,
+  "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+ },
+ "sequence_number": 3,
+ "previous_hash": "16f78d2489c1a9d49d884dc1a63a9cbdcd646d5d3dde0f4d52ecc410d411486b",
+ "event_hash": "38b699e8eb9d92ed15ccdd10d514f90c25aba9dd0f7917371f2113a364d5dc5b"
+}

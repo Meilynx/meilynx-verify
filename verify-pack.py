@@ -403,6 +403,12 @@ EVIDENCE_MODE_INDEX_FIELDS = ("sequence", "mode", "source")
 # the stored uploaded form and of the local-only part, checks the sealed
 # facts against the stored form, and checks the link to the judged record
 # against the pack record at that sequence.
+# `judgment-verdicts-v2` reads v1.22 judgment.verdict records (the same
+# record and hash feed, stamped v1.22) and holds the stored
+# uploaded form to the closed `judgment_verdict.v2` key set (input form,
+# snapshot, rule digest, raw-input grant, reason code raw_input_not_permitted)
+# and the local part to `judgment_verdict_local.v2`, checks their cross-field
+# rules, and checks the snapshot against the judged record's event kind.
 # `coverage-claim-v1` reads a manifest's `claim`, fails a claim that
 # contradicts the manifest, and reports a verified anchor after a
 # chain_to_head claim as coverage not established (exit 4), never as a
@@ -420,7 +426,8 @@ VERIFIER_CAPABILITIES = frozenset(
      "data-reach-evidence-v1", "control-plane-chain-v1", "ocsf-export-v1", "customer-scope-v1",
      "per-tenant-signer-v1", "evidence-class-v1", "content-stripped-v1", "customer-conditions-v1",
      "record-signatures-v1", "compliance-records-v1", "local-chain-evidence-v1", "coverage-claim-v1",
-     "evidence-modes-v1", "gateway-evidence-key-v1", "judgment-verdicts-v1"}
+     "evidence-modes-v1", "gateway-evidence-key-v1", "judgment-verdicts-v1",
+     "judgment-verdicts-v2"}
 )
 # The stripped profile of a manifest 1.5 Exchange pack. Mirror of
 # `exchange::STRIPPED_FIELDS` / `WITHHELD_FIELDS` / `STUB_FIELDS` /
@@ -1351,6 +1358,320 @@ JUDGMENT_VERDICT_NO_PACK_VERSION_REASON = 'pack_unavailable'
 JUDGMENT_VERDICT_LOCAL_SCHEMA = 'judgment_verdict_local.v1'
 JUDGMENT_VERDICT_LOCAL_FIELDS = ('schema', 'reason_text', 'reason_text_withheld', 'spans', 'floor_unavailable')
 
+# The v1.22 bucket: the same judgment.verdict record and
+# the same 14-field feed, stamped v1.22. The stamp obliges the reader to hold
+# the stored uploaded form to the closed `judgment_verdict.v2` key set and the
+# local part to `judgment_verdict_local.v2`. The stamp is not in the
+# preimage, so the stored form's own schema name is what tells the two
+# buckets apart: a v1.21 record carrying a v2 form is a relabelled v1.22
+# record.
+JUDGMENT_VERDICT_SCHEMA_VERSIONS = ('v1.21', 'v1.22')
+JUDGMENT_VERDICT_V2_SCHEMA_VERSION = 'v1.22'
+JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2 = 'judgment_verdict.v2'
+JUDGMENT_VERDICT_LOCAL_SCHEMA_V2 = 'judgment_verdict_local.v2'
+# Every key of the v2 uploaded form. `raw_input_grant` is the one optional
+# key: present exactly when the input form is `raw` and a backend answered,
+# otherwise absent (never null).
+JUDGMENT_VERDICT_V2_FIELDS = (
+    'schema', 'verdict_id', 'judged_event_id', 'rule_id', 'rule_sha256', 'judgment', 'pack',
+    'verdict', 'source', 'reason_code', 'enforceable', 'questions', 'execution', 'pool_verdict_id',
+    'backend', 'timing', 'rollout_stage', 'action_taken', 'stage', 'input_form', 'snapshot',
+    'raw_input_grant', 'latency_ms', 'evaluated_at',
+)
+JUDGMENT_VERDICT_V2_OPTIONAL_FIELDS = ('raw_input_grant',)
+# MEI-3939: `pool_verdict_id` links a receipt to the shared pool's own record
+# of the same verdict. Always present: `jv_` and 32 lowercase hex digits
+# exactly when `execution` is `pool`, null otherwise.
+JUDGMENT_VERDICT_POOL_VERDICT_ID = re.compile(r'\Ajv_[0-9a-f]{32}\Z')
+# MEI-3939 (option A): a pool record names no pool verdict when the gateway
+# settled the verdict itself: an INDETERMINATE not from the judge with one of
+# these reason codes, or a floor's FLAG.
+JUDGMENT_VERDICT_POOL_UNANSWERED_REASON_CODES = (
+    'backend_timeout', 'backend_unavailable', 'backend_error', 'malformed_answer',
+    'raw_input_not_permitted', 'backlog_dropped', 'no_backend_configured',
+    'floor_unavailable', 'floor_triggered_unanswered',
+)
+JUDGMENT_VERDICT_LOCAL_FIELDS_V2 = JUDGMENT_VERDICT_LOCAL_FIELDS + ('judged_input_sha256', 'floor_triggers')
+# The closed reason-code list (ADR-0115 D6), in its order. The 17th,
+# `raw_input_not_permitted`, is a raw-input rule with no live covering grant.
+JUDGMENT_VERDICT_REASON_CODES = (
+    'ok', 'clause_violated', 'floor_match', 'abstained', 'input_missing', 'budget_exceeded',
+    'backend_timeout', 'backend_unavailable', 'backend_error', 'malformed_answer', 'backlog_dropped',
+    'no_backend_configured', 'no_validated_backend', 'pack_unavailable', 'floor_unavailable',
+    'floor_triggered_unanswered', 'raw_input_not_permitted',
+)
+JUDGMENT_VERDICT_RAW_INPUT_NOT_PERMITTED = 'raw_input_not_permitted'
+JUDGMENT_VERDICT_OUTCOMES = ('PASS', 'FLAG', 'INDETERMINATE')
+JUDGMENT_VERDICT_SOURCES = ('judge', 'floor', 'none')
+JUDGMENT_VERDICT_EXECUTIONS = ('gateway', 'pool')
+JUDGMENT_VERDICT_DISTRIBUTIONS = ('native', 'derived')
+JUDGMENT_VERDICT_TIMINGS = ('after_delivery', 'before_delivery')
+JUDGMENT_VERDICT_ROLLOUT_STAGES = ('shadow', 'flag', 'enforce')
+JUDGMENT_VERDICT_ACTIONS = ('allow', 'warn', 'redact', 'mask_output', 'hold', 'block')
+JUDGMENT_VERDICT_INPUT_FORMS = ('redacted', 'raw')
+# Where the judgment ran: on the request before it is forwarded, on the reply
+# after the response, or on a tool call. Each stage judges its own snapshots
+# (`JUDGMENT_VERDICT_STAGE_SNAPSHOTS`), and `tool_call` judges an
+# mcp.tool_call record.
+JUDGMENT_VERDICT_TOOL_STAGE = 'tool_call'
+JUDGMENT_VERDICT_STAGES = ('pre_request', 'post_response', JUDGMENT_VERDICT_TOOL_STAGE)
+JUDGMENT_VERDICT_STAGE_SNAPSHOTS = {
+    'pre_request': ('forwarded_request',),
+    'post_response': ('candidate_reply', 'candidate_reply_partial'),
+    JUDGMENT_VERDICT_TOOL_STAGE: ('tool_arguments',),
+}
+# What the judge was given. `tool_arguments` is the tool lane's (the judged
+# record is an mcp.tool_call); the other three judge a model request (an
+# llm_request). `candidate_reply_partial` is a pass-through stream whose reply
+# was not seen whole.
+JUDGMENT_VERDICT_TOOL_SNAPSHOT = 'tool_arguments'
+JUDGMENT_VERDICT_SNAPSHOTS = ('forwarded_request', 'candidate_reply', 'candidate_reply_partial',
+                              JUDGMENT_VERDICT_TOOL_SNAPSHOT)
+JUDGMENT_VERDICT_V2_PACK_FIELDS = ('version', 'sha256')
+JUDGMENT_VERDICT_V2_QUESTION_FIELDS = ('id', 'clause_sha256', 'outcome', 'p', 'p_pass', 'flag_at', 'pass_at')
+JUDGMENT_VERDICT_V2_BACKEND_FIELDS = ('id', 'distribution', 'validated', 'prompt_version', 'prompt_sha256',
+                                      'validation_run', 'validation_sha256')
+JUDGMENT_VERDICT_LOCAL_SPAN_FIELDS = ('input', 'start', 'end')
+JUDGMENT_VERDICT_LOCAL_FLOOR_TRIGGER_FIELDS = ('rule_id', 'term_id', 'language')
+# The upload allowlist's value classes (contracts/control-plane-upload-allowlist.v1.json):
+# `code` (a system-assigned identifier) and `hex`.
+_JV_CODE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.:/@+-]{0,127}')
+_JV_HEX = re.compile(r'[0-9a-fA-F]{1,128}')
+_JV_RFC3339_UTC = re.compile(r'(\d{4})-(\d\d)-(\d\d)T(\d\d):(\d\d):(\d\d)(?:\.\d{1,9})?(?:Z|\+00:00)')
+
+
+def _jv_is_code(v):
+    return isinstance(v, str) and _JV_CODE.fullmatch(v) is not None
+
+
+def _jv_is_hex(v):
+    return isinstance(v, str) and _JV_HEX.fullmatch(v) is not None
+
+
+def _jv_is_sha256(v):
+    return isinstance(v, str) and re.fullmatch(r'[0-9a-f]{64}', v) is not None
+
+
+def _jv_is_uint(v, bits):
+    return isinstance(v, int) and not isinstance(v, bool) and 0 <= v < 2 ** bits
+
+
+def _jv_is_number(v):
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and v == v and v not in (float('inf'), float('-inf')))
+
+
+def _jv_is_utc(v):
+    m = _JV_RFC3339_UTC.fullmatch(v) if isinstance(v, str) else None
+    if not m:
+        return False
+    try:
+        datetime.datetime(*(int(g) for g in m.groups()))
+    except ValueError:
+        return False
+    return True
+
+
+def _jv_is_judgment_ref(v):
+    """`<id>@<version>`: the id plain and without `@`, the version a u32
+    with no leading zero (`JudgmentRef` in meilynx-judge)."""
+    if not _jv_is_code(v) or '@' not in v:
+        return False
+    ident, version = v.rsplit('@', 1)
+    return (bool(ident) and '@' not in ident and version.isdigit() and version.isascii()
+            and not version.startswith('0') and int(version) < 2 ** 32)
+
+
+def _jv_closed_keys(obj, allowed, optional=()):
+    """The problems of a closed object's key set: a missing required key or
+    an unknown key."""
+    keys = set(obj)
+    missing = sorted(set(allowed) - set(optional) - keys)
+    unknown = sorted(keys - set(allowed))
+    problems = []
+    if missing:
+        problems.append(f"lacks {', '.join(missing)}")
+    if unknown:
+        problems.append(f"carries the unknown key(s) {', '.join(unknown)}")
+    return problems
+
+
+def judgment_verdict_v2_form_problems(uploaded):
+    """The problems of a stored `judgment_verdict.v2` uploaded form on its
+    own: its closed key set, each value's type, enum, nullability and format,
+    the closed nested objects (`pack`, `questions[]`, `backend`), and the
+    cross-field rules that read only the form. Empty means it checks out."""
+    problems = []
+
+    def bad(path, what):
+        problems.append(f"`{path}` is not {what}")
+
+    problems.extend(f"the form {p}" for p in _jv_closed_keys(
+        uploaded, JUDGMENT_VERDICT_V2_FIELDS, JUDGMENT_VERDICT_V2_OPTIONAL_FIELDS))
+    get = uploaded.get
+    if 'schema' in uploaded and get('schema') != JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2:
+        bad('schema', JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2)
+    for name in ('verdict_id', 'judged_event_id', 'rule_id'):
+        if name in uploaded and not _jv_is_code(get(name)):
+            bad(name, 'a code')
+    if 'rule_sha256' in uploaded and not _jv_is_sha256(get('rule_sha256')):
+        bad('rule_sha256', '64 lowercase hex')
+    if 'judgment' in uploaded and not _jv_is_judgment_ref(get('judgment')):
+        bad('judgment', '<id>@<version>')
+    for name, values in (('verdict', JUDGMENT_VERDICT_OUTCOMES), ('source', JUDGMENT_VERDICT_SOURCES),
+                         ('reason_code', JUDGMENT_VERDICT_REASON_CODES),
+                         ('execution', JUDGMENT_VERDICT_EXECUTIONS), ('timing', JUDGMENT_VERDICT_TIMINGS),
+                         ('rollout_stage', JUDGMENT_VERDICT_ROLLOUT_STAGES),
+                         ('action_taken', JUDGMENT_VERDICT_ACTIONS),
+                         ('stage', JUDGMENT_VERDICT_STAGES),
+                         ('input_form', JUDGMENT_VERDICT_INPUT_FORMS),
+                         ('snapshot', JUDGMENT_VERDICT_SNAPSHOTS)):
+        if name in uploaded and (not isinstance(get(name), str) or get(name) not in values):
+            bad(name, f"one of {', '.join(values)}")
+    if 'enforceable' in uploaded and not isinstance(get('enforceable'), bool):
+        bad('enforceable', 'a boolean')
+    if 'latency_ms' in uploaded and not _jv_is_uint(get('latency_ms'), 32):
+        bad('latency_ms', 'an unsigned 32-bit integer')
+    if 'evaluated_at' in uploaded and not _jv_is_utc(get('evaluated_at')):
+        bad('evaluated_at', 'an RFC 3339 UTC timestamp')
+    if 'raw_input_grant' in uploaded and not _jv_is_code(get('raw_input_grant')):
+        bad('raw_input_grant', 'a code')
+    pack = get('pack')
+    if 'pack' in uploaded:
+        if not isinstance(pack, dict):
+            bad('pack', 'an object')
+        else:
+            problems.extend(f"`pack` {p}" for p in _jv_closed_keys(pack, JUDGMENT_VERDICT_V2_PACK_FIELDS))
+            if 'version' in pack and pack['version'] is not None and not _jv_is_uint(pack['version'], 64):
+                bad('pack.version', 'an unsigned integer or null')
+            if 'sha256' in pack and not _jv_is_hex(pack['sha256']):
+                bad('pack.sha256', 'hex')
+    questions = get('questions')
+    if 'questions' in uploaded:
+        if not isinstance(questions, list):
+            bad('questions', 'a list')
+        else:
+            for i, q in enumerate(questions):
+                at = f'questions[{i}]'
+                if not isinstance(q, dict):
+                    bad(at, 'an object')
+                    continue
+                problems.extend(f"`{at}` {p}" for p in _jv_closed_keys(q, JUDGMENT_VERDICT_V2_QUESTION_FIELDS))
+                if 'id' in q and not _jv_is_code(q['id']):
+                    bad(f'{at}.id', 'a code')
+                if 'clause_sha256' in q and not _jv_is_hex(q['clause_sha256']):
+                    bad(f'{at}.clause_sha256', 'hex')
+                if 'outcome' in q and (not isinstance(q['outcome'], str)
+                                       or q['outcome'] not in JUDGMENT_VERDICT_OUTCOMES):
+                    bad(f'{at}.outcome', f"one of {', '.join(JUDGMENT_VERDICT_OUTCOMES)}")
+                for name in ('p', 'p_pass', 'flag_at', 'pass_at'):
+                    if name in q and q[name] is not None and not _jv_is_number(q[name]):
+                        bad(f'{at}.{name}', 'a number or null')
+    backend = get('backend', ...)
+    if backend is not ... and backend is not None:
+        if not isinstance(backend, dict):
+            bad('backend', 'an object or null')
+        else:
+            problems.extend(f"`backend` {p}" for p in _jv_closed_keys(backend, JUDGMENT_VERDICT_V2_BACKEND_FIELDS))
+            for name in ('id', 'prompt_version'):
+                if name in backend and not _jv_is_code(backend[name]):
+                    bad(f'backend.{name}', 'a code')
+            if 'prompt_sha256' in backend and not _jv_is_hex(backend['prompt_sha256']):
+                bad('backend.prompt_sha256', 'hex')
+            if 'validated' in backend and not isinstance(backend['validated'], bool):
+                bad('backend.validated', 'a boolean')
+            distribution = backend.get('distribution')
+            if 'distribution' in backend and distribution is not None and (
+                    not isinstance(distribution, str) or distribution not in JUDGMENT_VERDICT_DISTRIBUTIONS):
+                bad('backend.distribution', f"one of {', '.join(JUDGMENT_VERDICT_DISTRIBUTIONS)} or null")
+            run = backend.get('validation_run')
+            if 'validation_run' in backend and run is not None and not _jv_is_code(run):
+                bad('backend.validation_run', 'a code or null')
+            run_sha = backend.get('validation_sha256')
+            if 'validation_sha256' in backend and run_sha is not None and not _jv_is_hex(run_sha):
+                bad('backend.validation_sha256', 'hex or null')
+    # Cross-field rules that read only the form.
+    stage, snapshot = get('stage'), get('snapshot')
+    if (isinstance(stage, str) and stage in JUDGMENT_VERDICT_STAGES and isinstance(snapshot, str)
+            and snapshot in JUDGMENT_VERDICT_SNAPSHOTS
+            and snapshot not in JUDGMENT_VERDICT_STAGE_SNAPSHOTS[stage]):
+        problems.append(
+            f"the snapshot `{snapshot}` is not one the `{stage}` stage judges "
+            f"({', '.join(JUDGMENT_VERDICT_STAGE_SNAPSHOTS[stage])})"
+        )
+    raw = get('input_form') == 'raw'
+    answered = isinstance(backend, dict)
+    if 'pool_verdict_id' in uploaded:
+        link, pooled = get('pool_verdict_id'), get('execution') == 'pool'
+        gateway_settled = ((get('verdict') == 'INDETERMINATE' and get('source') != 'judge'
+                            and get('reason_code') in JUDGMENT_VERDICT_POOL_UNANSWERED_REASON_CODES)
+                           or (get('verdict') == 'FLAG' and get('source') == 'floor'
+                               and get('reason_code') == 'floor_match'))
+        if pooled and link is None and not gateway_settled:
+            problems.append("`pool_verdict_id` is null on a judgment the pool answered")
+        elif pooled and link is not None and not (isinstance(link, str) and JUDGMENT_VERDICT_POOL_VERDICT_ID.match(link)):
+            problems.append("`pool_verdict_id` is not jv_ and 32 lowercase hex digits on a judgment that ran in the pool")
+        elif not pooled and link is not None:
+            problems.append("`pool_verdict_id` is not null on a judgment that did not run in the pool")
+    if ('raw_input_grant' in uploaded) != (raw and answered):
+        problems.append(
+            "`raw_input_grant` is not present exactly when the input form is raw and a backend answered"
+        )
+    if get('reason_code') == JUDGMENT_VERDICT_RAW_INPUT_NOT_PERMITTED and not (
+            raw and backend is None and get('verdict') == 'INDETERMINATE' and get('source') == 'none'):
+        problems.append(
+            f"a {JUDGMENT_VERDICT_RAW_INPUT_NOT_PERMITTED} verdict is not a raw-input INDETERMINATE "
+            f"with no source and no backend"
+        )
+    return problems
+
+
+def judgment_verdict_local_v2_problems(local):
+    """The problems of a stored `judgment_verdict_local.v2` local part on its
+    own: its closed key set and each value's type; `spans[]` and
+    `floor_triggers[]` entries are closed objects (a floor trigger names the
+    rule, the term and the language, never text)."""
+    problems = []
+
+    def bad(path, what):
+        problems.append(f"`{path}` is not {what}")
+
+    problems.extend(f"the local part {p}" for p in _jv_closed_keys(local, JUDGMENT_VERDICT_LOCAL_FIELDS_V2))
+    if 'schema' in local and local['schema'] != JUDGMENT_VERDICT_LOCAL_SCHEMA_V2:
+        bad('schema', JUDGMENT_VERDICT_LOCAL_SCHEMA_V2)
+    if 'reason_text' in local and local['reason_text'] is not None and not isinstance(local['reason_text'], str):
+        bad('reason_text', 'a string or null')
+    for name in ('reason_text_withheld', 'floor_unavailable'):
+        if name in local and not isinstance(local[name], bool):
+            bad(name, 'a boolean')
+    digest = local.get('judged_input_sha256')
+    if 'judged_input_sha256' in local and digest is not None and not _jv_is_sha256(digest):
+        bad('judged_input_sha256', '64 lowercase hex or null')
+    for name, fields, types in (
+            ('spans', JUDGMENT_VERDICT_LOCAL_SPAN_FIELDS, {'input': 'str', 'start': 'u32', 'end': 'u32'}),
+            ('floor_triggers', JUDGMENT_VERDICT_LOCAL_FLOOR_TRIGGER_FIELDS,
+             {'rule_id': 'str', 'term_id': 'str', 'language': 'str'})):
+        if name not in local:
+            continue
+        entries = local[name]
+        if not isinstance(entries, list):
+            bad(name, 'a list')
+            continue
+        for i, entry in enumerate(entries):
+            at = f'{name}[{i}]'
+            if not isinstance(entry, dict):
+                bad(at, 'an object')
+                continue
+            problems.extend(f"`{at}` {p}" for p in _jv_closed_keys(entry, fields))
+            for key, kind in types.items():
+                if key not in entry:
+                    continue
+                if kind == 'str' and not isinstance(entry[key], str):
+                    bad(f'{at}.{key}', 'a string')
+                elif kind == 'u32' and not _jv_is_uint(entry[key], 32):
+                    bad(f'{at}.{key}', 'an unsigned 32-bit integer')
+    return problems
+
 
 def compute_event_hash_v1_21_judgment_verdict(
     sequence_number, timestamp_utc, event_id, request_id,
@@ -1417,13 +1738,26 @@ def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=N
     judged record outside the pack's window is not a problem: the receipt's
     hash still binds the three link values.
 
+    A v1.22 record is checked the same way and more: its
+    stored uploaded form is a closed `judgment_verdict.v2` object
+    (`judgment_verdict_v2_form_problems`), its stored local part a closed
+    `judgment_verdict_local.v2` object whose `judged_input_sha256` is null
+    exactly when no backend answered, its `snapshot` is one its `stage`
+    judges, and when `pack_records` holds the judged record with its event
+    kind, the form's `snapshot` fits that kind (`tool_arguments` exactly for
+    an mcp.tool_call, the other three for an llm_request) and a `tool_call`
+    stage judges an mcp.tool_call. A v1.21 record checks as before; one whose stored form names
+    `judgment_verdict.v2` is a relabelled v1.22 record and fails.
+
     Returns a list of problems; empty means the record checks out. Records on
     any other schema version return no problems."""
-    if (event.get('schema_version') or 'v1') != 'v1.21':
+    version = event.get('schema_version') or 'v1'
+    if version not in JUDGMENT_VERDICT_SCHEMA_VERSIONS:
         return []
+    v2 = version == JUDGMENT_VERDICT_V2_SCHEMA_VERSION
     fields = event.get('judgment_verdict')
     if not isinstance(fields, dict):
-        return ['v1.21 record carries no judgment_verdict payload']
+        return [f'{version} record carries no judgment_verdict payload']
     problems = []
     vid = fields.get('verdict_id', '?')
     uploaded_json = fields.get('uploaded_json')
@@ -1472,6 +1806,17 @@ def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=N
                 f"verdict receipt {vid}: the stored uploaded form names a pack version on a "
                 f"{JUDGMENT_VERDICT_NO_PACK_VERSION_REASON} verdict, or none on another verdict"
             )
+        if v2:
+            for problem in judgment_verdict_v2_form_problems(uploaded):
+                problems.append(
+                    f"verdict receipt {vid}: the stored uploaded form is not a "
+                    f"{JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2} form: {problem}"
+                )
+        elif uploaded.get('schema') == JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2:
+            problems.append(
+                f"verdict receipt {vid}: a v1.21 record stores a {JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2} "
+                f"form, which only a v1.22 record carries"
+            )
     if 'raw_response' not in stripped:
         stored = event.get('raw_response')
         got = sha256_jcs(stored)
@@ -1480,7 +1825,20 @@ def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=N
                 f"verdict receipt {vid}: the stored local part hashes to {got}, "
                 f"not the sealed local_sha256 {fields.get('local_sha256')}"
             )
-        if isinstance(stored, dict):
+        if isinstance(stored, dict) and v2:
+            for problem in judgment_verdict_local_v2_problems(stored):
+                problems.append(
+                    f"verdict receipt {vid}: the stored local part is not a "
+                    f"{JUDGMENT_VERDICT_LOCAL_SCHEMA_V2} object: {problem}"
+                )
+            # The judged bytes have a digest exactly when a backend was sent them.
+            if isinstance(uploaded, dict) and 'backend' in uploaded and 'judged_input_sha256' in stored:
+                if (stored['judged_input_sha256'] is None) != (uploaded['backend'] is None):
+                    problems.append(
+                        f"verdict receipt {vid}: the stored local part's judged_input_sha256 is not "
+                        f"null exactly when the uploaded form names no backend"
+                    )
+        elif isinstance(stored, dict):
             if (stored.get('schema') != JUDGMENT_VERDICT_LOCAL_SCHEMA
                     or sorted(stored.keys()) != sorted(JUDGMENT_VERDICT_LOCAL_FIELDS)):
                 problems.append(
@@ -1497,12 +1855,33 @@ def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=N
                 f"which is not before its own sequence {seq}"
             )
         elif pack_records is not None and judged_seq in pack_records:
-            judged_id, judged_hash = pack_records[judged_seq]
+            held = pack_records[judged_seq]
+            judged_id, judged_hash = held[0], held[1]
+            # The judged record's event kind (wire name); None for a
+            # hash-only stub, whose kind the pack does not hold.
+            judged_kind = held[2] if len(held) > 2 else None
             id_ok = judged_id == STUB_EVENT_ID or judged_id == fields.get('judged_event_id')
             if not id_ok or judged_hash != fields.get('judged_event_hash'):
                 problems.append(
                     f"verdict receipt {vid}: does not link to the pack's record at sequence "
                     f"{judged_seq}: that record has another event id or event hash"
+                )
+            snapshot = uploaded.get('snapshot') if v2 and isinstance(uploaded, dict) else None
+            if judged_kind is not None and snapshot in JUDGMENT_VERDICT_SNAPSHOTS:
+                want = (EVENT_KIND_MCP_TOOL_CALL if snapshot == JUDGMENT_VERDICT_TOOL_SNAPSHOT
+                        else EVENT_KIND_LLM_REQUEST)
+                if judged_kind != want:
+                    problems.append(
+                        f"verdict receipt {vid}: its snapshot `{snapshot}` judges a record of kind {want}, "
+                        f"but the pack's record at sequence {judged_seq} has kind {judged_kind}"
+                    )
+            stage = uploaded.get('stage') if v2 and isinstance(uploaded, dict) else None
+            if (judged_kind is not None and stage == JUDGMENT_VERDICT_TOOL_STAGE
+                    and judged_kind != EVENT_KIND_MCP_TOOL_CALL):
+                problems.append(
+                    f"verdict receipt {vid}: its stage `{stage}` judges a record of kind "
+                    f"{EVENT_KIND_MCP_TOOL_CALL}, but the pack's record at sequence {judged_seq} "
+                    f"has kind {judged_kind}"
                 )
     return problems
 
@@ -1555,7 +1934,7 @@ def receipt_evidence_findings(receipt_seq, receipt, pack_chain, pack_records, wi
     an examiner can fetch the cited chain.
 
     `pack_records` maps each sequence read in this pack to its record's
-    (event_id, event_hash); `window_seqs` is every sequence the manifest lists,
+    (event_id, event_hash, ...); `window_seqs` is every sequence the manifest lists,
     read or not. Returns (failures, warnings), lists of strings."""
     failures, warnings = [], []
     rid = receipt.get('receipt_id', '?')
@@ -1590,7 +1969,7 @@ def receipt_evidence_findings(receipt_seq, receipt, pack_chain, pack_records, wi
                 f"the cited record is not in this pack; verify that chain to check it."
             )
             continue
-        held_id, held_hash = held
+        held_id, held_hash = held[0], held[1]
         # A hash-only stub: its hash is checked, its event_id is
         # not in the pack.
         if held_id is STUB_EVENT_ID:
@@ -3472,14 +3851,14 @@ def compute_event_hash_dispatch(
     ):
         raise ValueError("evaluation_trace has no outcomes_sha256_jcs, so the record has no defined preimage.")
     # Fail closed. The verdict receipt payload is hashed only by the v1.21
-    # judgment.verdict hasher; anywhere else it would sit on the record
-    # unhashed.
+    # judgment.verdict hasher (the v1.21 and v1.22 buckets); anywhere else it
+    # would sit on the record unhashed.
     if judgment_verdict is not None and (
-        schema_version != 'v1.21' or event_kind != EVENT_KIND_JUDGMENT_VERDICT
+        schema_version not in JUDGMENT_VERDICT_SCHEMA_VERSIONS or event_kind != EVENT_KIND_JUDGMENT_VERDICT
     ):
         raise ValueError(
             f"judgment_verdict payload present on a {schema_version!r} "
-            f"{event_kind!r} event — it is hashed only in the v1.21 judgment.verdict bucket."
+            f"{event_kind!r} event — it is hashed only in the v1.21 and v1.22 judgment.verdict buckets."
         )
     # Fail closed. The compliance-record payload is hashed only by the v1.20
     # compliance.record hasher; anywhere else it would sit on the record
@@ -3765,19 +4144,22 @@ def compute_event_hash_dispatch(
             cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
             coverage_key_inventory,
         )
-    if schema_version == 'v1.21':
+    if schema_version in JUDGMENT_VERDICT_SCHEMA_VERSIONS:
         # v1.21 introduces exactly one new event class: judgment.verdict.
         # Same kind-only gate posture as v1.8, v1.13, v1.15 and v1.20.
+        # v1.22 is the same record and the same feed; only
+        # the stamp differs, and it obliges the closed checks of the stored
+        # forms in check_judgment_verdict.
         if event_kind != EVENT_KIND_JUDGMENT_VERDICT:
             raise ValueError(
-                f"schema_version v1.21 is defined only for "
+                f"schema_version {schema_version} is defined only for "
                 f"judgment.verdict events; got event_kind {event_kind!r}"
             )
         if not isinstance(judgment_verdict, dict):
             raise ValueError("JudgmentVerdict event missing judgment_verdict payload")
         if any(p is not None for p in (auth_session, admin_action, mcp_event, coverage)):
             raise ValueError(
-                "a v1.21 judgment.verdict event carries another kind's payload; "
+                f"a {schema_version} judgment.verdict event carries another kind's payload; "
                 "it would ride the record unhashed."
             )
         return compute_event_hash_v1_21_judgment_verdict(
@@ -4822,7 +5204,7 @@ def run_self_test():
              judgment_verdict=dict(v121_payload, verdict=None)),
         dict(version='v1.21', event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=v121_payload,
              admin_action={'action_type': 'x', 'actor': 'y', 'description': 'z', 'metadata_json': '{}'}),
-        dict(version='v1.22', event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=v121_payload),
+        dict(version='v1.23', event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=v121_payload),
     )
     for refusal in refusals:
         kwargs = dict(refusal)
@@ -4840,6 +5222,303 @@ def run_self_test():
     else:
         print(f'SELF-TEST assertion 39c FAIL: only {rejected} of {len(refusals)} refused, '
               f'adjacent strings distinct {traded}', file=sys.stderr)
+        ok = False
+
+    # Assertion 39d — v1.22 judgment.verdict fixture. The
+    # feed is the v1.21 one, so the record hashes through the same function
+    # and the dispatcher routes the v1.22 stamp to it; only the two digests
+    # of the stored forms differ from the v1.21 fixture.
+    v122_uploaded_json = jcs_dumps(_V1_22_JUDGMENT_VERDICT_FIXTURE_UPLOADED)
+    v122_payload = dict(
+        _V1_21_JUDGMENT_VERDICT_FIXTURE_PAYLOAD,
+        uploaded_sha256=judgment_verdict_uploaded_sha256(v122_uploaded_json),
+        local_sha256=sha256_jcs(_V1_22_JUDGMENT_VERDICT_FIXTURE_LOCAL),
+        uploaded_json=v122_uploaded_json,
+    )
+    got_v122 = compute_event_hash_v1_21_judgment_verdict(receipt=v122_payload, **v121_args)
+    dispatched_v122 = compute_event_hash_dispatch(
+        'v1.22', *(v121_args[k] for k in (
+            'sequence_number', 'timestamp_utc', 'event_id', 'request_id', 'model_requested', 'action',
+            'input_tokens', 'output_tokens', 'total_tokens', 'cache_creation_input_tokens',
+            'cache_read_input_tokens', 'cached_input_tokens', 'reasoning_tokens', 'estimated_cost_usd',
+            'previous_hash')),
+        event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=v122_payload)
+    if (got_v122 == V1_22_JUDGMENT_VERDICT_FIXTURE_HASH and dispatched_v122 == got_v122
+            and v122_payload['uploaded_sha256'] == V1_22_FIXTURE_UPLOADED_SHA256
+            and v122_payload['local_sha256'] == V1_22_FIXTURE_LOCAL_SHA256
+            and set(_V1_22_JUDGMENT_VERDICT_FIXTURE_UPLOADED) == set(JUDGMENT_VERDICT_V2_FIELDS)
+            and set(_V1_22_JUDGMENT_VERDICT_FIXTURE_LOCAL) == set(JUDGMENT_VERDICT_LOCAL_FIELDS_V2)
+            and len(JUDGMENT_VERDICT_REASON_CODES) == 17
+            and JUDGMENT_VERDICT_REASON_CODES[-1] == JUDGMENT_VERDICT_RAW_INPUT_NOT_PERMITTED):
+        print('SELF-TEST assertion 39d PASS: v1.22 judgment.verdict fixture hash and stored digests match, '
+              'and the v1.22 stamp hashes through the v1.21 feed')
+    else:
+        print('SELF-TEST assertion 39d FAIL: v1.22 judgment.verdict fixture drift', file=sys.stderr)
+        print(f'  expected: {V1_22_JUDGMENT_VERDICT_FIXTURE_HASH}', file=sys.stderr)
+        print(f'  got:      {got_v122} (dispatched {dispatched_v122})', file=sys.stderr)
+        print(f"  uploaded_sha256 {v122_payload['uploaded_sha256']}, local_sha256 {v122_payload['local_sha256']}",
+              file=sys.stderr)
+        ok = False
+
+    # Assertion 39e — a full v1.22 record through recompute_event_hash. The
+    # intact record checks out; every closed-key, enum, type, nullability and
+    # cross-field violation of the stored uploaded form and local part is
+    # caught (each edit re-digests the forms and re-mirrors the sealed facts,
+    # so only the rule under test is broken); the snapshot is checked against
+    # the judged record's kind; the v1.21 fixture still checks out.
+    v122_event = dict(v121_event, schema_version='v1.22', judgment_verdict=v122_payload,
+                      raw_response=_V1_22_JUDGMENT_VERDICT_FIXTURE_LOCAL)
+    llm_pack = {judged_seq: (judged_id, 'a' * 64, EVENT_KIND_LLM_REQUEST)}
+    tool_pack = {judged_seq: (judged_id, 'a' * 64, EVENT_KIND_MCP_TOOL_CALL)}
+
+    def v122_with(form=None, drop=(), local=None, local_drop=(), stamp='v1.22', **mutate):
+        """The v1.22 fixture with its uploaded form and local part changed,
+        both re-digested and the mirrored sealed facts taken from the form.
+        `mutate` maps a nested path (`pack__sha256`, `backend__id`,
+        `questions__0__id`) to a new value."""
+        uploaded = json.loads(v122_uploaded_json)
+        uploaded.update(form or {})
+        for key in drop:
+            uploaded.pop(key, None)
+        for path, value in mutate.items():
+            *parents, leaf = path.split('__')
+            node = uploaded
+            for part in parents:
+                node = node[int(part)] if isinstance(node, list) else node[part]
+            if value is ...:
+                node.pop(leaf)
+            else:
+                node[leaf] = value
+        local_part = json.loads(json.dumps(_V1_22_JUDGMENT_VERDICT_FIXTURE_LOCAL))
+        local_part.update(local or {})
+        for key in local_drop:
+            local_part.pop(key, None)
+        text = jcs_dumps(uploaded)
+        payload = dict(v122_payload, uploaded_json=text, uploaded_sha256=judgment_verdict_uploaded_sha256(text),
+                       local_sha256=sha256_jcs(local_part))
+        for name, path in JUDGMENT_VERDICT_MIRRORED_FIELDS:
+            node = uploaded
+            for part in path:
+                node = node.get(part) if isinstance(node, dict) else None
+            if name in ('verdict', 'source', 'reason_code', 'enforceable') and node is not None:
+                payload[name] = node
+        return dict(v122_event, schema_version=stamp, judgment_verdict=payload, raw_response=local_part)
+
+    # A raw judgment refused for want of a live covering grant, as sealed.
+    not_permitted = dict(form=dict(verdict='INDETERMINATE', source='none',
+                                   reason_code=JUDGMENT_VERDICT_RAW_INPUT_NOT_PERMITTED, questions=[],
+                                   backend=None, enforceable=True, action_taken='allow'),
+                         drop=('raw_input_grant',), local=dict(judged_input_sha256=None, reason_text=None,
+                                                                spans=[], floor_triggers=[]))
+    v122_intact = check_judgment_verdict(v122_event, frozenset(), 7, llm_pack)
+    v122_edits = {
+        # Closed keys.
+        'an unknown key in the form': v122_with(form=dict(note='x')),
+        'a form without input_form': v122_with(drop=('input_form',)),
+        'a form without snapshot': v122_with(drop=('snapshot',)),
+        'a form without stage': v122_with(drop=('stage',)),
+        'a form without rule_sha256': v122_with(drop=('rule_sha256',)),
+        'a null raw_input_grant instead of an absent one': v122_with(form=dict(raw_input_grant=None)),
+        'an unknown key in pack': v122_with(pack__note='x'),
+        'an unknown key in a question': v122_with(questions__0__note='x'),
+        'a question without p_pass': v122_with(questions__0__p_pass=...),
+        'an unknown key in backend': v122_with(backend__note='x'),
+        'a backend without validation_run': v122_with(backend__validation_run=...),
+        # Enums, including the 17 reason codes.
+        'an input form outside the enum': v122_with(form=dict(input_form='mixed')),
+        'a snapshot outside the enum': v122_with(form=dict(snapshot='conversation')),
+        'a stage outside the enum': v122_with(form=dict(stage='during_call')),
+        'a null stage': v122_with(form=dict(stage=None)),
+        'a reason code outside the 17': v122_with(form=dict(reason_code='raw_input_refused')),
+        'a verdict outside the enum': v122_with(form=dict(verdict='MAYBE')),
+        'a source outside the enum': v122_with(form=dict(source='model')),
+        'an execution outside the enum': v122_with(form=dict(execution='remote')),
+        'a timing outside the enum': v122_with(form=dict(timing='during_delivery')),
+        'a rollout stage outside the enum': v122_with(form=dict(rollout_stage='canary')),
+        'an action outside the enum': v122_with(form=dict(action_taken='quarantine')),
+        'a question outcome outside the enum': v122_with(questions__0__outcome='UNSURE'),
+        'a distribution outside the enum': v122_with(backend__distribution='sampled'),
+        # Types and formats.
+        'an uppercase rule_sha256': v122_with(form=dict(
+            rule_sha256=_V1_22_JUDGMENT_VERDICT_FIXTURE_UPLOADED['rule_sha256'].upper())),
+        'a short rule_sha256': v122_with(form=dict(rule_sha256='ab' * 16)),
+        'a judgment without a version': v122_with(form=dict(judgment='clinical-boundary')),
+        'a judgment version with a leading zero': v122_with(form=dict(judgment='clinical-boundary@03')),
+        'a verdict id that is not a code': v122_with(form=dict(verdict_id='jv 0123')),
+        'a grant id that is not a code': v122_with(form=dict(raw_input_grant='grant with spaces')),
+        'a latency past u32': v122_with(form=dict(latency_ms=2 ** 32)),
+        'a latency that is a boolean': v122_with(form=dict(latency_ms=True)),
+        'an evaluated_at that is not RFC 3339 UTC': v122_with(form=dict(evaluated_at='2026-12-01T10:00:02+01:00')),
+        'an evaluated_at that is not a date': v122_with(form=dict(evaluated_at='2026-02-30T10:00:02Z')),
+        'a pack sha256 that is not hex': v122_with(pack__sha256='not-hex'),
+        'a question p that is a string': v122_with(questions__0__p='0.93'),
+        'a clause digest that is not hex': v122_with(questions__0__clause_sha256='zz'),
+        'a backend id that is not a code': v122_with(backend__id='fixture judge'),
+        'a validation digest that is not hex': v122_with(backend__validation_sha256='g' * 64),
+        'questions that are not a list': v122_with(form=dict(questions={})),
+        'a backend that is not an object': v122_with(form=dict(backend='fixture:judge@1')),
+        # Nullability.
+        'a null pack sha256': v122_with(pack__sha256=None),
+        'a null question id': v122_with(questions__0__id=None),
+        'a null backend validated': v122_with(backend__validated=None),
+        'a null prompt digest': v122_with(backend__prompt_sha256=None),
+        'a null input form': v122_with(form=dict(input_form=None)),
+        'a null latency': v122_with(form=dict(latency_ms=None)),
+        'no pack version on a clause_violated verdict': v122_with(pack__version=None),
+        # Cross-field rules.
+        'a raw judgment that reached a backend without its grant': v122_with(drop=('raw_input_grant',)),
+        'a grant on a redacted judgment': v122_with(form=dict(input_form='redacted')),
+        'a grant on a raw judgment no backend answered': v122_with(
+            form=dict(verdict='INDETERMINATE', source='none', reason_code='no_backend_configured',
+                      questions=[], backend=None), local=dict(judged_input_sha256=None)),
+        'raw_input_not_permitted with a backend': v122_with(
+            form=dict(verdict='INDETERMINATE', source='none',
+                      reason_code=JUDGMENT_VERDICT_RAW_INPUT_NOT_PERMITTED)),
+        'raw_input_not_permitted on redacted input': v122_with(**dict(not_permitted, form=dict(
+            not_permitted['form'], input_form='redacted'))),
+        'raw_input_not_permitted that is not INDETERMINATE': v122_with(**dict(not_permitted, form=dict(
+            not_permitted['form'], verdict='PASS'))),
+        'raw_input_not_permitted from the judge': v122_with(**dict(not_permitted, form=dict(
+            not_permitted['form'], source='judge'))),
+        'a judged-input digest with no backend': v122_with(**dict(not_permitted, local=dict(
+            not_permitted['local'], judged_input_sha256='c' * 64))),
+        'no judged-input digest with a backend': v122_with(local=dict(judged_input_sha256=None)),
+        # The local part.
+        'an unknown key in the local part': v122_with(local=dict(note='x')),
+        'a local part without floor_triggers': v122_with(local_drop=('floor_triggers',)),
+        'a local part without judged_input_sha256': v122_with(local_drop=('judged_input_sha256',)),
+        'a v1 local part schema': v122_with(local=dict(schema=JUDGMENT_VERDICT_LOCAL_SCHEMA)),
+        'a judged-input digest that is not hex': v122_with(local=dict(judged_input_sha256='C' * 64)),
+        'a floor trigger carrying text': v122_with(local=dict(floor_triggers=[
+            dict(rule_id='floor.dose-change', term_id='dose-change-3', language='en', text='two tablets')])),
+        'a floor trigger without a language': v122_with(local=dict(floor_triggers=[
+            dict(rule_id='floor.dose-change', term_id='dose-change-3')])),
+        'a floor trigger term that is a number': v122_with(local=dict(floor_triggers=[
+            dict(rule_id='floor.dose-change', term_id=3, language='en')])),
+        'floor triggers that are not a list': v122_with(local=dict(floor_triggers={})),
+        'a span with another key': v122_with(local=dict(spans=[dict(input='reply', start=1, end=2, text='x')])),
+        'a span offset that is negative': v122_with(local=dict(spans=[dict(input='reply', start=-1, end=2)])),
+        'a withheld flag that is not a boolean': v122_with(local=dict(reason_text_withheld='no')),
+        'a reason text that is not a string': v122_with(local=dict(reason_text=7)),
+        # MEI-3939: the link to the pool's record of the same verdict.
+        'a form without pool_verdict_id': v122_with(drop=('pool_verdict_id',)),
+        'a pool judgment with a null link': v122_with(form=dict(execution='pool', pool_verdict_id=None)),
+        'a pool PASS with a null link': v122_with(form=dict(
+            execution='pool', pool_verdict_id=None, verdict='PASS', reason_code='ok')),
+        'a pool INDETERMINATE from the judge with a null link': v122_with(form=dict(
+            execution='pool', pool_verdict_id=None, verdict='INDETERMINATE', source='judge',
+            reason_code='backend_timeout')),
+        'a pool judgment with a malformed link': v122_with(form=dict(execution='pool', pool_verdict_id='jv_0123')),
+        'a pool judgment with an uppercase link': v122_with(form=dict(
+            execution='pool', pool_verdict_id='jv_0123456789ABCDEF0123456789abcdef')),
+        'a pool judgment with a link that is not a string': v122_with(form=dict(execution='pool', pool_verdict_id=7)),
+        'a gateway judgment that names a link': v122_with(form=dict(
+            pool_verdict_id='jv_0123456789abcdef0123456789abcdef')),
+        # The stamp and the form's schema name.
+        'a v1 form schema on a v1.22 record': v122_with(form=dict(schema='judgment_verdict.v1')),
+        'a v1.22 record relabelled v1.21': v122_with(stamp='v1.21'),
+    }
+    v122_caught = {name: bool(check_judgment_verdict(e, frozenset(), 7, llm_pack)) for name, e in v122_edits.items()}
+    # Every stage paired with a snapshot it does not judge, checked with the
+    # judged record outside the pack window so only the stage rule applies.
+    stage_caught = {
+        f'snapshot {snapshot} at stage {stage}': bool(check_judgment_verdict(
+            v122_with(form=dict(stage=stage, snapshot=snapshot)), frozenset(), 7, {}))
+        for stage in JUDGMENT_VERDICT_STAGES for snapshot in JUDGMENT_VERDICT_SNAPSHOTS
+        if snapshot not in JUDGMENT_VERDICT_STAGE_SNAPSHOTS[stage]
+    }
+    stage_accepted = {
+        f'snapshot {snapshot} at stage {stage}': check_judgment_verdict(
+            v122_with(form=dict(stage=stage, snapshot=snapshot)), frozenset(), 7, {})
+        for stage in JUDGMENT_VERDICT_STAGES for snapshot in JUDGMENT_VERDICT_STAGE_SNAPSHOTS[stage]
+    }
+    tool_form = dict(stage=JUDGMENT_VERDICT_TOOL_STAGE, snapshot=JUDGMENT_VERDICT_TOOL_SNAPSHOT)
+    tool_stage_on_llm = check_judgment_verdict(v122_with(form=tool_form), frozenset(), 7, llm_pack)
+    kind_caught = {
+        'a reply snapshot on an mcp.tool_call record': check_judgment_verdict(v122_event, frozenset(), 7, tool_pack),
+        'a tool snapshot on an llm_request record': tool_stage_on_llm,
+        'a tool_call stage on an llm_request record': [
+            p for p in tool_stage_on_llm if 'its stage `tool_call`' in p],
+    }
+    v122_accepted = {
+        'a redacted judgment with no grant': check_judgment_verdict(
+            v122_with(form=dict(input_form='redacted'), drop=('raw_input_grant',)), frozenset(), 7, llm_pack),
+        'a raw judgment refused for want of a grant': check_judgment_verdict(
+            v122_with(**not_permitted), frozenset(), 7, llm_pack),
+        'a pool judgment the gateway settled on a timeout, with no link': check_judgment_verdict(
+            v122_with(form=dict(execution='pool', pool_verdict_id=None, verdict='INDETERMINATE', source='none',
+                                reason_code='backend_timeout', input_form='redacted', questions=[], backend=None),
+                      drop=('raw_input_grant',), local=dict(judged_input_sha256=None)),
+            frozenset(), 7, llm_pack),
+        'a pool judgment with its link': check_judgment_verdict(
+            v122_with(form=dict(execution='pool', pool_verdict_id='jv_0123456789abcdef0123456789abcdef')),
+            frozenset(), 7, llm_pack),
+        'a partial reply snapshot': check_judgment_verdict(
+            v122_with(form=dict(snapshot='candidate_reply_partial')), frozenset(), 7, llm_pack),
+        'a forwarded request snapshot': check_judgment_verdict(
+            v122_with(form=dict(stage='pre_request', snapshot='forwarded_request')), frozenset(), 7, llm_pack),
+        'a tool snapshot on an mcp.tool_call record': check_judgment_verdict(
+            v122_with(form=tool_form), frozenset(), 7, tool_pack),
+        'a pack_unavailable verdict with no pack version': check_judgment_verdict(
+            v122_with(form=dict(verdict='INDETERMINATE', source='none', questions=[], backend=None,
+                                input_form='redacted', reason_code=JUDGMENT_VERDICT_NO_PACK_VERSION_REASON),
+                      drop=('raw_input_grant',), local=dict(judged_input_sha256=None), pack__version=None),
+            frozenset(), 7, llm_pack),
+        'a null distribution and no validation run': check_judgment_verdict(
+            v122_with(backend__distribution=None, backend__validated=False, backend__validation_run=None,
+                      backend__validation_sha256=None), frozenset(), 7, llm_pack),
+        'empty spans and floor triggers': check_judgment_verdict(
+            v122_with(local=dict(spans=[], floor_triggers=[])), frozenset(), 7, llm_pack),
+        'the judged record outside the pack window': check_judgment_verdict(v122_event, frozenset(), 7, {}),
+        'a hash-only stub at the judged sequence': check_judgment_verdict(
+            v122_event, frozenset(), 7, {judged_seq: (STUB_EVENT_ID, 'a' * 64, None)}),
+        'a pack record held without its kind': check_judgment_verdict(v122_event, frozenset(), 7, v121_pack),
+        'a stripped pack without the local part': check_judgment_verdict(
+            dict(v122_event, raw_response=None), frozenset({'raw_response'}), 7, llm_pack),
+        'the v1.21 fixture': check_judgment_verdict(v121_event, frozenset(), 7, llm_pack),
+        'the v1.21 fixture judging an mcp.tool_call record': check_judgment_verdict(
+            v121_event, frozenset(), 7, tool_pack),
+    }
+    if (recompute_event_hash(v122_event, 7, 'b' * 64) == got_v122 and not v122_intact
+            and all(v122_caught.values()) and all(kind_caught.values()) and not any(v122_accepted.values())
+            and all(stage_caught.values()) and not any(stage_accepted.values())
+            and len(v122_caught) == 80 and len(stage_caught) == 8 and len(stage_accepted) == 4):
+        print(f'SELF-TEST assertion 39e PASS: v1.22 judgment.verdict recomputes, its closed uploaded form and '
+              f'local part are checked ({len(v122_caught)} violations and {len(stage_caught)} stage/snapshot '
+              f'mismatches caught), its snapshot and stage are checked against the judged record, and the v1.21 '
+              f'fixture still checks out')
+    else:
+        print(f'SELF-TEST assertion 39e FAIL: intact {v122_intact}, '
+              f'not caught {[n for n, c in v122_caught.items() if not c]}, '
+              f'kind not caught {[n for n, c in kind_caught.items() if not c]}, '
+              f'stage not caught {[n for n, c in stage_caught.items() if not c]}, '
+              f'stage refused {[(n, p) for n, p in stage_accepted.items() if p]}, '
+              f'refused {[(n, p) for n, p in v122_accepted.items() if p]}, count {len(v122_caught)}',
+              file=sys.stderr)
+        ok = False
+
+    # Assertion 39f — the dispatcher's fail-closed guards hold for the v1.22
+    # stamp as for v1.21: another kind, no payload, a malformed payload or
+    # another kind's payload are refused.
+    rejected = 0
+    v122_refusals = (
+        dict(event_kind=EVENT_KIND_LLM_REQUEST, judgment_verdict=v122_payload),
+        dict(event_kind=EVENT_KIND_LLM_REQUEST, judgment_verdict=None),
+        dict(event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=None),
+        dict(event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=dict(v122_payload, enforceable='true')),
+        dict(event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=dict(v122_payload, verdict=None)),
+        dict(event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=v122_payload,
+             admin_action={'action_type': 'x', 'actor': 'y', 'description': 'z', 'metadata_json': '{}'}),
+    )
+    for refusal in v122_refusals:
+        try:
+            compute_event_hash_dispatch('v1.22', *base_args, **refusal)
+        except ValueError:
+            rejected += 1
+    if rejected == len(v122_refusals) and 'judgment-verdicts-v2' in VERIFIER_CAPABILITIES:
+        print('SELF-TEST assertion 39f PASS: misplaced, missing and malformed v1.22 verdict payloads are refused')
+    else:
+        print(f'SELF-TEST assertion 39f FAIL: only {rejected} of {len(v122_refusals)} refused', file=sys.stderr)
         ok = False
 
     # Assertion 28a — v1.15 decision.receipt fixture (direct fn),
@@ -5771,7 +6450,7 @@ def run_self_test():
 # legacy v1 FIXTURE_HASH above stays at ba7a7f3d… (the v1 path is
 # frozen; no encoding change can ever bump it).
 V1_2_LLM_REQUEST_FIXTURE_HASH = "5f85e27ee519003176c2acb8dd287a9c9dfdd1ba0cc41ec3c92e1c56c9869456"
-V1_2_AUTH_SESSION_STARTED_FIXTURE_HASH = "1f3d58eaaf32e85fa96105e66a71943de4ce865d64d896ef1f4afde25aeea7af"
+V1_2_AUTH_SESSION_STARTED_FIXTURE_HASH = "108135332a58650a37df2c3f6a55d752a6d444ac73ace1be9a9ffe5f7bb445c5"
 # v1.3 admin.action fixture. Paired with
 # meilynx-audit/tests/mei1048_admin_chain_round_trip.rs::mei1048_v1_3_admin_action_fixture_hash_pinned;
 # neither side may drift independently.
@@ -6012,6 +6691,31 @@ _V1_21_JUDGMENT_VERDICT_FIXTURE_PAYLOAD = dict(
     rule_id='judgment.clinical-boundary', judgment='clinical-boundary@3',
     pack_sha256='16ab3dd0776ecfaa867bc6aa52af0d255670b0baca0abfe02e42671aeabd1eeb',
     verdict='FLAG', source='judge', reason_code='clause_violated', enforceable=True,
+)
+
+V1_22_JUDGMENT_VERDICT_FIXTURE_HASH = "5b1c488a4b40223597e46ad1bff588bc864ab733df134e176af300e0b73330c6"
+V1_22_FIXTURE_UPLOADED_SHA256 = "22f673fd91eadf3461deb844ac52d98d8a66fdda93f7a2a74fee321ad2225780"
+V1_22_FIXTURE_LOCAL_SHA256 = "47ab542948841019e426cd57f534fce75b667d693499c8331a60b184f4ad7ce8"
+# The v1.22 fixture receipt: the v1.21 one judged on raw input under a grant,
+# on the complete candidate reply (post-response stage). Its uploaded form is judgment_verdict.v2,
+# its local part judgment_verdict_local.v2 (with the digest of the judged
+# input block and one trigger-floor id). The hashed fields are the v1.21
+# fixture's; only the two digests differ.
+_V1_22_JUDGMENT_VERDICT_FIXTURE_UPLOADED = dict(
+    _V1_21_JUDGMENT_VERDICT_FIXTURE_UPLOADED,
+    schema="judgment_verdict.v2",
+    rule_sha256="5b2e8f0c3d6a9b1e4f7a0c3d6e9b2f5a8c1d4e7f0a3b6c9d2e5f8a1b4c7d0e3f",
+    stage="post_response",
+    input_form="raw",
+    snapshot="candidate_reply",
+    raw_input_grant="rig_01JFIXTURE0000000000000001",
+    pool_verdict_id=None,
+)
+_V1_22_JUDGMENT_VERDICT_FIXTURE_LOCAL = dict(
+    _V1_21_JUDGMENT_VERDICT_FIXTURE_LOCAL,
+    schema="judgment_verdict_local.v2",
+    judged_input_sha256="c4f1a7e0b3d6c9f2a5e8b1d4c7f0a3e6b9d2c5f8a1e4b7d0c3f6a9e2b5d8c1f4",
+    floor_triggers=[{"rule_id": "floor.dose-change", "term_id": "dose-change-3", "language": "en"}],
 )
 
 V1_15_DECISION_RECEIPT_FIXTURE_HASH = "4e93ecd462a3acd7a0a73e1fe98317a35fe0da3c1876e8389d4b63c668450682"
@@ -6354,7 +7058,7 @@ V1_11_DIGEST_FIXTURE_TOOL_CALLS = "656300fbe1f68f78edee99a3c826fbb4fbdd14793e5b9
 V1_11_DIGEST_FIXTURE_TOOL_CALLS_REDACTED = "29257c956f8d4585d7fbe2d7bafe2d83dd65852ff44e88e2a3327f3b6100174b"
 
 _V1_2_AUTH_FIXTURE_PAYLOAD = dict(
-    user_email="cassio@meilynx.com",
+    user_email="fixture-user@example.com",
     user_id="9382725d-3bc4-4c88-9655-3f743b0e13f9",
     project_id="proj-fixture-001",
     proxy_id="pxy_fixture001",
@@ -7410,7 +8114,8 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             print(line)
 
     # What the decision-receipt checks after the walk read: each
-    # record's (event_id, event_hash) by sequence, and each receipt's payload.
+    # record's (event_id, event_hash, event kind) by sequence, and each
+    # receipt's payload.
     pack_records = {}
     receipts = {}
 
@@ -7447,7 +8152,7 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
                         cannot_evaluate_out.append((seq, problem))
             stub_hash = record.get('event_hash') if isinstance(record.get('event_hash'), str) else ''
             stub_prev = record.get('previous_hash') if isinstance(record.get('previous_hash'), str) else ''
-            pack_records[seq] = (STUB_EVENT_ID, stub_hash)
+            pack_records[seq] = (STUB_EVENT_ID, stub_hash, None)
             next_link = committed_hashes(entry, stub_hash)
             if reason == 'unreadable_record':
                 report(f"FAIL seq={seq}: hash-only stub of a record that does not parse (the chain's own break); "
@@ -7475,7 +8180,12 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
         stored_prev = event.get('previous_hash', '')
         stored_hash = event.get('event_hash', '')
         next_link = committed_hashes(entry, stored_hash)
-        pack_records[seq] = (event.get('event_id'), stored_hash)
+        # The wire kind rides along for the v1.22 snapshot check; an
+        # unknown kind is held as None (not checked).
+        raw_kind = event.get('event_kind')
+        pack_records[seq] = (event.get('event_id'), stored_hash,
+                             SERDE_EVENT_KIND_TO_WIRE.get(raw_kind) if raw_kind is None or isinstance(raw_kind, str)
+                             else None)
         if records_out is not None:
             records_out[seq] = event
         if isinstance(event.get('decision_receipt'), dict):

@@ -27,6 +27,12 @@ The cases:
                            edited after sealing                            exit 1
   judgment-verdicts-relinked
                            a receipt sealed with a link to another record  exit 1
+  judgment-verdicts-v2     a request, a tool call and four v1.22 receipts  exit 0
+                           without --allow-unsigned                        exit 3
+  judgment-verdicts-v2-malformed
+                           four v1.22 receipts sealed breaking its rules   exit 1
+  judgment-verdicts-v2-relabelled
+                           a v1.22 receipt's stamp edited to v1.21         exit 1
 """
 import json
 import subprocess
@@ -37,7 +43,8 @@ HERE = Path(__file__).resolve().parent
 VERIFIER = HERE.parent / "verify-pack.py"
 CASES = HERE / "local-chain"
 EXPECTED_CASES = {"clean", "earlier-pack", "claim-relabelled", "evidence-modes", "evidence-modes-doctored",
-                  "judgment-verdicts", "judgment-verdicts-edited", "judgment-verdicts-relinked"}
+                  "judgment-verdicts", "judgment-verdicts-edited", "judgment-verdicts-relinked",
+                  "judgment-verdicts-v2", "judgment-verdicts-v2-malformed", "judgment-verdicts-v2-relabelled"}
 
 
 def die(msg):
