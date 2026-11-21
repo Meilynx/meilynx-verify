@@ -1,0 +1,17 @@
+{
+  "runs": [
+    {
+      "args": [
+        "--allow-unsigned"
+      ],
+      "contains": [
+        "FAIL seq=1: verdict receipt jv_00000000000000000000000000000001: the stored uploaded form is not a judgment_verdict.v2 form: `raw_input_grant` is not present exactly when the input form is raw and a backend answered",
+        "FAIL seq=2: verdict receipt jv_00000000000000000000000000000002: the stored uploaded form is not a judgment_verdict.v2 form: the form carries the unknown key(s) input_text",
+        "FAIL seq=4: verdict receipt jv_00000000000000000000000000000004: its snapshot `tool_arguments` judges a record of kind mcp.tool_call, but the pack's record at sequence 0 has kind llm_request",
+        "FAIL seq=4: verdict receipt jv_00000000000000000000000000000004: its stage `tool_call` judges a record of kind mcp.tool_call, but the pack's record at sequence 0 has kind llm_request",
+        "FAIL seq=5: verdict receipt jv_00000000000000000000000000000005: the stored local part is not a judgment_verdict_local.v2 object: `floor_triggers[0]` carries the unknown key(s) matched"
+      ],
+      "exit": 1
+    }
+  ]
+}

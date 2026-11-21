@@ -30,6 +30,13 @@ Where the records come from:
   that names no pack version). Each receipt stores its uploaded form, the
   receipt without the judge's reason and spans, and its local part, the
   reason and spans, in the shape the proxy writes them.
+- The v1.22 judgment-verdict cases are a third such chain: a model request,
+  an MCP tool call and four v1.22 verdict receipts whose uploaded form is
+  judgment_verdict.v2 and whose local part is judgment_verdict_local.v2 (a
+  FLAG judged on raw input under a grant, on the complete candidate reply; a
+  PASS judged on the redacted forwarded request; a PASS judged on the tool
+  call's arguments; and a raw_input_not_permitted verdict, which reached no
+  backend).
 
 The cases (each case's expect.json lists its runs):
 
@@ -48,6 +55,17 @@ The cases (each case's expect.json lists its runs):
   judgment-verdicts-relinked
                       a receipt sealed with a link to another record
                       than the one at the sequence it names            exit 1
+  judgment-verdicts-v2
+                      a request, a tool call and four v1.22 receipts   exit 0 / 3
+  judgment-verdicts-v2-malformed
+                      the same chain sealed with four receipts that
+                      break the v1.22 rules (no grant on a raw
+                      judgment, an unknown key in the uploaded form,
+                      a tool snapshot judging a model request, a
+                      floor trigger carrying text)                     exit 1
+  judgment-verdicts-v2-relabelled
+                      the clean v1.22 chain with one receipt's stamp
+                      edited to v1.21 after sealing                    exit 1
 
 Everything is synthetic: fixed timestamps and ids, no real content.
 """
@@ -457,6 +475,198 @@ def verdict_cases(root):
     ]})
 
 
+RULE_SHA256 = "4" * 64
+GRANT_ID = "rig_01JFIXTURE0000000000000001"
+
+
+def verdict_v2_receipt(n, ts, judged, rule_id, judgment, verdict, reason_code, questions, reason_text, spans,
+                       stage, input_form, snapshot, backend=BACKEND, floor_triggers=(), form_edit=None):
+    """One v1.22 judgment.verdict record judging the record `judged`.
+
+    The uploaded form is judgment_verdict.v2: the v1 form plus the rule
+    digest, the stage, the input form, the snapshot and, on a raw judgment
+    a backend answered, the grant that covered the backend. The local part is
+    judgment_verdict_local.v2: the v1 part plus the digest of the judged input
+    block (null when no backend was sent one) and the trigger-floor ids.
+    `form_edit(uploaded, local)` changes the two forms before the receipt is
+    sealed, as a gateway that broke the rules would."""
+    hexid = f"{n:032x}"
+    verdict_id = f"jv_{hexid}"
+    source = "judge" if backend is not None else "none"
+    uploaded = {
+        "schema": vp.JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2, "verdict_id": verdict_id,
+        "judged_event_id": judged["event_id"], "rule_id": rule_id, "rule_sha256": RULE_SHA256,
+        "judgment": judgment, "pack": {"version": 3, "sha256": PACK_SHA256},
+        "verdict": verdict, "source": source, "reason_code": reason_code, "enforceable": True,
+        "questions": questions, "execution": "gateway", "pool_verdict_id": None,
+        "backend": backend,
+        "timing": "after_delivery", "rollout_stage": "shadow", "action_taken": "allow",
+        "stage": stage, "input_form": input_form, "snapshot": snapshot,
+        "latency_ms": 0 if backend is None else 180 + n, "evaluated_at": ts[:19] + "Z",
+    }
+    if input_form == "raw" and backend is not None:
+        uploaded["raw_input_grant"] = GRANT_ID
+    local = {"schema": vp.JUDGMENT_VERDICT_LOCAL_SCHEMA_V2, "reason_text": reason_text,
+             "reason_text_withheld": False, "spans": spans, "floor_unavailable": False,
+             "judged_input_sha256": None if backend is None else f"{n:x}" * 64,
+             "floor_triggers": [dict(t) for t in floor_triggers]}
+    if form_edit is not None:
+        form_edit(uploaded, local)
+    uploaded_json = vp.jcs_dumps(uploaded)
+    uuid = f"{hexid[:8]}-{hexid[8:12]}-{hexid[12:16]}-{hexid[16:20]}-{hexid[20:]}"
+    return {
+        "schema_version": "v1.22", "event_kind": "judgment_verdict", "timestamp_utc": ts,
+        "event_id": uuid, "request_id": uuid, "model_requested": "", "action": "allow",
+        "input_tokens": 0, "output_tokens": 0, "estimated_cost_usd": None,
+        "judgment_verdict": {
+            "verdict_id": verdict_id, "judged_event_id": judged["event_id"],
+            "judged_upload_event_id": judged["event_id"], "judged_event_hash": judged["event_hash"],
+            "judged_sequence_number": judged["sequence_number"], "rule_id": rule_id, "judgment": judgment,
+            "pack_sha256": PACK_SHA256, "verdict": uploaded["verdict"], "source": uploaded["source"],
+            "reason_code": uploaded["reason_code"], "enforceable": True,
+            "uploaded_sha256": vp.judgment_verdict_uploaded_sha256(uploaded_json),
+            "local_sha256": vp.sha256_jcs(local), "uploaded_json": uploaded_json,
+        },
+        "raw_response": local,
+    }
+
+
+def verdict_v2_chain(malformed=False):
+    """A model request (0), a raw-input FLAG on its candidate reply (1), a
+    redacted PASS on its forwarded request (2), an MCP tool call (3), a PASS
+    on the call's arguments (4) and a raw_input_not_permitted verdict on the
+    request's partial reply (5). With `malformed`, receipts 1, 2, 4 and 5 are
+    sealed breaking one v1.22 rule each: 1 names no grant, 2 carries an
+    unknown key, 4 judges the model request with a tool snapshot, 5 holds a
+    floor trigger with text. Each receipt names the stage it ran at: the
+    post-response stage for 1 and 5, pre-request for 2, tool call for 4."""
+    genesis = vp.genesis_hash()
+    records, prev = [], genesis
+
+    def seal(event):
+        nonlocal prev
+        event["sequence_number"] = len(records)
+        event["previous_hash"] = prev
+        event["event_hash"] = vp.recompute_event_hash(event, event["sequence_number"], prev)
+        prev = event["event_hash"]
+        records.append(event)
+        return event
+
+    def question(qid, outcome, p, p_pass):
+        return {"id": qid, "clause_sha256": CLAUSE_SHA256, "outcome": outcome, "p": p, "p_pass": p_pass,
+                "flag_at": 0.8, "pass_at": 0.1}
+
+    def edit(fn):
+        return fn if malformed else None
+
+    def drop_grant(uploaded, local):
+        del uploaded["raw_input_grant"]
+
+    def unknown_key(uploaded, local):
+        uploaded["input_text"] = "Synthetic request."
+
+    def trigger_text(uploaded, local):
+        local["floor_triggers"][0]["matched"] = "synthetic term"
+
+    trigger = {"rule_id": "floor.scope-terms", "term_id": "scope-term-2", "language": "en"}
+    request = seal({
+        "schema_version": "v1.1", "timestamp_utc": "2026-11-04T09:00:00.000000000Z",
+        "event_id": "00000000-0000-4000-8000-0000000f2000",
+        "request_id": "00000000-0000-4000-8000-0000000f2100",
+        "model_requested": "gpt-4.1-mini", "model_executed": "gpt-4.1-mini-2025-04-14",
+        "provider": "openai", "action": "allow", "input_tokens": 12, "output_tokens": 30,
+        "total_tokens": 42, "estimated_cost_usd": 5.4e-05, "policy_version": "0" * 64,
+        "findings": [], "messages": [{"role": "user", "content": "Synthetic request."}],
+        "response_text": "Synthetic response.",
+    })
+    seal(verdict_v2_receipt(
+        1, "2026-11-04T09:00:01.000000000Z", request, "judgment.scope-boundary", "scope-boundary@2", "FLAG",
+        "clause_violated", [question("Q-SCOPE-1-a", "FLAG", 0.93, 0.05)], "Q-SCOPE-1-a: synthetic reason.",
+        [{"input": "reply", "start": 0, "end": 19}], "post_response", "raw", "candidate_reply",
+        floor_triggers=[trigger],
+        form_edit=edit(drop_grant)))
+    seal(verdict_v2_receipt(
+        2, "2026-11-04T09:00:01.500000000Z", request, "judgment.disclosure", "disclosure@1", "PASS", "ok",
+        [question("Q-DISC-1", "PASS", 0.02, 0.97)], "Q-DISC-1: synthetic reason.", [], "pre_request",
+        "redacted", "forwarded_request", form_edit=edit(unknown_key)))
+    tool_call = seal({
+        "schema_version": "v1.4", "event_kind": "mcp_tool_call", "timestamp_utc": "2026-11-04T09:01:00.000000000Z",
+        "event_id": "00000000-0000-4000-8000-0000000f2003",
+        "request_id": "00000000-0000-4000-8000-0000000f2103",
+        "model_requested": "", "action": "allow", "input_tokens": 0, "output_tokens": 0,
+        "estimated_cost_usd": None, "findings": [], "messages": [], "response_text": None,
+        "mcp_event": {
+            "virtual_server": "research", "upstream_slug": "market-data", "method": "tools/call",
+            "tool_name": "market-data__get_positions", "jsonrpc_id": "7", "protocol_version": "2026-07-28",
+            "decision": None, "reason": None,
+            "payload_sha256_jcs": vp.sha256_jcs({"name": "market-data__get_positions",
+                                                 "arguments": {"portfolio": "model"}}),
+            "mcp_bundle_sha256": "a" * 64, "correlated_event_id": None, "error_code": None,
+            "traceparent": "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01",
+        },
+    })
+    seal(verdict_v2_receipt(
+        4, "2026-11-04T09:01:00.500000000Z", request if malformed else tool_call, "judgment.tool-scope",
+        "tool-scope@1", "PASS", "ok", [question("Q-TOOL-1", "PASS", 0.03, 0.96)], "Q-TOOL-1: synthetic reason.",
+        [], "tool_call", "redacted", "tool_arguments"))
+    seal(verdict_v2_receipt(
+        5, "2026-11-04T09:01:02.000000000Z", request, "judgment.scope-boundary", "scope-boundary@2",
+        "INDETERMINATE", vp.JUDGMENT_VERDICT_RAW_INPUT_NOT_PERMITTED, [], None, [], "post_response", "raw",
+        "candidate_reply_partial", backend=None, floor_triggers=[trigger], form_edit=edit(trigger_text)))
+    return genesis, records
+
+
+def verdict_v2_cases(root):
+    genesis, records = verdict_v2_chain()
+    head = records[-1]["sequence_number"]
+    base = unanchored_base(genesis, records, "00000000-0000-4000-8000-0000000f2f00", "2026-11-04T10:00:00Z")
+    receipts = {r["sequence_number"]: r["judgment_verdict"]["verdict_id"]
+                for r in records if r.get("event_kind") == "judgment_verdict"}
+
+    out = root / "judgment-verdicts-v2"
+    write_records(out, records)
+    write_case(out, local_manifest(base, head), {"runs": [
+        {"args": ["--allow-unsigned"], "exit": 0, "contains": [
+            "CLAIM: the whole chain proxy from seq=0 up to its head at seq=5",
+            "AUTHENTICITY NOT ESTABLISHED"],
+         "absent": ["FAIL"]},
+        {"args": [], "exit": 3, "contains": ["AUTHENTICITY NOT ESTABLISHED"], "absent": ["FAIL"]},
+    ]})
+
+    # The same chain sealed by a gateway that broke the v1.22 rules. Every
+    # hash and every stored digest recomputes; the closed checks do not pass.
+    genesis, malformed = verdict_v2_chain(malformed=True)
+    base_m = unanchored_base(genesis, malformed, "00000000-0000-4000-8000-0000000f2f01", "2026-11-04T10:00:00Z")
+    form = "the stored uploaded form is not a judgment_verdict.v2 form"
+    out = root / "judgment-verdicts-v2-malformed"
+    write_records(out, malformed)
+    write_case(out, local_manifest(base_m, head), {"runs": [
+        {"args": ["--allow-unsigned"], "exit": 1, "contains": [
+            f"FAIL seq=1: verdict receipt {receipts[1]}: {form}: `raw_input_grant` is not present exactly "
+            "when the input form is raw and a backend answered",
+            f"FAIL seq=2: verdict receipt {receipts[2]}: {form}: the form carries the unknown key(s) input_text",
+            f"FAIL seq=4: verdict receipt {receipts[4]}: its snapshot `tool_arguments` judges a record of kind "
+            "mcp.tool_call, but the pack's record at sequence 0 has kind llm_request",
+            f"FAIL seq=4: verdict receipt {receipts[4]}: its stage `tool_call` judges a record of kind "
+            "mcp.tool_call, but the pack's record at sequence 0 has kind llm_request",
+            f"FAIL seq=5: verdict receipt {receipts[5]}: the stored local part is not a "
+            "judgment_verdict_local.v2 object: `floor_triggers[0]` carries the unknown key(s) matched"]},
+    ]})
+
+    # The clean chain with the first receipt's stamp edited to v1.21 after
+    # sealing. The stamp is outside the hash, so every hash recomputes; the
+    # stored v2 forms say the record is v1.22.
+    relabelled = [json.loads(json.dumps(r)) for r in records]
+    relabelled[1]["schema_version"] = "v1.21"
+    out = root / "judgment-verdicts-v2-relabelled"
+    write_records(out, relabelled)
+    write_case(out, local_manifest(base, head), {"runs": [
+        {"args": ["--allow-unsigned"], "exit": 1, "contains": [
+            f"FAIL seq=1: verdict receipt {receipts[1]}: a v1.21 record stores a judgment_verdict.v2 form, "
+            "which only a v1.22 record carries"]},
+    ]})
+
+
 def main():
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE / "local-chain"
     if root.exists():
@@ -464,6 +674,7 @@ def main():
     anchored_cases(root)
     mode_cases(root)
     verdict_cases(root)
+    verdict_v2_cases(root)
     return 0
 
 

@@ -5,14 +5,14 @@ enough that a verifier can be written from it without reading Meilynx code.
 `verify-pack.py` in this repository is one such verifier; its `--self-test`
 pins the values below against fixture hashes.
 
-Status: describes chain records with `schema_version` v1 through v1.21, the
+Status: describes chain records with `schema_version` v1 through v1.22, the
 per-record and segment storage layouts, pack manifest `schema_version` 1.0
 through 1.5, the control-plane chain a 1.3 manifest carries, the per-tenant
 pack signature, the local-chain evidence class (§6.5), the manifest's
 coverage claim (§6.7) and list of evidence modes (§6.8), the export copy a
 pack can be checked against (§9), the customer-conditions verdict (§10),
 record signatures (§11) and the gateway evidence key (§12), as read by
-`verify-pack.py` from meilynx-proxy commit `bcbc8eb` (2026-11-19). A chain written before the
+`verify-pack.py` from meilynx-proxy commit `f80356e` (2026-11-20). A chain written before the
 segment rollout is per-record, and its packs carry manifest 1.0 or 1.1.
 
 ## 1. Records
@@ -100,7 +100,7 @@ Every record carries at least these fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.21"`). Absent means `"v1"`. |
+| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.22"`). Absent means `"v1"`. |
 | `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`, `decision_receipt`, `compliance_record`, `judgment_verdict`). Absent means `llm_request`. |
 | `sequence_number` | integer | Position in the chain, starting at 0. |
 | `timestamp_utc` | string | RFC 3339 UTC timestamp, nanosecond precision, `Z` suffix. |
@@ -558,6 +558,93 @@ payload, or a v1.21 record that also carries another kind's payload
 fails verification. A receipt shows that a verdict was recorded and not
 changed since. It does not show that the verdict was right.
 
+**v1.22 `judgment.verdict`**: the v1.21 record and preimage, unchanged (the
+same 30 fields; `schema_version` is not in the preimage). The stamp says the
+receipt also records how the judge was given its input, and obliges the
+checks below on top of every v1.21 check; the v1.21 refusals (another
+kind, no payload, another kind's payload) apply to v1.22 alike. Because the stamp is outside the
+hash, the uploaded form's own `schema` tells the two apart: a v1.21 record
+whose uploaded form is `judgment_verdict.v2` fails verification.
+
+The uploaded form is `judgment_verdict.v2`, a closed object. Any other key,
+or a listed key missing, fails the receipt. Its keys (*code* is a string of
+1 to 128 characters from `A-Za-z0-9_.:/@+-` starting with a letter or
+digit; *hex* is 1 to 128 hex digits):
+
+| Key | Value |
+|---|---|
+| `schema` | `"judgment_verdict.v2"` |
+| `verdict_id`, `judged_event_id`, `rule_id` | code |
+| `rule_sha256` | 64 lowercase hex: the SHA-256 of the rule as the gateway received it, in the canonical JSON of its governance bundle |
+| `judgment` | `<id>@<version>`, a code; the version an unsigned 32-bit integer with no leading zero |
+| `pack` | `{ "version": unsigned integer or null, "sha256": hex }`, closed |
+| `verdict` | `PASS`, `FLAG` or `INDETERMINATE` |
+| `source` | `judge`, `floor` or `none` |
+| `reason_code` | one of `ok`, `clause_violated`, `floor_match`, `abstained`, `input_missing`, `budget_exceeded`, `backend_timeout`, `backend_unavailable`, `backend_error`, `malformed_answer`, `backlog_dropped`, `no_backend_configured`, `no_validated_backend`, `pack_unavailable`, `floor_unavailable`, `floor_triggered_unanswered`, `raw_input_not_permitted` |
+| `enforceable` | boolean |
+| `questions` | a list of closed objects `{ "id": code, "clause_sha256": hex, "outcome": PASS, FLAG or INDETERMINATE, "p", "p_pass", "flag_at", "pass_at": number or null }` |
+| `execution` | `gateway` or `pool` |
+| `pool_verdict_id` | `null`, or `jv_` and 32 lowercase hex digits; always present, as below |
+| `backend` | `null`, or the closed object `{ "id": code, "distribution": native, derived or null, "validated": boolean, "prompt_version": code, "prompt_sha256": hex, "validation_run": code or null, "validation_sha256": hex or null }` |
+| `timing` | `after_delivery` or `before_delivery` |
+| `rollout_stage` | `shadow`, `flag` or `enforce` |
+| `action_taken` | `allow`, `warn`, `redact`, `mask_output`, `hold` or `block` |
+| `stage` | `pre_request`, `post_response` or `tool_call`: where the judgment ran |
+| `input_form` | `redacted` or `raw`: the form of every input of the judge call |
+| `snapshot` | `forwarded_request`, `candidate_reply`, `candidate_reply_partial` (a streamed reply that was not seen whole) or `tool_arguments` |
+| `raw_input_grant` | code; present only as below, otherwise absent (never `null`) |
+| `latency_ms` | unsigned 32-bit integer |
+| `evaluated_at` | RFC 3339 UTC time (`Z` or `+00:00`) |
+
+Cross-field rules, each a failure when broken:
+
+- `raw_input_grant` is present exactly when `input_form` is `raw` and
+  `backend` is not `null`: a raw judgment that reached a backend names the
+  organization's permission that covered that backend, and one that reached
+  none names none.
+- `pool_verdict_id` links a receipt to the shared decision pool's own record
+  of the same verdict. It is `null` when `execution` is `gateway`. When
+  `execution` is `pool` it is the pool's verdict id (`jv_` and 32 lowercase
+  hex digits), or `null` only when the gateway settled the verdict itself
+  because the pool issued none: an `INDETERMINATE` whose `source` is not
+  `judge`, with `reason_code` `backend_timeout`, `backend_unavailable`,
+  `backend_error`, `malformed_answer`, `raw_input_not_permitted`,
+  `backlog_dropped`, `no_backend_configured`, `floor_unavailable` or
+  `floor_triggered_unanswered`; or a `FLAG` from `source` `floor` with
+  `reason_code` `floor_match`.
+- `reason_code` `raw_input_not_permitted` (a raw judgment with no covering
+  permission) has `input_form` `raw`, `backend` `null`, `verdict`
+  `INDETERMINATE` and `source` `none`.
+- Each stage judges its own snapshots: `forwarded_request` only with
+  `stage` `pre_request`; `candidate_reply` and `candidate_reply_partial` only
+  with `post_response`; `tool_arguments` exactly with `tool_call`.
+- When the pack holds the judged record (and it is not a hash-only stub),
+  `snapshot` `tool_arguments` judges an `mcp.tool_call` record and the other
+  three an `llm_request` record, and `stage` `tool_call` judges an
+  `mcp.tool_call` record.
+- `pack.version` is `null` exactly when `reason_code` is `pack_unavailable`,
+  as in v1.21.
+
+The local part (`raw_response`) is `judgment_verdict_local.v2`, a closed
+object: `schema` (`"judgment_verdict_local.v2"`), `reason_text` (string or
+null), `reason_text_withheld` and `floor_unavailable` (booleans), `spans` (a
+list of closed objects `{ "input": string, "start", "end": unsigned 32-bit
+integers }`), `judged_input_sha256` and `floor_triggers`.
+`judged_input_sha256` is 64 lowercase hex, the SHA-256 of the UTF-8 bytes of
+the judged input block exactly as the backend received it, and is `null`
+exactly when the uploaded form's `backend` is `null`. `floor_triggers` is a
+list of closed objects `{ "rule_id", "term_id", "language": string }`, the
+ids of the trigger-floor terms that fired; it never holds the matched text.
+The local part is never uploaded. In a content-stripped pack (§6.6) whose
+`removed_fields` include `raw_response`, its checks are left out.
+
+What a v1.22 receipt does not show: `rule_sha256` names the rule as
+delivered, but the pack does not hold the rule, so only its format is
+checked; the verifier cannot tell whether a permission named by
+`raw_input_grant` was live when the judge ran, or whether a reply marked
+partial was in fact not seen whole, only that the receipt states these facts
+consistently.
+
 MCP kinds are: `mcp.tool_call`, `mcp.policy_decision`, `mcp.tool_result`,
 `mcp.tools_list.served`, `mcp.error`, `mcp.catalog_drift`. Any MCP hasher
 called with a non-MCP kind is an error.
@@ -573,7 +660,8 @@ asserted-claims digest (§4.5), for v1.16, v1.18 and v1.19 records the
 evaluation outcome digest, for v1.15 records the evidence-set digest (§4.3),
 for v1.18 and v1.19 records the customer label digest (§4.6), for v1.20
 records the stored-record, file-content and findings digests (§4.3), and for
-v1.21 records the digests of the uploaded form and the local part (§4.3).
+v1.21 and v1.22 records the digests of the uploaded form and the local part
+(§4.3).
 
 ### 4.4 LLM content attestation (v1.10, v1.11, v1.12, v1.16, v1.18, v1.19)
 
@@ -1380,7 +1468,7 @@ since; the chain hashes attest the records.
   `label_sha256` binds it only when `source` is `asserted` (§4.6). On v1.20
   records the stored item, its file bytes and its findings are bound through
   `record_sha256`, `content_sha256` and `findings_sha256` (§4.3). On v1.21
-  records the uploaded form and the local part are bound through
+  and v1.22 records the uploaded form and the local part are bound through
   `uploaded_sha256` and `local_sha256` (§4.3). On LLM
   records before v1.19 `policy_version` and `model_executed` are stored but
   not hashed (v1.19 binds both, §4.3), and on every MCP record

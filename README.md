@@ -52,6 +52,8 @@ python3 verify-pack.py --records fixtures/local-chain/earlier-pack/records \
 # 6. Verify a chain that holds judgment verdict receipts
 python3 verify-pack.py --records fixtures/local-chain/judgment-verdicts/records \
   --manifest fixtures/local-chain/judgment-verdicts/manifest.json --allow-unsigned
+python3 verify-pack.py --records fixtures/local-chain/judgment-verdicts-v2/records \
+  --manifest fixtures/local-chain/judgment-verdicts-v2/manifest.json --allow-unsigned
 ```
 
 Exit codes, the same online and offline:
@@ -393,11 +395,11 @@ the modes (`evidence_modes`, [SPEC.md](SPEC.md) §6.8) must list exactly the
 seals in the records; otherwise the pack fails with `FAIL evidence_modes`
 lines instead.
 
-`fixtures/local-chain/` holds eight packs: a clean local-chain pack, the same
-chain packed at an earlier head and checked against the later anchor
+`fixtures/local-chain/` holds eleven packs: a clean local-chain pack, the
+same chain packed at an earlier head and checked against the later anchor
 (exit `4`), that pack with its claim edited (exit `1`), a chain with a
 change of evidence mode, the same chain with the change left out of the
-manifest (exit `1`), and the three judgment verdict packs described below.
+manifest (exit `1`), and the six judgment verdict packs described below.
 `fixtures/run-local-chain-cases.py` runs each one with its expected exit code
 and output lines; `fixtures/gen-local-chain-fixtures.py` writes them and says
 where each record comes from.
@@ -407,9 +409,9 @@ where each record comes from.
 A gateway can run judgments: checks of a model request against an
 organization's policy, each with a verdict (`PASS`, `FLAG` or
 `INDETERMINATE`) and a reason code. Every verdict is sealed in the
-gateway's chain as a receipt (a v1.21 `judgment_verdict` record), after the
-request it judged and on the same chain. For each receipt the verifier
-checks that:
+gateway's chain as a receipt (a v1.21 or v1.22 `judgment_verdict` record),
+after the request it judged and on the same chain. For each receipt the
+verifier checks that:
 
 - **it is intact.** Its hash recomputes, and the two parts stored beside the
   hash match the digests the hash covers: the receipt as the gateway uploads
@@ -421,6 +423,36 @@ checks that:
   record at that sequence, it must be that record, and it must come before
   the receipt. A judged record outside the pack's window is not a failure:
   the receipt's hash still binds the three values.
+
+A v1.22 receipt also records how the judge was given its input, and the
+verifier checks that:
+
+- **its stored parts are closed.** The uploaded part
+  (`judgment_verdict.v2`) and the local part (`judgment_verdict_local.v2`)
+  hold exactly their listed keys, each of its type, fixed vocabulary and
+  format, and `null` only where the format allows it. A key the format does
+  not list fails the receipt.
+- **its input facts agree.** `input_form` is `redacted` or `raw` (one form
+  for every input of the judge call). A raw judgment that reached a backend
+  names the organization's permission that covered that backend
+  (`raw_input_grant`); no other receipt names one. A raw judgment with no
+  covering permission is `INDETERMINATE` with reason code
+  `raw_input_not_permitted`, and reached no backend. The local part holds
+  the digest of the exact input block the backend received
+  (`judged_input_sha256`) exactly when a backend was sent one.
+- **its stage and snapshot fit the judged record.** `stage` says where the
+  judgment ran (`pre_request`, `post_response` or `tool_call`) and
+  `snapshot` what was judged: the forwarded request (only before the
+  request), the complete or partial candidate reply of a model request (only
+  after the response), or the arguments of an MCP tool call
+  (`tool_arguments`, exactly at the `tool_call` stage). When the pack holds
+  the judged record, `tool_arguments` and the `tool_call` stage must judge
+  an MCP tool call, and the other snapshots a model request.
+
+`rule_sha256` is the digest of the rule as the gateway received it; the pack
+does not hold the rule, so the verifier checks only its format. The
+trigger-floor ids in the local part (`floor_triggers`) name the rule, the
+term and the language, never the matched text.
 
 An edit to any of these fails the pack at the receipt (exit `1`).
 
@@ -444,6 +476,19 @@ receipt's uploaded part and another's reason edited after sealing, and
 `judgment-verdicts-relinked` has a receipt sealed with a link to another
 record than the one at the sequence it names; both exit `1`
 ([SPEC.md](SPEC.md) §4.3).
+
+```bash
+python3 verify-pack.py --records fixtures/local-chain/judgment-verdicts-v2/records \
+  --manifest fixtures/local-chain/judgment-verdicts-v2/manifest.json --allow-unsigned
+```
+
+The v1.22 fixture chain holds a model request, an MCP tool call and four
+receipts: a `FLAG` judged on raw input under a permission, a `PASS` judged
+on the redacted forwarded request, a `PASS` judged on the tool call's
+arguments, and a raw judgment refused for want of a permission.
+`judgment-verdicts-v2-malformed` is the same chain sealed with four receipts
+that break the v1.22 rules, and `judgment-verdicts-v2-relabelled` the clean
+chain with one receipt's stamp edited to v1.21; both exit `1`.
 
 ## Further checks
 
@@ -471,9 +516,11 @@ the same exit-code precedence.
   verdict for the condition set whose digest you hold, counting the records
   in the window sealed under it, its gaps and its exceptions
   ([SPEC.md](SPEC.md) §10).
-- **Judgment verdict receipts** (no flag). A v1.21 `judgment_verdict`
-  record is checked for its stored parts, its sealed facts and its link to
-  the record it judged (see "Judgment verdict receipts").
+- **Judgment verdict receipts** (no flag). A v1.21 or v1.22
+  `judgment_verdict` record is checked for its stored parts, its sealed
+  facts and its link to the record it judged; a v1.22 record also for its
+  closed parts, its input facts, its stage and its snapshot (see "Judgment
+  verdict receipts").
 - **Gateway evidence key** (`--attestation-key JWK` or `--gateway-key KEY`).
   Attestations, record signatures, signed chain heads and evidence-key
   manifest signatures (see "Gateway evidence key").
@@ -545,7 +592,7 @@ It does **not** prove:
 ## Versions
 
 The verifier understands chain records with `schema_version` v1 through
-v1.21, stored per record or in segment objects, and pack manifests 1.0
+v1.22, stored per record or in segment objects, and pack manifests 1.0
 through 1.5 (1.1 adds chain-head anchors, 1.2 the storage layout, 1.3 the
 control-plane chain, 1.4 the evidence class label, 1.5 the content-stripped
 pack with its hash-only stubs). It declares the pack features it checks in
@@ -555,7 +602,8 @@ pack with its hash-only stubs). It declares the pack features it checks in
 `per-tenant-signer-v1`, `evidence-class-v1`, `content-stripped-v1`,
 `customer-conditions-v1`, `record-signatures-v1`, `compliance-records-v1`,
 `local-chain-evidence-v1`, `coverage-claim-v1`, `evidence-modes-v1`,
-`gateway-evidence-key-v1` and `judgment-verdicts-v1`. A record of an unknown
+`gateway-evidence-key-v1`, `judgment-verdicts-v1` and
+`judgment-verdicts-v2`. A record of an unknown
 version or kind fails verification rather than being skipped; a manifest of
 an unknown version, storage layout, evidence class or content claim is
 cannot evaluate (exit `2`). Changes to the verifier are listed in
