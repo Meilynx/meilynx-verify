@@ -1,0 +1,16 @@
+{
+  "runs": [
+    {
+      "absent": [
+        "FAIL seq=0"
+      ],
+      "args": [
+        "--allow-unsigned"
+      ],
+      "contains": [
+        "FAIL seq=1: probe run 6c1d9f4a-3e2b-4d66-8b88-1a2b3c4d5e02: passed, failed and not_applicable are not the counts of its results"
+      ],
+      "exit": 1
+    }
+  ]
+}

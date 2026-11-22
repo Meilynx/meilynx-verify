@@ -137,7 +137,7 @@ Record signatures:
         python verify-pack.py --records ./records --manifest manifest.json \\
             --chain-signing-key <64 hex characters>
 
-Gateway evidence key (ADR-0113):
+Gateway evidence key:
     A gateway's one Ed25519 evidence key signs its records (record_sig), its
     chain heads (records/head-signatures/<head_sequence:020d>.json) and its
     pack and OCSF export manifests (a `signature` with scheme
@@ -416,18 +416,23 @@ EVIDENCE_MODE_INDEX_FIELDS = ("sequence", "mode", "source")
 # `evidence-modes-v1` reads a manifest's `evidence_modes`, checks it against
 # the evidence_mode_resolved seals in the pack, and prints each mode and
 # every change of mode.
-# `gateway-evidence-key-v1` (ADR-0113) reads the gateway evidence key: the
+# `gateway-evidence-key-v1` reads the gateway evidence key: the
 # attestations a pack carries (--attestation-key, the project's pinned P-256
 # key) or a key the reader pins (--gateway-key), the evidence-key seals on the
 # chain (signing stopped, key lost, rotated, rekeyed), signed chain heads,
 # and pack and OCSF export manifests signed under `meilynx.evidence.v1`.
+# `control-probe-runs-v1` reads the v1.23
+# control_probe.run record: recomputes its hash, and when the pack carries the
+# stored set references and per-case results, recomputes sets_sha256 and
+# results_sha256 from them and recounts passed, failed and not_applicable;
+# when it does not, it reports the digests as bound but not checked.
 VERIFIER_CAPABILITIES = frozenset(
     {"chain-anchors-v1", "segmented-records-v1", "decision-receipts-v1", "evaluation-trace-v1",
      "data-reach-evidence-v1", "control-plane-chain-v1", "ocsf-export-v1", "customer-scope-v1",
      "per-tenant-signer-v1", "evidence-class-v1", "content-stripped-v1", "customer-conditions-v1",
      "record-signatures-v1", "compliance-records-v1", "local-chain-evidence-v1", "coverage-claim-v1",
      "evidence-modes-v1", "gateway-evidence-key-v1", "judgment-verdicts-v1",
-     "judgment-verdicts-v2"}
+     "judgment-verdicts-v2", "control-probe-runs-v1"}
 )
 # The stripped profile of a manifest 1.5 Exchange pack. Mirror of
 # `exchange::STRIPPED_FIELDS` / `WITHHELD_FIELDS` / `STUB_FIELDS` /
@@ -462,7 +467,7 @@ STUB_REASONS = {
 }
 # OCSF mapping contract versions this verifier reads (contracts/ocsf-mapping.v1.json).
 # `1+gateway-evidence-key-v1` is mapping 1 in a manifest signed by the gateway
-# evidence key (ADR-0113 D10, MEI-3749): a verifier from before it reads only
+# evidence key: a verifier from before it reads only
 # `1`, so it answers "cannot evaluate" for a signed manifest instead of failing
 # its `signed: true` with no detached `.manifest.sig`. A manifest stamped with
 # it must carry the `meilynx.evidence.v1` signature.
@@ -612,6 +617,8 @@ EVENT_KIND_DECISION_RECEIPT = 'decision.receipt'
 EVENT_KIND_COMPLIANCE_RECORD = 'compliance.record'
 # The judgment verdict receipt kind (v1.21 bucket).
 EVENT_KIND_JUDGMENT_VERDICT = 'judgment.verdict'
+# The scheduled control-probe run kind (v1.23 bucket).
+EVENT_KIND_CONTROL_PROBE_RUN = 'control_probe.run'
 
 MCP_EVENT_KINDS = {
     EVENT_KIND_MCP_TOOL_CALL,
@@ -644,6 +651,8 @@ SERDE_EVENT_KIND_TO_WIRE = {
     'compliance_record': EVENT_KIND_COMPLIANCE_RECORD,
     # Serde snake_case form of the v1.21 kind.
     'judgment_verdict': EVENT_KIND_JUDGMENT_VERDICT,
+    # Serde snake_case form of the v1.23 kind.
+    'control_probe_run': EVENT_KIND_CONTROL_PROBE_RUN,
 }
 
 
@@ -1379,11 +1388,11 @@ JUDGMENT_VERDICT_V2_FIELDS = (
     'raw_input_grant', 'latency_ms', 'evaluated_at',
 )
 JUDGMENT_VERDICT_V2_OPTIONAL_FIELDS = ('raw_input_grant',)
-# MEI-3939: `pool_verdict_id` links a receipt to the shared pool's own record
+# `pool_verdict_id` links a receipt to the shared pool's own record
 # of the same verdict. Always present: `jv_` and 32 lowercase hex digits
 # exactly when `execution` is `pool`, null otherwise.
 JUDGMENT_VERDICT_POOL_VERDICT_ID = re.compile(r'\Ajv_[0-9a-f]{32}\Z')
-# MEI-3939 (option A): a pool record names no pool verdict when the gateway
+# A pool record names no pool verdict when the gateway
 # settled the verdict itself: an INDETERMINATE not from the judge with one of
 # these reason codes, or a floor's FLAG.
 JUDGMENT_VERDICT_POOL_UNANSWERED_REASON_CODES = (
@@ -1392,7 +1401,7 @@ JUDGMENT_VERDICT_POOL_UNANSWERED_REASON_CODES = (
     'floor_unavailable', 'floor_triggered_unanswered',
 )
 JUDGMENT_VERDICT_LOCAL_FIELDS_V2 = JUDGMENT_VERDICT_LOCAL_FIELDS + ('judged_input_sha256', 'floor_triggers')
-# The closed reason-code list (ADR-0115 D6), in its order. The 17th,
+# The closed reason-code list, in its order. The 17th,
 # `raw_input_not_permitted`, is a raw-input rule with no live covering grant.
 JUDGMENT_VERDICT_REASON_CODES = (
     'ok', 'clause_violated', 'floor_match', 'abstained', 'input_missing', 'budget_exceeded',
@@ -1715,6 +1724,159 @@ def compute_event_hash_v1_21_judgment_verdict(
 def judgment_verdict_uploaded_sha256(uploaded_json):
     """SHA-256 over the utf-8 bytes of the stored uploaded form."""
     return hashlib.sha256(uploaded_json.encode('utf-8')).hexdigest()
+
+
+# The v1.23 control_probe.run bucket.
+CONTROL_PROBE_RUN_SCHEMA_VERSION = 'v1.23'
+# The payload feed: (field, kind) in `ControlProbeRunFields` struct-definition
+# order, which is the shared contract's section 3 order. `str` feeds
+# length-prefixed (the v1.19 feed), `u64` 8 little-endian bytes, `bool` one
+# byte. `sets_json` and `results_json` are stored beside them, not fed.
+CONTROL_PROBE_RUN_FEED = (
+    ('run_id', 'str'), ('started_at', 'str'), ('finished_at', 'str'), ('bundle_sha256', 'str'),
+    ('policy_version', 'str'), ('evidence_mode', 'str'), ('shadow_mode', 'bool'),
+    ('sets_sha256', 'str'), ('passed', 'u64'), ('failed', 'u64'), ('not_applicable', 'u64'),
+    ('results_sha256', 'str'),
+)
+CONTROL_PROBE_RUN_STORED = ('sets_json', 'results_json')
+CONTROL_PROBE_EVIDENCE_MODES = ('write_once', 'local_chain')
+CONTROL_PROBE_SET_REF_FIELDS = ('set_id', 'version', 'sha256')
+CONTROL_PROBE_RESULT_FIELDS = (
+    'set_id', 'case_id', 'rule_instance', 'configured_action', 'expected_detected',
+    'actual_detected', 'actual_decision', 'outcome', 'shadow',
+)
+CONTROL_PROBE_ACTIONS = ('block', 'redact', 'warn', 'flag', 'hold')
+CONTROL_PROBE_DECISIONS = ('block', 'redact', 'flag', 'hold', 'allow')
+CONTROL_PROBE_OUTCOMES = ('pass', 'fail', 'not_applicable')
+CONTROL_PROBE_ID = re.compile(r'\A[a-z0-9][a-z0-9-]{2,63}\Z')
+_LOWER_SHA256 = re.compile(r'\A[0-9a-f]{64}\Z')
+
+
+def compute_event_hash_v1_23_control_probe_run(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    run,
+):
+    """v1.23 control_probe.run hash. `run` is a dict matching
+    `ControlProbeRunFields`. Mirror of
+    `compute_event_hash_v1_23_control_probe_run` in sqlite.rs: the SAME v1.2
+    prefix, then the event_kind wire-name, then the 12 hashed fields in
+    `CONTROL_PROBE_RUN_FEED` order. The stored set references and results
+    are outside the preimage; `sets_sha256` and `results_sha256` bind them
+    (see `check_control_probe_run`)."""
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_CONTROL_PROBE_RUN.encode('utf-8'))
+    for name, kind in CONTROL_PROBE_RUN_FEED:
+        value = run.get(name)
+        if kind == 'str':
+            if not isinstance(value, str):
+                raise ValueError(f"control_probe_run.{name} is not a string, so the record has no defined preimage.")
+            h.update(encode_len_prefixed_str(value))
+        elif kind == 'u64':
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2 ** 64:
+                raise ValueError(f"control_probe_run.{name} is not an unsigned integer, so the record has no defined preimage.")
+            h.update(struct.pack('<Q', value))
+        elif kind == 'bool':
+            if not isinstance(value, bool):
+                raise ValueError(f"control_probe_run.{name} is not a boolean, so the record has no defined preimage.")
+            h.update(b'\x01' if value else b'\x00')
+    return h.hexdigest()
+
+
+def _control_probe_result_problems(results):
+    """Shape problems of a stored results array (the closed result schema)."""
+    if not isinstance(results, list):
+        return ['the stored results are not an array']
+    problems = []
+    for i, r in enumerate(results):
+        if not isinstance(r, dict) or set(r) != set(CONTROL_PROBE_RESULT_FIELDS):
+            problems.append(f'stored result [{i}] is not exactly the control_probe_run.v1 result members')
+            continue
+        if not (isinstance(r['set_id'], str) and CONTROL_PROBE_ID.match(r['set_id'])
+                and isinstance(r['case_id'], str) and CONTROL_PROBE_ID.match(r['case_id'])
+                and isinstance(r['rule_instance'], str) and r['rule_instance']
+                and r['configured_action'] in CONTROL_PROBE_ACTIONS
+                and isinstance(r['expected_detected'], bool) and isinstance(r['actual_detected'], bool)
+                and r['actual_decision'] in CONTROL_PROBE_DECISIONS
+                and r['outcome'] in CONTROL_PROBE_OUTCOMES
+                and isinstance(r['shadow'], bool)):
+            problems.append(f'stored result [{i}] holds a value outside its class')
+    return problems
+
+
+def check_control_probe_run(event):
+    """The checks of a v1.23 control_probe.run record that its hash does not
+    cover. Returns (problems, notes): `problems` are failures; `notes` say what
+    is bound but not checked because the pack does not carry it. Records on
+    any other schema version return nothing (the dispatcher refuses the
+    payload anywhere else). Mirror of `check_control_probe_run_fields` in
+    meilynx-core."""
+    version = event.get('schema_version') or 'v1'
+    if version != CONTROL_PROBE_RUN_SCHEMA_VERSION:
+        return [], []
+    fields = event.get('control_probe_run')
+    if not isinstance(fields, dict):
+        return [f'{version} record carries no control_probe_run payload'], []
+    expected = {name for name, _ in CONTROL_PROBE_RUN_FEED} | set(CONTROL_PROBE_RUN_STORED)
+    present = set(fields)
+    problems, notes = [], []
+    unknown = sorted(present - expected)
+    if unknown:
+        problems.append(f'control_probe_run carries members outside v1.23: {unknown}')
+    run_id = fields.get('run_id', '?')
+    for name in ('bundle_sha256', 'sets_sha256', 'results_sha256'):
+        if not (isinstance(fields.get(name), str) and _LOWER_SHA256.match(fields[name])):
+            problems.append(f'probe run {run_id}: {name} is not 64 lowercase hexadecimal digits')
+    if fields.get('evidence_mode') not in CONTROL_PROBE_EVIDENCE_MODES:
+        problems.append(f'probe run {run_id}: evidence_mode is not write_once or local_chain')
+    sets_json = fields.get('sets_json')
+    if sets_json is None:
+        notes.append(f'probe run {run_id}: sets_sha256 is bound but not checked: the pack carries no set references')
+    elif not isinstance(sets_json, str) or hashlib.sha256(sets_json.encode('utf-8')).hexdigest() != fields.get('sets_sha256'):
+        problems.append(f'probe run {run_id}: the stored set references do not hash to sets_sha256')
+    else:
+        try:
+            sets = json.loads(sets_json)
+        except ValueError:
+            sets = None
+        if not isinstance(sets, list) or any(
+            not isinstance(x, dict) or set(x) != set(CONTROL_PROBE_SET_REF_FIELDS) for x in sets
+        ):
+            problems.append(f'probe run {run_id}: the stored set references are not {{set_id, version, sha256}} objects')
+        else:
+            ordered = sorted(sets, key=lambda x: (x['set_id'], x['version'], x['sha256']))
+            if jcs_dumps(ordered) != sets_json:
+                problems.append(f'probe run {run_id}: the stored set references are not the JCS form of the sorted array')
+    results_json = fields.get('results_json')
+    if results_json is None:
+        notes.append(f'probe run {run_id}: results_sha256 is bound but not checked: the pack carries no case results')
+    elif not isinstance(results_json, str) or hashlib.sha256(results_json.encode('utf-8')).hexdigest() != fields.get('results_sha256'):
+        problems.append(f'probe run {run_id}: the stored case results do not hash to results_sha256')
+    else:
+        try:
+            results = json.loads(results_json)
+        except ValueError:
+            results = None
+        shape = _control_probe_result_problems(results)
+        if shape:
+            problems.extend(f'probe run {run_id}: {p}' for p in shape)
+        else:
+            ordered = sorted(results, key=lambda r: (r['set_id'], r['case_id'], r['rule_instance']))
+            if jcs_dumps(ordered) != results_json:
+                problems.append(f'probe run {run_id}: the stored case results are not the JCS form of the sorted array')
+            counts = tuple(sum(1 for r in results if r['outcome'] == o) for o in CONTROL_PROBE_OUTCOMES)
+            if counts != (fields.get('passed'), fields.get('failed'), fields.get('not_applicable')):
+                problems.append(f'probe run {run_id}: passed, failed and not_applicable are not the counts of its results')
+            if any(r['shadow'] for r in results) != fields.get('shadow_mode'):
+                problems.append(f'probe run {run_id}: shadow_mode is not whether any of its results is in shadow')
+    return problems, notes
 
 
 def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=None):
@@ -3805,7 +3967,7 @@ def compute_event_hash_dispatch(
     mcp_event=None, coverage=None, join_context=None, content=None,
     identity=None, coverage_key_inventory=None, decision_receipt=None,
     evaluation_trace=None, customer=None, policy_version=None, model_executed=None,
-    compliance_record=None, judgment_verdict=None,
+    compliance_record=None, judgment_verdict=None, control_probe_run=None,
 ):
     """Python mirror of compute_event_hash_dispatch in sqlite.rs.
 
@@ -3850,6 +4012,16 @@ def compute_event_hash_dispatch(
         isinstance(evaluation_trace, dict) and isinstance(evaluation_trace.get('outcomes_sha256_jcs'), str)
     ):
         raise ValueError("evaluation_trace has no outcomes_sha256_jcs, so the record has no defined preimage.")
+    # Fail closed. The probe-run payload is hashed only by the v1.23
+    # control_probe.run hasher; anywhere else it would sit on the record
+    # unhashed.
+    if control_probe_run is not None and (
+        schema_version != CONTROL_PROBE_RUN_SCHEMA_VERSION or event_kind != EVENT_KIND_CONTROL_PROBE_RUN
+    ):
+        raise ValueError(
+            f"control_probe_run payload present on a {schema_version!r} "
+            f"{event_kind!r} event — it is hashed only in the v1.23 control_probe.run bucket."
+        )
     # Fail closed. The verdict receipt payload is hashed only by the v1.21
     # judgment.verdict hasher (the v1.21 and v1.22 buckets); anywhere else it
     # would sit on the record unhashed.
@@ -4143,6 +4315,28 @@ def compute_event_hash_dispatch(
             total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
             cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
             coverage_key_inventory,
+        )
+    if schema_version == CONTROL_PROBE_RUN_SCHEMA_VERSION:
+        # v1.23 introduces exactly one new event class: control_probe.run.
+        # Same kind-only gate posture as v1.8, v1.13, v1.15, v1.20 and v1.21.
+        if event_kind != EVENT_KIND_CONTROL_PROBE_RUN:
+            raise ValueError(
+                f"schema_version v1.23 is defined only for "
+                f"control_probe.run events; got event_kind {event_kind!r}"
+            )
+        if not isinstance(control_probe_run, dict):
+            raise ValueError("ControlProbeRun event missing control_probe_run payload")
+        if any(p is not None for p in (auth_session, admin_action, mcp_event, coverage)):
+            raise ValueError(
+                "a v1.23 control_probe.run event carries another kind's payload; "
+                "it would ride the record unhashed."
+            )
+        return compute_event_hash_v1_23_control_probe_run(
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            control_probe_run,
         )
     if schema_version in JUDGMENT_VERDICT_SCHEMA_VERSIONS:
         # v1.21 introduces exactly one new event class: judgment.verdict.
@@ -5400,7 +5594,7 @@ def run_self_test():
         'a span offset that is negative': v122_with(local=dict(spans=[dict(input='reply', start=-1, end=2)])),
         'a withheld flag that is not a boolean': v122_with(local=dict(reason_text_withheld='no')),
         'a reason text that is not a string': v122_with(local=dict(reason_text=7)),
-        # MEI-3939: the link to the pool's record of the same verdict.
+        # The link to the pool's record of the same verdict.
         'a form without pool_verdict_id': v122_with(drop=('pool_verdict_id',)),
         'a pool judgment with a null link': v122_with(form=dict(execution='pool', pool_verdict_id=None)),
         'a pool PASS with a null link': v122_with(form=dict(
@@ -6441,6 +6635,110 @@ def run_self_test():
     else:
         print('SELF-TEST assertion 17e PASS: join_context outside v1.9 is rejected')
 
+    # Assertion 40a — v1.23 control_probe.run fixture. The
+    # payload carries the values of the shared contract's run fixture
+    # (contracts/control-probe-run.v1.sample.json); the hash is pinned in
+    # crates/meilynx-audit/tests/mei2603_control_probe_run_chain_round_trip.rs
+    # as V1_23_CONTROL_PROBE_RUN_FIXTURE_HASH, and the two digests are the
+    # contract's known answers (contracts/control-probe.v1.digests.txt).
+    probe_results = sorted(_V1_23_CONTROL_PROBE_RUN_FIXTURE_RESULTS,
+                           key=lambda r: (r['set_id'], r['case_id'], r['rule_instance']))
+    probe_payload = dict(_V1_23_CONTROL_PROBE_RUN_FIXTURE_PAYLOAD,
+                         sets_json=jcs_dumps(_V1_23_CONTROL_PROBE_RUN_FIXTURE_SETS),
+                         results_json=jcs_dumps(probe_results))
+    probe_args = dict(sequence_number=42, timestamp_utc='2026-11-21T10:00:01.000000+00:00',
+                      event_id='evt_probe_0001', request_id='evt_probe_0001', model_requested='',
+                      action='allow', input_tokens=0, output_tokens=0, total_tokens=None,
+                      cache_creation_input_tokens=None, cache_read_input_tokens=None,
+                      cached_input_tokens=None, reasoning_tokens=None, estimated_cost_usd=None,
+                      previous_hash='b' * 64)
+    got_probe = compute_event_hash_v1_23_control_probe_run(run=probe_payload, **probe_args)
+    digests_ok = (
+        hashlib.sha256(probe_payload['sets_json'].encode('utf-8')).hexdigest() == probe_payload['sets_sha256']
+        == '44d66f6269833264ffe33e2ec63025e2af65e060250792f7f11f9a375567e02c'
+        and hashlib.sha256(probe_payload['results_json'].encode('utf-8')).hexdigest() == probe_payload['results_sha256']
+        == '1b99f395eb2b3e0b51a13fe89e1419102cc527385ec3abb5888760483719b3bc'
+    )
+    if got_probe == V1_23_CONTROL_PROBE_RUN_FIXTURE_HASH and digests_ok:
+        print('SELF-TEST assertion 40a PASS: v1.23 control_probe.run fixture hash and contract digests pinned')
+    else:
+        print(f'SELF-TEST assertion 40a FAIL: got {got_probe}, expected '
+              f'{V1_23_CONTROL_PROBE_RUN_FIXTURE_HASH}; digests {digests_ok}', file=sys.stderr)
+        ok = False
+
+    # Assertion 40b — the production recompute path routes an exported v1.23
+    # record (serde kind `control_probe_run`) to the hasher, and the stored
+    # parts check out.
+    probe_event = {
+        'schema_version': 'v1.23', 'event_kind': 'control_probe_run',
+        'timestamp_utc': '2026-11-21T10:00:01.000000+00:00', 'event_id': 'evt_probe_0001',
+        'request_id': 'evt_probe_0001', 'model_requested': '', 'action': 'allow',
+        'input_tokens': 0, 'output_tokens': 0, 'control_probe_run': probe_payload,
+    }
+    routed = recompute_event_hash(probe_event, 42, 'b' * 64)
+    intact = check_control_probe_run(probe_event)
+    if routed == got_probe and intact == ([], []):
+        print('SELF-TEST assertion 40b PASS: an exported v1.23 record recomputes and its stored parts check out')
+    else:
+        print(f'SELF-TEST assertion 40b FAIL: routed {routed}, checks {intact}', file=sys.stderr)
+        ok = False
+
+    # Assertion 40c — what the hash does not cover is caught by the checks: a
+    # stored outcome, a stored set reference, a count, an unknown member. A
+    # pack without the stored parts reports the digests as bound but not
+    # checked, and does not fail.
+    def probe_with(**mutate):
+        return dict(probe_event, control_probe_run=dict(probe_payload, **mutate))
+    probe_edits = {
+        'a stored outcome': probe_with(results_json=probe_payload['results_json'].replace('"pass"', '"fail"', 1)),
+        'a stored set reference': probe_with(sets_json=probe_payload['sets_json'].replace('"version":1', '"version":2')),
+        'the passed count against the results': probe_with(passed=1, failed=1),
+        'a run-level shadow flag against the results': probe_with(shadow_mode=False),
+        'a member outside v1.23': probe_with(inputs='x'),
+        'an evidence mode outside its vocabulary': probe_with(evidence_mode='elsewhere'),
+    }
+    probe_caught = {name: bool(check_control_probe_run(e)[0]) for name, e in probe_edits.items()}
+    thin = dict(probe_event, control_probe_run={k: v for k, v in probe_payload.items()
+                                                 if k not in CONTROL_PROBE_RUN_STORED})
+    thin_problems, thin_notes = check_control_probe_run(thin)
+    if all(probe_caught.values()) and not thin_problems and len(thin_notes) == 2 \
+            and recompute_event_hash(thin, 42, 'b' * 64) == got_probe:
+        print('SELF-TEST assertion 40c PASS: stored parts are bound by their digests; '
+              'a pack without them reports bound but not checked')
+    else:
+        print(f'SELF-TEST assertion 40c FAIL: caught {probe_caught}, thin {thin_problems} {thin_notes}',
+              file=sys.stderr)
+        ok = False
+
+    # Assertion 40d — the fail-closed invariants of the v1.23 bucket.
+    probe_base = tuple(probe_args.values())
+    probe_refusals = (
+        dict(version='v1.1', event_kind=EVENT_KIND_LLM_REQUEST, control_probe_run=probe_payload),
+        dict(version='v1.21', event_kind=EVENT_KIND_CONTROL_PROBE_RUN, control_probe_run=probe_payload),
+        dict(version='v1.23', event_kind=EVENT_KIND_LLM_REQUEST, control_probe_run=probe_payload),
+        dict(version='v1.23', event_kind=EVENT_KIND_CONTROL_PROBE_RUN, control_probe_run=None),
+        dict(version='v1.23', event_kind=EVENT_KIND_CONTROL_PROBE_RUN,
+             control_probe_run=dict(probe_payload, shadow_mode='true')),
+        dict(version='v1.23', event_kind=EVENT_KIND_CONTROL_PROBE_RUN,
+             control_probe_run=dict(probe_payload, passed='2')),
+        dict(version='v1.23', event_kind=EVENT_KIND_CONTROL_PROBE_RUN, control_probe_run=probe_payload,
+             admin_action={'action_type': 'x', 'actor': 'y', 'description': 'z', 'metadata_json': '{}'}),
+    )
+    probe_rejected = 0
+    for refusal in probe_refusals:
+        kwargs = dict(refusal)
+        version = kwargs.pop('version')
+        try:
+            compute_event_hash_dispatch(version, *probe_base, **kwargs)
+        except ValueError:
+            probe_rejected += 1
+    if probe_rejected == len(probe_refusals) and 'control-probe-runs-v1' in VERIFIER_CAPABILITIES:
+        print('SELF-TEST assertion 40d PASS: misplaced, missing and malformed probe-run payloads are refused')
+    else:
+        print(f'SELF-TEST assertion 40d FAIL: only {probe_rejected} of {len(probe_refusals)} refused',
+              file=sys.stderr)
+        ok = False
+
     return ok
 
 
@@ -6450,6 +6748,37 @@ def run_self_test():
 # legacy v1 FIXTURE_HASH above stays at ba7a7f3d… (the v1 path is
 # frozen; no encoding change can ever bump it).
 V1_2_LLM_REQUEST_FIXTURE_HASH = "5f85e27ee519003176c2acb8dd287a9c9dfdd1ba0cc41ec3c92e1c56c9869456"
+
+# The v1.23 control_probe.run fixture: the values of the shared
+# contract's run fixture. Pinned in BOTH this file and
+# crates/meilynx-audit/tests/mei2603_control_probe_run_chain_round_trip.rs.
+V1_23_CONTROL_PROBE_RUN_FIXTURE_HASH = "67328f3cb41958f060d46ec01ef547e3d53344b18f6e84d549d66cf2c16b2282"
+_V1_23_CONTROL_PROBE_RUN_FIXTURE_SETS = [
+    {"set_id": "phi-detection", "version": 1,
+     "sha256": "ce7651af1b6f4b374d3da7c16395067b82fa0a5a40805864edfecf5073405192"},
+]
+_V1_23_CONTROL_PROBE_RUN_FIXTURE_RESULTS = [
+    {"set_id": "phi-detection", "case_id": "mrn-in-user-turn", "rule_instance": "phi-detection",
+     "configured_action": "redact", "expected_detected": True, "actual_detected": True,
+     "actual_decision": "redact", "outcome": "pass", "shadow": True},
+    {"set_id": "phi-detection", "case_id": "benign-scheduling", "rule_instance": "phi-detection",
+     "configured_action": "redact", "expected_detected": False, "actual_detected": False,
+     "actual_decision": "allow", "outcome": "pass", "shadow": True},
+]
+_V1_23_CONTROL_PROBE_RUN_FIXTURE_PAYLOAD = {
+    "run_id": "5b0c8f3e-2d1a-4c55-9a77-0f1e2d3c4b5a",
+    "started_at": "2026-11-21T10:00:00Z",
+    "finished_at": "2026-11-21T10:00:01Z",
+    "bundle_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+    "policy_version": "v7",
+    "evidence_mode": "local_chain",
+    "shadow_mode": True,
+    "sets_sha256": "44d66f6269833264ffe33e2ec63025e2af65e060250792f7f11f9a375567e02c",
+    "passed": 2,
+    "failed": 0,
+    "not_applicable": 0,
+    "results_sha256": "1b99f395eb2b3e0b51a13fe89e1419102cc527385ec3abb5888760483719b3bc",
+}
 V1_2_AUTH_SESSION_STARTED_FIXTURE_HASH = "108135332a58650a37df2c3f6a55d752a6d444ac73ace1be9a9ffe5f7bb445c5"
 # v1.3 admin.action fixture. Paired with
 # meilynx-audit/tests/mei1048_admin_chain_round_trip.rs::mei1048_v1_3_admin_action_fixture_hash_pinned;
@@ -7142,6 +7471,7 @@ def recompute_event_hash(event, seq, previous_hash):
         model_executed=event.get('model_executed'),
         compliance_record=event.get('compliance_record'),
         judgment_verdict=event.get('judgment_verdict'),
+        control_probe_run=event.get('control_probe_run'),
     )
 
 
@@ -7675,7 +8005,7 @@ def boundary_key_of(event):
     return raw, None
 
 
-# The evidence-key seals a gateway writes on its chain (ADR-0113 D7, D9).
+# The evidence-key seals a gateway writes on its chain.
 # `evidence_key_signing_stopped` is signed by the key in force; records after
 # it may be unsigned until the next chain_signing_started, and a record signed
 # in that stretch is checked but never credited as attested (the key awaits
@@ -7724,7 +8054,7 @@ def evidence_seal_of(event):
 
 
 def key_rotation_message(statement):
-    """The bytes the old key signs for a rotation (ADR-0113 D7)."""
+    """The bytes the old key signs for a rotation."""
     return KEY_ROTATION_DOMAIN + jcs_dumps(statement).encode('utf-8')
 
 
@@ -7759,8 +8089,8 @@ def key_rotation_problem(statement, signature, old_key):
 
 
 def _seal_metadata_problem(action, meta):
-    """None when an evidence-key seal's metadata has the fields ADR-0113
-    defines for it, else the problem."""
+    """None when an evidence-key seal's metadata has the fields the
+    evidence-key design defines for it, else the problem."""
     if action == EVIDENCE_KEY_SIGNING_STOPPED:
         if not _is_fingerprint(meta.get('fingerprint')) or not isinstance(meta.get('reason'), str):
             return f'{action} carries no well-formed fingerprint and reason'
@@ -7793,7 +8123,7 @@ class RecordSignatureWalk:
     for a key of its own, fails there. Without one, the verdict says the
     signatures were checked under the key the chain itself announces.
 
-    The evidence-key seals (ADR-0113) open an unsigned stretch: after
+    The evidence-key seals open an unsigned stretch: after
     `evidence_key_signing_stopped` or `evidence_key_lost`, unsigned records
     are accepted until the next boundary. A record signed after
     `evidence_key_signing_stopped` must verify and is marked pending (never
@@ -7815,7 +8145,7 @@ class RecordSignatureWalk:
         self.first_bad = None
         self.newest_fingerprint = None
         self.newest_seq = None
-        # ADR-0113: None before any boundary, then signing / stopped / lost.
+        # None before any boundary, then signing / stopped / lost.
         self.mode = None
         self.facts = []
         self.boundary_events = []
@@ -7977,8 +8307,8 @@ class RecordSignatureWalk:
                 self.facts.append((seq, chain_id, None, False))
         self.deferred = []
         # A key the control plane held back (its pending_acknowledgement stop
-        # seal is on the chain) is judged after the walk as not attested
-        # (ADR-0113 D9); the newest signature of any other key must verify
+        # seal is on the chain) is judged after the walk as not attested;
+        # the newest signature of any other key must verify
         # under a pinned key.
         held = {s['fingerprint'] for s in self.stops if s['reason'] == 'pending_acknowledgement'}
         judged = [(seq, fp) for seq, _, fp, _ in self.facts if fp is not None and fp not in held]
@@ -8253,6 +8583,16 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             report(f"FAIL seq={seq}: {problem}")
             all_passed = False
             content_ok = False
+        # A v1.23 record's hash covers the digests of the control-probe
+        # run's stored set references and case results; this recomputes
+        # them, and the counts, when the pack carries them.
+        probe_problems, probe_notes = check_control_probe_run(event)
+        for problem in probe_problems:
+            report(f"FAIL seq={seq}: {problem}")
+            all_passed = False
+            content_ok = False
+        for note in probe_notes:
+            report(f"NOTE seq={seq}: {note}")
         # A v1.16 record's hash covers the digest of its evaluation
         # outcomes; this checks the stored outcomes still match it.
         for problem in check_evaluation_trace(event):
@@ -14597,7 +14937,7 @@ def _tsa_certificates(resp):
 
 
 # ---------------------------------------------------------------------------
-# Gateway evidence key (ADR-0113, MEI-3749)
+# Gateway evidence key
 #
 # A gateway holds one Ed25519 evidence key. It signs every record
 # (`record_sig`, above), its chain heads and its pack and OCSF export
@@ -14608,7 +14948,7 @@ def _tsa_certificates(resp):
 # own key (--gateway-key; --chain-signing-key is its alias), and the verdict
 # says the key was pinned by the reader, not certified. A pack signed under
 # `meilynx.evidence.v1` checked with neither is exit 2: nothing in the pack
-# can say whose key it is (ADR-0065 D3).
+# can say whose key it is.
 #
 # Pack layout: evidence-keys/attestations.json (every attestation envelope,
 # oldest first), evidence-keys/rotations.json (optional; the chain's
@@ -14814,7 +15154,7 @@ class EvidenceKeys:
         """The raw key when `fingerprint` is attested as acknowledged_loss
         and the signature names another key_seq: a fresh incarnation signs at
         first boot under the key_seq it gave itself, before the control plane
-        assigns one (ADR-0113 D5 and D9 edits of 2026-11-16). Such a signature
+        assigns one. Such a signature
         is held back, never credited and never failed. Else None."""
         entry = self.table.get(fingerprint) if self.mode == 'attested' else None
         if entry is None or not entry['ack'] or key_seq == entry['key_seq']:
@@ -15126,7 +15466,7 @@ def evaluate_gateway_evidence(manifest, keys, walk, records, records_dir, report
             current = fingerprint
         return current
 
-    # Pending is not tampering (ADR-0113 D9): a key the control plane held
+    # Pending is not tampering: a key the control plane held
     # back seals evidence_key_signing_stopped {reason: pending_acknowledgement}
     # as the last record it signs. Its signatures up to that seal (and any it
     # made while pending) are reported as not attested, never failed; a key
@@ -15248,7 +15588,7 @@ def evaluate_gateway_evidence(manifest, keys, walk, records, records_dir, report
         held_head = attested and held_before(chain, fingerprint, head_seq) and fingerprint in announced
         # Signed under a key_seq the gateway gave itself before the control
         # plane assigned one: below the first covered sequence (judged below)
-        # it is reported, never failed (ADR-0113 D9 edit 2026-11-16).
+        # it is reported, never failed.
         early = None if held_head else keys.signed_before_assignment(fingerprint, statement['key_seq'])
         if early is not None:
             start = credit_start(fingerprint, chain)
@@ -15414,7 +15754,7 @@ def verify_ocsf_manifest_signature(manifest_bytes, signature_b64, public_point):
 
 def ocsf_signed_record_entries(manifest):
     """({sequence: event_hash}, None) for the `records` of an OCSF manifest
-    signed under `meilynx.evidence.v1` (ADR-0113 D3: every record entry
+    signed under `meilynx.evidence.v1` (every record entry
     carries its event_hash), else (None, problem)."""
     entries = manifest.get('records')
     if not isinstance(entries, list) or not entries:
@@ -15487,9 +15827,9 @@ def verify_ocsf_export(entries, pack_chain, pack_records, public_point=None, qui
     unsigned, or signed with no public key given), or CANNOT_EVALUATE.
 
     A manifest whose `signature` names the scheme `meilynx.evidence.v1` is
-    signed by the gateway evidence key (ADR-0113 D3): it is checked under the
+    signed by the gateway evidence key: it is checked under the
     keys in `evidence_keys` (EvidenceKeys), and with no pinned key it cannot
-    be evaluated. Any other manifest keeps the legacy ADR-0090 D4 form: a
+    be evaluated. Any other manifest keeps the legacy form: a
     detached ECDSA P-256 `.manifest.sig` over its bytes, checked under
     `public_point`."""
     import gzip
@@ -16156,7 +16496,7 @@ def _p256_self_test_jwk(private):
 
 
 def gateway_evidence_key_self_test():
-    """The gateway evidence key (ADR-0113) end to end on synthetic packs built
+    """The gateway evidence key end to end on synthetic packs built
     here: the test signers (38a), the platform's attestation fixture (38b),
     the attestation pin (38c), and the command line's exit codes over a
     signed pack with the right pin (38d), a wrong pin (38e), no pin (38f), a
@@ -16167,7 +16507,7 @@ def gateway_evidence_key_self_test():
     below an acknowledged key's first covered sequence (38o), the unsigned
     stretches after evidence_key_signing_stopped and evidence_key_lost (38p),
     OCSF export manifests in both signature forms (38q), and the capability
-    (38r). MEI-3749 slice 3: a pack built while a fresh key is held back
+    (38r). A pack built while a fresh key is held back
     (38s), the same with another key of the project attested (38t), a key
     that signs with no attestation and no stop seal (38u), a signed head with
     no organization or project under a reader-pinned key (38v), and the
@@ -16666,7 +17006,7 @@ def gateway_evidence_key_self_test():
               'records fails on content even when its signature verifies', f'{missing} {other} {absent}')
 
         # 38x — the signed form's mapping_version (what makes a verifier from
-        # before ADR-0113 answer "cannot evaluate") with its signature removed
+        # before the gateway evidence key answer "cannot evaluate") with its signature removed
         # fails; mapping 1 still reads a gateway-key manifest.
         stripped_path = export(tmp / 'ocsf-stripped', simple[1:4], signature=(key_a, 1))
         stripped_m = json.loads(stripped_path.read_bytes())
@@ -16684,7 +17024,7 @@ def gateway_evidence_key_self_test():
               f'a manifest stamped {OCSF_SIGNED_MAPPING_VERSION} with no signature fails; a gateway-key manifest '
               f'of mapping 1 still verifies', f'{stripped_status} {v1_status}')
 
-        # 38y — a fresh incarnation (ADR-0113 D9 edit 2026-11-16): at first
+        # 38y — a fresh incarnation: at first
         # boot its key signs as key_seq 1, the only one it knows, until the
         # control plane holds it back and assigns key_seq 4; approved, it
         # signs from first_sequences as 4. The early record, head and OCSF
@@ -16761,7 +17101,7 @@ def main():
         default=[],
         metavar='JWK',
         help=(
-            "The project's evidence attestation key (ADR-0113), pinned once out of band: a file holding "
+            "The project's evidence attestation key, pinned once out of band: a file holding "
             "the P-256 JWK, bare or as the control plane serves it ({\"keyId\": ..., \"jwk\": {...}}). "
             "Every attestation in evidence-keys/attestations.json must verify under it; the records, "
             "chain heads and manifest are then checked under the keys it attests. Repeat after a rotation "
@@ -16973,7 +17313,7 @@ def main():
         sys.exit(EXIT_CANNOT_EVALUATE)
 
     signed = pack_is_signed(manifest)
-    # A manifest signed by the gateway evidence key (ADR-0113) is judged
+    # A manifest signed by the gateway evidence key is judged
     # after the walk, under the keys the attestations (or the reader) name.
     gateway_signed = is_evidence_signed(manifest)
     evidence_keys = load_evidence_keys(manifest_path.parent, attestation_pins, chain_keys)

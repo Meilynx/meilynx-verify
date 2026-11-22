@@ -33,6 +33,13 @@ The cases:
                            four v1.22 receipts sealed breaking its rules   exit 1
   judgment-verdicts-v2-relabelled
                            a v1.22 receipt's stamp edited to v1.21         exit 1
+  control-probe-runs       two v1.23 probe runs, one with a failed case    exit 0
+                           without --allow-unsigned                        exit 3
+  control-probe-runs-edited
+                           a failed case result edited to pass             exit 1
+  control-probe-runs-miscounted
+                           a run sealed with counts its results disagree
+                           with                                            exit 1
 """
 import json
 import subprocess
@@ -44,7 +51,8 @@ VERIFIER = HERE.parent / "verify-pack.py"
 CASES = HERE / "local-chain"
 EXPECTED_CASES = {"clean", "earlier-pack", "claim-relabelled", "evidence-modes", "evidence-modes-doctored",
                   "judgment-verdicts", "judgment-verdicts-edited", "judgment-verdicts-relinked",
-                  "judgment-verdicts-v2", "judgment-verdicts-v2-malformed", "judgment-verdicts-v2-relabelled"}
+                  "judgment-verdicts-v2", "judgment-verdicts-v2-malformed", "judgment-verdicts-v2-relabelled",
+                  "control-probe-runs", "control-probe-runs-edited", "control-probe-runs-miscounted"}
 
 
 def die(msg):

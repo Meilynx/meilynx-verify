@@ -54,6 +54,10 @@ python3 verify-pack.py --records fixtures/local-chain/judgment-verdicts/records 
   --manifest fixtures/local-chain/judgment-verdicts/manifest.json --allow-unsigned
 python3 verify-pack.py --records fixtures/local-chain/judgment-verdicts-v2/records \
   --manifest fixtures/local-chain/judgment-verdicts-v2/manifest.json --allow-unsigned
+
+# 7. Verify a chain that holds scheduled control probe runs
+python3 verify-pack.py --records fixtures/local-chain/control-probe-runs/records \
+  --manifest fixtures/local-chain/control-probe-runs/manifest.json --allow-unsigned
 ```
 
 Exit codes, the same online and offline:
@@ -490,6 +494,45 @@ arguments, and a raw judgment refused for want of a permission.
 that break the v1.22 rules, and `judgment-verdicts-v2-relabelled` the clean
 chain with one receipt's stamp edited to v1.21; both exit `1`.
 
+## Control probe runs
+
+A gateway can run scheduled negative tests of its own rules: synthetic
+inputs each rule is expected to catch or let through, evaluated through its
+governance engine with the policy in force, without calling a model
+provider. Each run is sealed in the gateway's chain as one v1.23
+`control_probe_run` record. For each run the verifier checks that:
+
+- **it is intact.** Its hash recomputes, and the two parts stored beside the
+  hash, the probe sets used and the per-case results, match the digests the
+  hash covers;
+- **its parts are closed.** Each is the canonical form of a sorted array of
+  objects with exactly their listed keys and fixed vocabularies;
+- **its counts are its results'.** The passed, failed and not-applicable
+  counts the hash binds are the counts of the stored results, and the run's
+  shadow flag is set exactly when a case ran in shadow mode.
+
+An edit to any of these fails the pack at the run (exit `1`). A record whose
+parts are not in the pack is not a failure: the verifier notes that their
+digests are bound but not checked.
+
+**What a run does not show.** The record carries ids, digests, counts and
+fixed vocabularies, and no input text. A pass shows that the stated results
+were recorded and have not changed since; it does not show that the gateway
+ran the cases against the bundle it names. A case in shadow mode shows what
+the policy would have done, not that it blocked anything.
+
+```bash
+python3 verify-pack.py --records fixtures/local-chain/control-probe-runs/records \
+  --manifest fixtures/local-chain/control-probe-runs/manifest.json --allow-unsigned
+```
+
+The fixture chain holds two runs: one in shadow mode that passed every case,
+and an enforcing run with one failed case and one that did not apply.
+`control-probe-runs-edited` is the same chain with the failed case's result
+edited to a pass after sealing, and `control-probe-runs-miscounted` a run
+sealed with counts its results do not add up to; both exit `1`
+([SPEC.md](SPEC.md) §4.3).
+
 ## Further checks
 
 Each of these runs with the chain check and ranks its verdict against it by
@@ -521,6 +564,9 @@ the same exit-code precedence.
   facts and its link to the record it judged; a v1.22 record also for its
   closed parts, its input facts, its stage and its snapshot (see "Judgment
   verdict receipts").
+- **Control probe runs** (no flag). A v1.23 `control_probe_run` record is
+  checked for its stored probe sets and case results and for its counts
+  (see "Control probe runs").
 - **Gateway evidence key** (`--attestation-key JWK` or `--gateway-key KEY`).
   Attestations, record signatures, signed chain heads and evidence-key
   manifest signatures (see "Gateway evidence key").
@@ -592,7 +638,7 @@ It does **not** prove:
 ## Versions
 
 The verifier understands chain records with `schema_version` v1 through
-v1.22, stored per record or in segment objects, and pack manifests 1.0
+v1.23, stored per record or in segment objects, and pack manifests 1.0
 through 1.5 (1.1 adds chain-head anchors, 1.2 the storage layout, 1.3 the
 control-plane chain, 1.4 the evidence class label, 1.5 the content-stripped
 pack with its hash-only stubs). It declares the pack features it checks in
@@ -602,8 +648,8 @@ pack with its hash-only stubs). It declares the pack features it checks in
 `per-tenant-signer-v1`, `evidence-class-v1`, `content-stripped-v1`,
 `customer-conditions-v1`, `record-signatures-v1`, `compliance-records-v1`,
 `local-chain-evidence-v1`, `coverage-claim-v1`, `evidence-modes-v1`,
-`gateway-evidence-key-v1`, `judgment-verdicts-v1` and
-`judgment-verdicts-v2`. A record of an unknown
+`gateway-evidence-key-v1`, `judgment-verdicts-v1`,
+`judgment-verdicts-v2` and `control-probe-runs-v1`. A record of an unknown
 version or kind fails verification rather than being skipped; a manifest of
 an unknown version, storage layout, evidence class or content claim is
 cannot evaluate (exit `2`). Changes to the verifier are listed in
