@@ -409,6 +409,9 @@ EVIDENCE_MODE_INDEX_FIELDS = ("sequence", "mode", "source")
 # snapshot, rule digest, raw-input grant, reason code raw_input_not_permitted)
 # and the local part to `judgment_verdict_local.v2`, checks their cross-field
 # rules, and checks the snapshot against the judged record's event kind.
+# `judgment-verdicts-v3` reads v1.24 judgment.verdict records: the
+# v1.22 record and checks again, stamped v1.24 on the receipt of a
+# `pacing_limited` verdict (the eighteenth reason code) and on nothing else.
 # `coverage-claim-v1` reads a manifest's `claim`, fails a claim that
 # contradicts the manifest, and reports a verified anchor after a
 # chain_to_head claim as coverage not established (exit 4), never as a
@@ -432,7 +435,7 @@ VERIFIER_CAPABILITIES = frozenset(
      "per-tenant-signer-v1", "evidence-class-v1", "content-stripped-v1", "customer-conditions-v1",
      "record-signatures-v1", "compliance-records-v1", "local-chain-evidence-v1", "coverage-claim-v1",
      "evidence-modes-v1", "gateway-evidence-key-v1", "judgment-verdicts-v1",
-     "judgment-verdicts-v2", "control-probe-runs-v1"}
+     "judgment-verdicts-v2", "control-probe-runs-v1", "judgment-verdicts-v3"}
 )
 # The stripped profile of a manifest 1.5 Exchange pack. Mirror of
 # `exchange::STRIPPED_FIELDS` / `WITHHELD_FIELDS` / `STUB_FIELDS` /
@@ -1374,8 +1377,18 @@ JUDGMENT_VERDICT_LOCAL_FIELDS = ('schema', 'reason_text', 'reason_text_withheld'
 # preimage, so the stored form's own schema name is what tells the two
 # buckets apart: a v1.21 record carrying a v2 form is a relabelled v1.22
 # record.
-JUDGMENT_VERDICT_SCHEMA_VERSIONS = ('v1.21', 'v1.22')
+#
+# The v1.24 bucket: the v1.22 record again, stamped v1.24 on the
+# receipt of a `pacing_limited` verdict, the eighteenth reason code, and on
+# nothing else. The same feed and the same closed v2 forms; only the reason
+# list differs, so a reader that knows seventeen codes refuses the version
+# instead of reading the eighteenth as tampering. `pacing_limited` on any
+# other version is a relabelled v1.24 record, and v1.24 with any other code
+# is refused.
+JUDGMENT_VERDICT_SCHEMA_VERSIONS = ('v1.21', 'v1.22', 'v1.24')
 JUDGMENT_VERDICT_V2_SCHEMA_VERSION = 'v1.22'
+JUDGMENT_VERDICT_V2_SCHEMA_VERSIONS = ('v1.22', 'v1.24')
+JUDGMENT_VERDICT_PACING_SCHEMA_VERSION = 'v1.24'
 JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2 = 'judgment_verdict.v2'
 JUDGMENT_VERDICT_LOCAL_SCHEMA_V2 = 'judgment_verdict_local.v2'
 # Every key of the v2 uploaded form. `raw_input_grant` is the one optional
@@ -1403,13 +1416,17 @@ JUDGMENT_VERDICT_POOL_UNANSWERED_REASON_CODES = (
 JUDGMENT_VERDICT_LOCAL_FIELDS_V2 = JUDGMENT_VERDICT_LOCAL_FIELDS + ('judged_input_sha256', 'floor_triggers')
 # The closed reason-code list, in its order. The 17th,
 # `raw_input_not_permitted`, is a raw-input rule with no live covering grant.
+# The 18th, `pacing_limited`, is an item that fell off the
+# gateway's after-delivery queue while its own request pacing held it; only a
+# v1.24 record carries it.
 JUDGMENT_VERDICT_REASON_CODES = (
     'ok', 'clause_violated', 'floor_match', 'abstained', 'input_missing', 'budget_exceeded',
     'backend_timeout', 'backend_unavailable', 'backend_error', 'malformed_answer', 'backlog_dropped',
     'no_backend_configured', 'no_validated_backend', 'pack_unavailable', 'floor_unavailable',
-    'floor_triggered_unanswered', 'raw_input_not_permitted',
+    'floor_triggered_unanswered', 'raw_input_not_permitted', 'pacing_limited',
 )
 JUDGMENT_VERDICT_RAW_INPUT_NOT_PERMITTED = 'raw_input_not_permitted'
+JUDGMENT_VERDICT_PACING_LIMITED = 'pacing_limited'
 JUDGMENT_VERDICT_OUTCOMES = ('PASS', 'FLAG', 'INDETERMINATE')
 JUDGMENT_VERDICT_SOURCES = ('judge', 'floor', 'none')
 JUDGMENT_VERDICT_EXECUTIONS = ('gateway', 'pool')
@@ -1630,6 +1647,16 @@ def judgment_verdict_v2_form_problems(uploaded):
             raw and backend is None and get('verdict') == 'INDETERMINATE' and get('source') == 'none'):
         problems.append(
             f"a {JUDGMENT_VERDICT_RAW_INPUT_NOT_PERMITTED} verdict is not a raw-input INDETERMINATE "
+            f"with no source and no backend"
+        )
+    # `timing` is the rule's configured timing, not the path: a rule set
+    # before_delivery below enforce is judged after delivery, so it is not
+    # part of the shape.
+    if get('reason_code') == JUDGMENT_VERDICT_PACING_LIMITED and not (
+            backend is None and get('verdict') == 'INDETERMINATE' and get('source') == 'none'
+            and get('execution') == 'gateway'):
+        problems.append(
+            f"a {JUDGMENT_VERDICT_PACING_LIMITED} verdict is not an INDETERMINATE in gateway execution "
             f"with no source and no backend"
         )
     return problems
@@ -1911,17 +1938,34 @@ def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=N
     stage judges an mcp.tool_call. A v1.21 record checks as before; one whose stored form names
     `judgment_verdict.v2` is a relabelled v1.22 record and fails.
 
+    A v1.24 record is a v1.22 record whose sealed reason code is
+    `pacing_limited`, checked the same way. `pacing_limited` on any other
+    version is a relabelled v1.24 record, and a v1.24 record with any other
+    code fails.
+
     Returns a list of problems; empty means the record checks out. Records on
     any other schema version return no problems."""
     version = event.get('schema_version') or 'v1'
     if version not in JUDGMENT_VERDICT_SCHEMA_VERSIONS:
         return []
-    v2 = version == JUDGMENT_VERDICT_V2_SCHEMA_VERSION
+    v2 = version in JUDGMENT_VERDICT_V2_SCHEMA_VERSIONS
     fields = event.get('judgment_verdict')
     if not isinstance(fields, dict):
         return [f'{version} record carries no judgment_verdict payload']
     problems = []
     vid = fields.get('verdict_id', '?')
+    pacing_limited = fields.get('reason_code') == JUDGMENT_VERDICT_PACING_LIMITED
+    stamped_pacing = version == JUDGMENT_VERDICT_PACING_SCHEMA_VERSION
+    if pacing_limited and not stamped_pacing:
+        problems.append(
+            f"verdict receipt {vid}: a {version} record carries {JUDGMENT_VERDICT_PACING_LIMITED}, "
+            f"which only a {JUDGMENT_VERDICT_PACING_SCHEMA_VERSION} record carries"
+        )
+    if stamped_pacing and not pacing_limited:
+        problems.append(
+            f"verdict receipt {vid}: a {JUDGMENT_VERDICT_PACING_SCHEMA_VERSION} record whose reason code "
+            f"is not {JUDGMENT_VERDICT_PACING_LIMITED}"
+        )
     uploaded_json = fields.get('uploaded_json')
     if not isinstance(uploaded_json, str):
         return [f"verdict receipt {vid}: the record stores no uploaded form as text"]
@@ -4023,14 +4067,14 @@ def compute_event_hash_dispatch(
             f"{event_kind!r} event — it is hashed only in the v1.23 control_probe.run bucket."
         )
     # Fail closed. The verdict receipt payload is hashed only by the v1.21
-    # judgment.verdict hasher (the v1.21 and v1.22 buckets); anywhere else it
-    # would sit on the record unhashed.
+    # judgment.verdict hasher (the v1.21, v1.22 and v1.24 buckets); anywhere
+    # else it would sit on the record unhashed.
     if judgment_verdict is not None and (
         schema_version not in JUDGMENT_VERDICT_SCHEMA_VERSIONS or event_kind != EVENT_KIND_JUDGMENT_VERDICT
     ):
         raise ValueError(
             f"judgment_verdict payload present on a {schema_version!r} "
-            f"{event_kind!r} event — it is hashed only in the v1.21 and v1.22 judgment.verdict buckets."
+            f"{event_kind!r} event — it is hashed only in the v1.21, v1.22 and v1.24 judgment.verdict buckets."
         )
     # Fail closed. The compliance-record payload is hashed only by the v1.20
     # compliance.record hasher; anywhere else it would sit on the record
@@ -4343,7 +4387,8 @@ def compute_event_hash_dispatch(
         # Same kind-only gate posture as v1.8, v1.13, v1.15 and v1.20.
         # v1.22 is the same record and the same feed; only
         # the stamp differs, and it obliges the closed checks of the stored
-        # forms in check_judgment_verdict.
+        # forms in check_judgment_verdict. v1.24 is v1.22 again on
+        # the receipt of a `pacing_limited` verdict.
         if event_kind != EVENT_KIND_JUDGMENT_VERDICT:
             raise ValueError(
                 f"schema_version {schema_version} is defined only for "
@@ -5442,8 +5487,9 @@ def run_self_test():
             and v122_payload['local_sha256'] == V1_22_FIXTURE_LOCAL_SHA256
             and set(_V1_22_JUDGMENT_VERDICT_FIXTURE_UPLOADED) == set(JUDGMENT_VERDICT_V2_FIELDS)
             and set(_V1_22_JUDGMENT_VERDICT_FIXTURE_LOCAL) == set(JUDGMENT_VERDICT_LOCAL_FIELDS_V2)
-            and len(JUDGMENT_VERDICT_REASON_CODES) == 17
-            and JUDGMENT_VERDICT_REASON_CODES[-1] == JUDGMENT_VERDICT_RAW_INPUT_NOT_PERMITTED):
+            and len(JUDGMENT_VERDICT_REASON_CODES) == 18
+            and JUDGMENT_VERDICT_REASON_CODES[-2] == JUDGMENT_VERDICT_RAW_INPUT_NOT_PERMITTED
+            and JUDGMENT_VERDICT_REASON_CODES[-1] == JUDGMENT_VERDICT_PACING_LIMITED):
         print('SELF-TEST assertion 39d PASS: v1.22 judgment.verdict fixture hash and stored digests match, '
               'and the v1.22 stamp hashes through the v1.21 feed')
     else:
@@ -5518,12 +5564,12 @@ def run_self_test():
         'a question without p_pass': v122_with(questions__0__p_pass=...),
         'an unknown key in backend': v122_with(backend__note='x'),
         'a backend without validation_run': v122_with(backend__validation_run=...),
-        # Enums, including the 17 reason codes.
+        # Enums, including the 18 reason codes.
         'an input form outside the enum': v122_with(form=dict(input_form='mixed')),
         'a snapshot outside the enum': v122_with(form=dict(snapshot='conversation')),
         'a stage outside the enum': v122_with(form=dict(stage='during_call')),
         'a null stage': v122_with(form=dict(stage=None)),
-        'a reason code outside the 17': v122_with(form=dict(reason_code='raw_input_refused')),
+        'a reason code outside the 18': v122_with(form=dict(reason_code='raw_input_refused')),
         'a verdict outside the enum': v122_with(form=dict(verdict='MAYBE')),
         'a source outside the enum': v122_with(form=dict(source='model')),
         'an execution outside the enum': v122_with(form=dict(execution='remote')),
@@ -5713,6 +5759,77 @@ def run_self_test():
         print('SELF-TEST assertion 39f PASS: misplaced, missing and malformed v1.22 verdict payloads are refused')
     else:
         print(f'SELF-TEST assertion 39f FAIL: only {rejected} of {len(v122_refusals)} refused', file=sys.stderr)
+        ok = False
+
+    # Assertion 39g — v1.24 judgment.verdict: the receipt of a
+    # `pacing_limited` verdict, the eighteenth reason code, sealed when an
+    # item fell off the gateway's after-delivery queue while its own pacing
+    # held it. The feed is the v1.21 one, so the dispatcher routes the v1.24
+    # stamp to the same hasher and the record checks out in its one shape;
+    # `pacing_limited` relabelled v1.22 or v1.21 fails, v1.24 on any other
+    # code fails, every other shape of the code fails, and the dispatcher's
+    # fail-closed guards hold for the stamp.
+    pacing = dict(form=dict(verdict='INDETERMINATE', source='none', reason_code=JUDGMENT_VERDICT_PACING_LIMITED,
+                            questions=[], backend=None, enforceable=True, action_taken='allow',
+                            input_form='redacted', timing='after_delivery', execution='gateway',
+                            pool_verdict_id=None, latency_ms=0),
+                  drop=('raw_input_grant',), local=dict(judged_input_sha256=None, reason_text=None,
+                                                        spans=[], floor_triggers=[]))
+    v124_event = v122_with(stamp=JUDGMENT_VERDICT_PACING_SCHEMA_VERSION, **pacing)
+    v124_payload = v124_event['judgment_verdict']
+    got_v124 = compute_event_hash_v1_21_judgment_verdict(receipt=v124_payload, **v121_args)
+    dispatched_v124 = compute_event_hash_dispatch(
+        JUDGMENT_VERDICT_PACING_SCHEMA_VERSION, *(v121_args[k] for k in (
+            'sequence_number', 'timestamp_utc', 'event_id', 'request_id', 'model_requested', 'action',
+            'input_tokens', 'output_tokens', 'total_tokens', 'cache_creation_input_tokens',
+            'cache_read_input_tokens', 'cached_input_tokens', 'reasoning_tokens', 'estimated_cost_usd',
+            'previous_hash')),
+        event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=v124_payload)
+    v124_intact = check_judgment_verdict(v124_event, frozenset(), 7, llm_pack)
+
+    def paced(stamp=JUDGMENT_VERDICT_PACING_SCHEMA_VERSION, **form):
+        return v122_with(stamp=stamp, **dict(pacing, form=dict(pacing['form'], **form)))
+
+    with_backend = {k: v for k, v in pacing['form'].items() if k != 'backend'}
+    v124_edits = {
+        'pacing_limited relabelled v1.22': paced(stamp='v1.22'),
+        'pacing_limited relabelled v1.21': paced(stamp='v1.21'),
+        'v1.24 on the v1.22 fixture': v122_with(stamp=JUDGMENT_VERDICT_PACING_SCHEMA_VERSION),
+        'v1.24 on backlog_dropped': paced(reason_code='backlog_dropped'),
+        'pacing_limited with a backend': v122_with(
+            stamp=JUDGMENT_VERDICT_PACING_SCHEMA_VERSION, form=with_backend, drop=('raw_input_grant',),
+            local=dict(pacing['local'], judged_input_sha256='c' * 64)),
+        'pacing_limited in the pool': paced(execution='pool'),
+        'pacing_limited from the judge': paced(source='judge'),
+        'pacing_limited that is a FLAG': paced(verdict='FLAG'),
+    }
+    v124_caught = {name: bool(check_judgment_verdict(e, frozenset(), 7, llm_pack)) for name, e in v124_edits.items()}
+    # A rule configured before_delivery below enforce is judged after
+    # delivery, through the queue: its record keeps the configured timing.
+    v124_configured_before = check_judgment_verdict(paced(timing='before_delivery'), frozenset(), 7, llm_pack)
+    rejected = 0
+    v124_refusals = (
+        dict(event_kind=EVENT_KIND_LLM_REQUEST, judgment_verdict=v124_payload),
+        dict(event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=None),
+    )
+    for refusal in v124_refusals:
+        try:
+            compute_event_hash_dispatch(JUDGMENT_VERDICT_PACING_SCHEMA_VERSION, *base_args, **refusal)
+        except ValueError:
+            rejected += 1
+    if (got_v124 == dispatched_v124 and recompute_event_hash(v124_event, 7, 'b' * 64) == got_v124
+            and not v124_intact and not v124_configured_before
+            and all(v124_caught.values()) and len(v124_caught) == 8
+            and rejected == len(v124_refusals)
+            and JUDGMENT_VERDICT_PACING_SCHEMA_VERSION in JUDGMENT_VERDICT_SCHEMA_VERSIONS
+            and 'judgment-verdicts-v3' in VERIFIER_CAPABILITIES):
+        print('SELF-TEST assertion 39g PASS: a v1.24 pacing_limited judgment.verdict recomputes through the v1.21 '
+              f'feed and checks out; {len(v124_caught)} relabels and wrong shapes are caught')
+    else:
+        print(f'SELF-TEST assertion 39g FAIL: intact {v124_intact}, configured before delivery {v124_configured_before}, '
+              f'not caught {[n for n, c in v124_caught.items() if not c]}, '
+              f'dispatched {dispatched_v124 == got_v124}, refused {rejected} of {len(v124_refusals)}',
+              file=sys.stderr)
         ok = False
 
     # Assertion 28a — v1.15 decision.receipt fixture (direct fn),

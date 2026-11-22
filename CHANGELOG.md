@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.15.0 (2026-11-22)
+
+- `verify-pack.py` from meilynx-proxy `69d533f`.
+- **Upgrade before verifying chains or packs written after this release.**
+  A verifier older than 0.15.0 fails every v1.24 record (exit 1). It never
+  reports such a chain as a pass.
+- Chain v1.24 (SPEC §4.3): the v1.22 `judgment.verdict` receipt and checks,
+  stamped v1.24 on the receipt of a verdict with the eighteenth reason code,
+  `pacing_limited`: a judgment left unanswered because the gateway's own
+  request pacing for the judge held it in the queue.
+  - Its one shape: `INDETERMINATE`, no source, gateway execution, no
+    backend. Its timing is the rule's configured timing.
+  - `pacing_limited` on v1.21 or v1.22, a v1.24 receipt with any other
+    reason code, and a v1.24 stamp on any other kind fail.
+- `VERIFIER_CAPABILITIES` adds `judgment-verdicts-v3`. Self-test assertion
+  39g pins the v1.24 receipt and eight relabels and wrong shapes.
+- Packs without v1.24 records verify as before.
+
 ## 0.14.0 (2026-11-22)
 
 - `verify-pack.py` from meilynx-proxy `ae7afa2`.
