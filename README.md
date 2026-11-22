@@ -413,7 +413,7 @@ where each record comes from.
 A gateway can run judgments: checks of a model request against an
 organization's policy, each with a verdict (`PASS`, `FLAG` or
 `INDETERMINATE`) and a reason code. Every verdict is sealed in the
-gateway's chain as a receipt (a v1.21 or v1.22 `judgment_verdict` record),
+gateway's chain as a receipt (a v1.21, v1.22 or v1.24 `judgment_verdict` record),
 after the request it judged and on the same chain. For each receipt the
 verifier checks that:
 
@@ -452,6 +452,13 @@ verifier checks that:
   (`tool_arguments`, exactly at the `tool_call` stage). When the pack holds
   the judged record, `tool_arguments` and the `tool_call` stage must judge
   an MCP tool call, and the other snapshots a model request.
+
+A v1.24 receipt is a v1.22 receipt for one new reason code,
+`pacing_limited`: a judgment left unanswered because the gateway's own
+request pacing for the judge held it in the queue. It is always an
+`INDETERMINATE` from no source, settled at the gateway, with no backend.
+The code on any other version, or a v1.24 stamp on any other code, fails
+the receipt.
 
 `rule_sha256` is the digest of the rule as the gateway received it; the pack
 does not hold the rule, so the verifier checks only its format. The
@@ -559,11 +566,12 @@ the same exit-code precedence.
   verdict for the condition set whose digest you hold, counting the records
   in the window sealed under it, its gaps and its exceptions
   ([SPEC.md](SPEC.md) §10).
-- **Judgment verdict receipts** (no flag). A v1.21 or v1.22
+- **Judgment verdict receipts** (no flag). A v1.21, v1.22 or v1.24
   `judgment_verdict` record is checked for its stored parts, its sealed
-  facts and its link to the record it judged; a v1.22 record also for its
-  closed parts, its input facts, its stage and its snapshot (see "Judgment
-  verdict receipts").
+  facts and its link to the record it judged; a v1.22 or v1.24 record also
+  for its closed parts, its input facts, its stage and its snapshot, and a
+  v1.24 record for the one shape of a `pacing_limited` verdict (see
+  "Judgment verdict receipts").
 - **Control probe runs** (no flag). A v1.23 `control_probe_run` record is
   checked for its stored probe sets and case results and for its counts
   (see "Control probe runs").
@@ -638,7 +646,7 @@ It does **not** prove:
 ## Versions
 
 The verifier understands chain records with `schema_version` v1 through
-v1.23, stored per record or in segment objects, and pack manifests 1.0
+v1.24, stored per record or in segment objects, and pack manifests 1.0
 through 1.5 (1.1 adds chain-head anchors, 1.2 the storage layout, 1.3 the
 control-plane chain, 1.4 the evidence class label, 1.5 the content-stripped
 pack with its hash-only stubs). It declares the pack features it checks in
@@ -649,7 +657,8 @@ pack with its hash-only stubs). It declares the pack features it checks in
 `customer-conditions-v1`, `record-signatures-v1`, `compliance-records-v1`,
 `local-chain-evidence-v1`, `coverage-claim-v1`, `evidence-modes-v1`,
 `gateway-evidence-key-v1`, `judgment-verdicts-v1`,
-`judgment-verdicts-v2` and `control-probe-runs-v1`. A record of an unknown
+`judgment-verdicts-v2`, `control-probe-runs-v1` and `judgment-verdicts-v3`.
+A record of an unknown
 version or kind fails verification rather than being skipped; a manifest of
 an unknown version, storage layout, evidence class or content claim is
 cannot evaluate (exit `2`). Changes to the verifier are listed in

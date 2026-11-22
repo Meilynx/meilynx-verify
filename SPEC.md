@@ -5,7 +5,7 @@ enough that a verifier can be written from it without reading Meilynx code.
 `verify-pack.py` in this repository is one such verifier; its `--self-test`
 pins the values below against fixture hashes.
 
-Status: describes chain records with `schema_version` v1 through v1.23, the
+Status: describes chain records with `schema_version` v1 through v1.24, the
 per-record and segment storage layouts, pack manifest `schema_version` 1.0
 through 1.5, the control-plane chain a 1.3 manifest carries, the per-tenant
 pack signature, the local-chain evidence class (§6.5), the manifest's
@@ -100,7 +100,7 @@ Every record carries at least these fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.23"`). Absent means `"v1"`. |
+| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.24"`). Absent means `"v1"`. |
 | `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`, `decision_receipt`, `compliance_record`, `judgment_verdict`). Absent means `llm_request`. |
 | `sequence_number` | integer | Position in the chain, starting at 0. |
 | `timestamp_utc` | string | RFC 3339 UTC timestamp, nanosecond precision, `Z` suffix. |
@@ -580,7 +580,7 @@ digit; *hex* is 1 to 128 hex digits):
 | `pack` | `{ "version": unsigned integer or null, "sha256": hex }`, closed |
 | `verdict` | `PASS`, `FLAG` or `INDETERMINATE` |
 | `source` | `judge`, `floor` or `none` |
-| `reason_code` | one of `ok`, `clause_violated`, `floor_match`, `abstained`, `input_missing`, `budget_exceeded`, `backend_timeout`, `backend_unavailable`, `backend_error`, `malformed_answer`, `backlog_dropped`, `no_backend_configured`, `no_validated_backend`, `pack_unavailable`, `floor_unavailable`, `floor_triggered_unanswered`, `raw_input_not_permitted` |
+| `reason_code` | one of `ok`, `clause_violated`, `floor_match`, `abstained`, `input_missing`, `budget_exceeded`, `backend_timeout`, `backend_unavailable`, `backend_error`, `malformed_answer`, `backlog_dropped`, `no_backend_configured`, `no_validated_backend`, `pack_unavailable`, `floor_unavailable`, `floor_triggered_unanswered`, `raw_input_not_permitted`; on v1.24 only, `pacing_limited` |
 | `enforceable` | boolean |
 | `questions` | a list of closed objects `{ "id": code, "clause_sha256": hex, "outcome": PASS, FLAG or INDETERMINATE, "p", "p_pass", "flag_at", "pass_at": number or null }` |
 | `execution` | `gateway` or `pool` |
@@ -699,6 +699,23 @@ binds. A case in shadow mode shows what the policy would have done, not that
 it blocked anything. A pass of the run says nothing of a rule no delivered
 set covers.
 
+**v1.24 `judgment.verdict`**: the v1.22 record, preimage, uploaded form and
+local part, unchanged, with every v1.22 check. The stamp marks the receipt
+of a verdict whose reason code is `pacing_limited`, the eighteenth code: a
+judgment that left the gateway's after-delivery queue unanswered because the
+gateway's own request pacing for the judge backend held it. A reader that
+knows seventeen codes refuses the version instead of reading the new code as
+tampering. The receipt has one shape: `verdict` `INDETERMINATE`, `source`
+`none`, `execution` `gateway` and `backend` `null`. `timing` is the rule's
+configured timing, so it can be either value. A `pacing_limited` receipt on
+any other version, a v1.24 receipt with any other reason code, and a v1.24
+stamp on any other kind fail verification.
+
+What a v1.24 receipt does not show: that pacing was the cause, or that the
+configured rate was the one in force; only that the gateway recorded the
+judgment as left unanswered for that reason, and that the record has not
+changed since.
+
 MCP kinds are: `mcp.tool_call`, `mcp.policy_decision`, `mcp.tool_result`,
 `mcp.tools_list.served`, `mcp.error`, `mcp.catalog_drift`. Any MCP hasher
 called with a non-MCP kind is an error.
@@ -714,8 +731,8 @@ asserted-claims digest (§4.5), for v1.16, v1.18 and v1.19 records the
 evaluation outcome digest, for v1.15 records the evidence-set digest (§4.3),
 for v1.18 and v1.19 records the customer label digest (§4.6), for v1.20
 records the stored-record, file-content and findings digests (§4.3), and for
-v1.21 and v1.22 records the digests of the uploaded form and the local part,
-and for v1.23 records the digests of the probe sets and the case results
+v1.21, v1.22 and v1.24 records the digests of the uploaded form and the local
+part, and for v1.23 records the digests of the probe sets and the case results
 (§4.3).
 
 ### 4.4 LLM content attestation (v1.10, v1.11, v1.12, v1.16, v1.18, v1.19)
@@ -1522,8 +1539,8 @@ since; the chain hashes attest the records.
   v1.18 and v1.19 records the plain `customer_id` is stored but not hashed;
   `label_sha256` binds it only when `source` is `asserted` (§4.6). On v1.20
   records the stored item, its file bytes and its findings are bound through
-  `record_sha256`, `content_sha256` and `findings_sha256` (§4.3). On v1.21
-  and v1.22 records the uploaded form and the local part are bound through
+  `record_sha256`, `content_sha256` and `findings_sha256` (§4.3). On v1.21,
+  v1.22 and v1.24 records the uploaded form and the local part are bound through
   `uploaded_sha256` and `local_sha256` (§4.3). On v1.23 records the probe
   sets and case results are bound through `sets_sha256` and
   `results_sha256` (§4.3). On LLM
