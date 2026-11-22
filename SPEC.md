@@ -5,7 +5,7 @@ enough that a verifier can be written from it without reading Meilynx code.
 `verify-pack.py` in this repository is one such verifier; its `--self-test`
 pins the values below against fixture hashes.
 
-Status: describes chain records with `schema_version` v1 through v1.22, the
+Status: describes chain records with `schema_version` v1 through v1.23, the
 per-record and segment storage layouts, pack manifest `schema_version` 1.0
 through 1.5, the control-plane chain a 1.3 manifest carries, the per-tenant
 pack signature, the local-chain evidence class (§6.5), the manifest's
@@ -100,7 +100,7 @@ Every record carries at least these fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.22"`). Absent means `"v1"`. |
+| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.23"`). Absent means `"v1"`. |
 | `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`, `decision_receipt`, `compliance_record`, `judgment_verdict`). Absent means `llm_request`. |
 | `sequence_number` | integer | Position in the chain, starting at 0. |
 | `timestamp_utc` | string | RFC 3339 UTC timestamp, nanosecond precision, `Z` suffix. |
@@ -645,6 +645,60 @@ checked; the verifier cannot tell whether a permission named by
 partial was in fact not seen whole, only that the receipt states these facts
 consistently.
 
+**v1.23 `control_probe.run`**: a new kind with a bucket of its own. From
+`control_probe_run`, after the kind attestation: `run_id`, `started_at`,
+`finished_at`, `bundle_sha256`, `policy_version`, `evidence_mode`
+(length-prefixed strings, §3), `shadow_mode` (one byte, `0x01` for true or
+`0x00` for false), `sets_sha256` (length-prefixed string), `passed`,
+`failed`, `not_applicable` (u64), `results_sha256` (length-prefixed string).
+28 fields. Every field is required; a field that is absent or of another
+type leaves the record with no defined preimage and fails verification. v1.23
+holds no other kind, and a `control_probe_run` payload on any other version
+or kind fails.
+
+A probe run records one scheduled run of synthetic negative tests through the
+gateway's governance engine, with the policy in force: each case is a
+synthetic input with the detection the rule is expected to reach, evaluated
+against the one rule instance under test. The run names the policy bundle
+(`bundle_sha256`, `policy_version`), the gateway's evidence mode
+(`write_once` or `local_chain`), whether any case ran in shadow mode
+(`shadow_mode`) and the counts of its case outcomes. It is not traffic: a
+probe makes no upstream call and writes no request record.
+
+Two parts are stored beside the hash and bound by digests the hash covers:
+
+- `sets_json`, the probe sets the run used: the RFC 8785 serialization of
+  the array of closed objects `{ "set_id": string, "version": unsigned
+  integer, "sha256": 64 lowercase hex }`, sorted by `set_id`, `version`,
+  `sha256`. Its SHA-256 is `sets_sha256`.
+- `results_json`, the per-case results: the RFC 8785 serialization of the
+  array of closed objects `{ "set_id", "case_id", "rule_instance": string,
+  "configured_action": "block" | "redact" | "warn" | "flag" | "hold",
+  "expected_detected", "actual_detected": boolean, "actual_decision":
+  "block" | "redact" | "flag" | "hold" | "allow", "outcome": "pass" |
+  "fail" | "not_applicable", "shadow": boolean }`, sorted by `set_id`,
+  `case_id`, `rule_instance`. `set_id` and `case_id` are 3 to 64
+  characters of lowercase letters, digits and hyphens, starting with a
+  letter or digit; `rule_instance` is a non-empty string. Its SHA-256 is
+  `results_sha256`.
+
+When the record carries a stored part, the verifier checks that it hashes to
+its digest, that it is the canonical form of the sorted array of closed
+objects, that `passed`, `failed` and `not_applicable` are the counts of the
+results' outcomes, and that `shadow_mode` is true exactly when some result
+is in shadow. It also checks that the three digests are 64 lowercase hex and
+that `evidence_mode` is `write_once` or `local_chain`. A record without a
+stored part is not a failure: the verifier says the digest is bound but not
+checked. The parts hold ids, digests, booleans and fixed vocabularies; no
+input text of a case.
+
+What a probe run does not show: that the gateway ran the cases it names, or
+ran them against the bundle it names; only that the stated results were
+recorded and have not changed since, and agree with the counts the hash
+binds. A case in shadow mode shows what the policy would have done, not that
+it blocked anything. A pass of the run says nothing of a rule no delivered
+set covers.
+
 MCP kinds are: `mcp.tool_call`, `mcp.policy_decision`, `mcp.tool_result`,
 `mcp.tools_list.served`, `mcp.error`, `mcp.catalog_drift`. Any MCP hasher
 called with a non-MCP kind is an error.
@@ -660,7 +714,8 @@ asserted-claims digest (§4.5), for v1.16, v1.18 and v1.19 records the
 evaluation outcome digest, for v1.15 records the evidence-set digest (§4.3),
 for v1.18 and v1.19 records the customer label digest (§4.6), for v1.20
 records the stored-record, file-content and findings digests (§4.3), and for
-v1.21 and v1.22 records the digests of the uploaded form and the local part
+v1.21 and v1.22 records the digests of the uploaded form and the local part,
+and for v1.23 records the digests of the probe sets and the case results
 (§4.3).
 
 ### 4.4 LLM content attestation (v1.10, v1.11, v1.12, v1.16, v1.18, v1.19)
@@ -1469,7 +1524,9 @@ since; the chain hashes attest the records.
   records the stored item, its file bytes and its findings are bound through
   `record_sha256`, `content_sha256` and `findings_sha256` (§4.3). On v1.21
   and v1.22 records the uploaded form and the local part are bound through
-  `uploaded_sha256` and `local_sha256` (§4.3). On LLM
+  `uploaded_sha256` and `local_sha256` (§4.3). On v1.23 records the probe
+  sets and case results are bound through `sets_sha256` and
+  `results_sha256` (§4.3). On LLM
   records before v1.19 `policy_version` and `model_executed` are stored but
   not hashed (v1.19 binds both, §4.3), and on every MCP record
   `mcp_event.finding_summary` is; the customer-conditions verdict (§10) says

@@ -1,0 +1,28 @@
+{
+  "runs": [
+    {
+      "absent": [
+        "FAIL",
+        "NOTE seq="
+      ],
+      "args": [
+        "--allow-unsigned"
+      ],
+      "contains": [
+        "CLAIM: the whole chain proxy from seq=0 up to its head at seq=1",
+        "AUTHENTICITY NOT ESTABLISHED"
+      ],
+      "exit": 0
+    },
+    {
+      "absent": [
+        "FAIL"
+      ],
+      "args": [],
+      "contains": [
+        "AUTHENTICITY NOT ESTABLISHED"
+      ],
+      "exit": 3
+    }
+  ]
+}

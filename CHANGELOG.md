@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.14.0 (2026-11-22)
+
+- `verify-pack.py` from meilynx-proxy `ae7afa2`.
+- **Upgrade before verifying chains or packs written after this release.**
+  A verifier older than 0.14.0 fails every v1.23 record (exit 1). It never
+  reports such a chain as a pass.
+- Chain v1.23 (SPEC §4.3): a new kind, `control_probe.run`, one record per
+  scheduled run of synthetic negative tests through the gateway's governance
+  engine with the policy in force. 28 hashed fields: the kind attestation,
+  then the run id, its start and finish times, the bundle digest and policy
+  version in force, the evidence mode, the shadow flag, the digest of the
+  probe sets, the passed, failed and not-applicable counts, and the digest
+  of the per-case results.
+  - The probe sets and the per-case results are stored beside the hash. The
+    verifier recomputes both digests, checks that each part is the canonical
+    form of a sorted array of closed objects, that the counts are the
+    results' outcome counts, and that the shadow flag is set exactly when a
+    case ran in shadow mode.
+  - A record without its stored parts is noted as bound but not checked,
+    never failed.
+  - v1.23 holds no other kind, and a probe-run payload on any other version
+    or kind fails.
+- `VERIFIER_CAPABILITIES` adds `control-probe-runs-v1`. Self-test assertion
+  40a pins the v1.23 fixture.
+- New fixtures under `fixtures/local-chain/`: two probe runs (exit 0, or 3
+  without `--allow-unsigned`), the same chain with a failed case's result
+  edited to a pass (exit 1), and a run sealed with counts its results do not
+  add up to (exit 1).
+- Comments and one help string no longer carry internal tracking
+  identifiers. No verification rule changes.
+- Packs without v1.23 records verify as before.
+
 ## 0.13.0 (2026-11-20)
 
 - `verify-pack.py` from meilynx-proxy `f80356e`.

@@ -37,6 +37,10 @@ Where the records come from:
   PASS judged on the redacted forwarded request; a PASS judged on the tool
   call's arguments; and a raw_input_not_permitted verdict, which reached no
   backend).
+- The control-probe cases are a fourth such chain: two v1.23
+  control_probe.run records, a run in shadow mode that passed every case and
+  an enforcing run with one failed case, each storing its set references and
+  its case results beside the hash, in the shape the proxy writes them.
 
 The cases (each case's expect.json lists its runs):
 
@@ -66,6 +70,13 @@ The cases (each case's expect.json lists its runs):
   judgment-verdicts-v2-relabelled
                       the clean v1.22 chain with one receipt's stamp
                       edited to v1.21 after sealing                    exit 1
+  control-probe-runs  two v1.23 probe runs, one with a failed case     exit 0 / 3
+  control-probe-runs-edited
+                      the same records, a failed case result edited
+                      to pass after sealing                            exit 1
+  control-probe-runs-miscounted
+                      a run sealed with counts its results do not
+                      add up to                                        exit 1
 
 Everything is synthetic: fixed timestamps and ids, no real content.
 """
@@ -667,6 +678,126 @@ def verdict_v2_cases(root):
     ]})
 
 
+# Synthetic probe set digests and bundle digest: the verifier checks a run
+# against its own stored parts, not against a delivered set or bundle.
+PROBE_SETS = [
+    {"set_id": "phi-detection", "version": 1, "sha256": "c" * 64},
+    {"set_id": "secrets-detection", "version": 1, "sha256": "d" * 64},
+]
+
+
+def probe_result(set_id, case_id, action, expected, detected, decision, outcome, shadow):
+    return {"set_id": set_id, "case_id": case_id, "rule_instance": set_id, "configured_action": action,
+            "expected_detected": expected, "actual_detected": detected, "actual_decision": decision,
+            "outcome": outcome, "shadow": shadow}
+
+
+def probe_run_record(n, run_id, started, finished, results, evidence_mode, counts=None):
+    """One v1.23 control_probe.run record with its stored set references and
+    case results. `counts` overrides the counts the hash binds (passed,
+    failed, not_applicable), for a run that misstates them."""
+    sets_json = vp.jcs_dumps(sorted(PROBE_SETS, key=lambda x: (x["set_id"], x["version"], x["sha256"])))
+    ordered = sorted(results, key=lambda r: (r["set_id"], r["case_id"], r["rule_instance"]))
+    results_json = vp.jcs_dumps(ordered)
+    if counts is None:
+        counts = tuple(sum(1 for r in results if r["outcome"] == o) for o in vp.CONTROL_PROBE_OUTCOMES)
+    return {
+        "schema_version": "v1.23", "event_kind": "control_probe_run", "timestamp_utc": finished,
+        "event_id": f"00000000-0000-4000-8000-0000000f30{n:02d}",
+        "request_id": f"00000000-0000-4000-8000-0000000f31{n:02d}",
+        "model_requested": "", "action": "allow", "input_tokens": 0, "output_tokens": 0,
+        "estimated_cost_usd": None, "findings": [], "messages": [], "response_text": None,
+        "control_probe_run": {
+            "run_id": run_id, "started_at": started, "finished_at": finished,
+            "bundle_sha256": "e" * 64, "policy_version": "v3", "evidence_mode": evidence_mode,
+            "shadow_mode": any(r["shadow"] for r in results),
+            "sets_sha256": vp.hashlib.sha256(sets_json.encode("utf-8")).hexdigest(),
+            "passed": counts[0], "failed": counts[1], "not_applicable": counts[2],
+            "results_sha256": vp.hashlib.sha256(results_json.encode("utf-8")).hexdigest(),
+            "sets_json": sets_json, "results_json": results_json,
+        },
+    }
+
+
+SHADOW_RUN = "6c1d9f4a-3e2b-4d66-8b88-1a2b3c4d5e01"
+ENFORCING_RUN = "6c1d9f4a-3e2b-4d66-8b88-1a2b3c4d5e02"
+
+
+def probe_chain(miscounted=False):
+    """A run in shadow mode on a local_chain gateway that passed every case
+    (0) and an enforcing run on the same gateway with one failed case and one
+    case that did not apply (1). With `miscounted`, run 1 is sealed with
+    counts that say every case passed."""
+    genesis = vp.genesis_hash()
+    records, prev = [], genesis
+    shadow = [
+        probe_result("phi-detection", "mrn-in-user-turn", "redact", True, True, "redact", "pass", True),
+        probe_result("phi-detection", "benign-scheduling", "redact", False, False, "allow", "pass", True),
+        probe_result("secrets-detection", "cloud-key-in-tool-args", "block", True, True, "block", "pass", True),
+    ]
+    enforcing = [
+        probe_result("phi-detection", "mrn-in-user-turn", "redact", True, True, "redact", "pass", False),
+        probe_result("phi-detection", "dob-and-name", "redact", True, False, "allow", "fail", False),
+        probe_result("secrets-detection", "cloud-key-in-tool-args", "block", True, False, "allow",
+                     "not_applicable", False),
+    ]
+    runs = [
+        probe_run_record(0, SHADOW_RUN, "2026-11-21T10:00:00Z", "2026-11-21T10:00:01Z", shadow, "local_chain"),
+        probe_run_record(1, ENFORCING_RUN, "2026-11-22T10:00:00Z", "2026-11-22T10:00:01Z", enforcing,
+                         "local_chain", counts=(3, 0, 0) if miscounted else None),
+    ]
+    for event in runs:
+        event["sequence_number"] = len(records)
+        event["previous_hash"] = prev
+        event["event_hash"] = vp.recompute_event_hash(event, event["sequence_number"], prev)
+        prev = event["event_hash"]
+        records.append(event)
+    return genesis, records
+
+
+def probe_cases(root):
+    genesis, records = probe_chain()
+    head = records[-1]["sequence_number"]
+    base = unanchored_base(genesis, records, "00000000-0000-4000-8000-0000000f3f00", "2026-11-22T11:00:00Z")
+
+    out = root / "control-probe-runs"
+    write_records(out, records)
+    write_case(out, local_manifest(base, head), {"runs": [
+        {"args": ["--allow-unsigned"], "exit": 0, "contains": [
+            f"CLAIM: the whole chain proxy from seq=0 up to its head at seq={head}",
+            "AUTHENTICITY NOT ESTABLISHED"],
+         "absent": ["FAIL", "NOTE seq="]},
+        {"args": [], "exit": 3, "contains": ["AUTHENTICITY NOT ESTABLISHED"], "absent": ["FAIL"]},
+    ]})
+
+    # The failed case's result edited to pass after sealing. The record's
+    # hash still recomputes (the stored results ride beside it); the stored
+    # results no longer hash to the results_sha256 it binds.
+    edited = [json.loads(json.dumps(r)) for r in records]
+    fields = edited[1]["control_probe_run"]
+    fields["results_json"] = fields["results_json"].replace('"fail"', '"pass"', 1)
+    out = root / "control-probe-runs-edited"
+    write_records(out, edited)
+    write_case(out, local_manifest(base, head), {"runs": [
+        {"args": ["--allow-unsigned"], "exit": 1, "contains": [
+            f"FAIL seq=1: probe run {ENFORCING_RUN}: the stored case results do not hash to results_sha256"],
+         "absent": ["FAIL seq=0"]},
+    ]})
+
+    # A gateway that sealed a run whose counts say every case passed. Every
+    # hash and stored digest recomputes; the counts are not its results'.
+    genesis, miscounted = probe_chain(miscounted=True)
+    base_m = unanchored_base(genesis, miscounted, "00000000-0000-4000-8000-0000000f3f01", "2026-11-22T11:00:00Z")
+    out = root / "control-probe-runs-miscounted"
+    write_records(out, miscounted)
+    write_case(out, local_manifest(base_m, head), {"runs": [
+        {"args": ["--allow-unsigned"], "exit": 1, "contains": [
+            f"FAIL seq=1: probe run {ENFORCING_RUN}: passed, failed and not_applicable are not the counts "
+            "of its results"],
+         "absent": ["FAIL seq=0"]},
+    ]})
+
+
 def main():
     root = Path(sys.argv[1]) if len(sys.argv) > 1 else HERE / "local-chain"
     if root.exists():
@@ -675,6 +806,7 @@ def main():
     mode_cases(root)
     verdict_cases(root)
     verdict_v2_cases(root)
+    probe_cases(root)
     return 0
 
 
