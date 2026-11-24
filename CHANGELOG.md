@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.16.0 (unreleased)
+## 0.16.0 (2026-11-24)
 
 - `verify-pack.py` from meilynx-proxy `e786536`.
 - **Upgrade before verifying chains or packs written after this release.**
