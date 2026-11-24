@@ -709,7 +709,7 @@ It does **not** prove:
 ## Versions
 
 The verifier understands chain records with `schema_version` v1 through
-v1.24, stored per record or in segment objects, and pack manifests 1.0
+v1.25, stored per record or in segment objects, and pack manifests 1.0
 through 1.5 (1.1 adds chain-head anchors, 1.2 the storage layout, 1.3 the
 control-plane chain, 1.4 the evidence class label, 1.5 the content-stripped
 pack with its hash-only stubs). It declares the pack features it checks in
@@ -721,7 +721,8 @@ pack with its hash-only stubs). It declares the pack features it checks in
 `local-chain-evidence-v1`, `coverage-claim-v1`, `evidence-modes-v1`,
 `gateway-evidence-key-v1`, `judgment-verdicts-v1`,
 `judgment-verdicts-v2`, `control-probe-runs-v1`, `judgment-verdicts-v3`,
-`witness-file-v1` and `verification-receipt-v1`.
+`witness-file-v1`, `verification-receipt-v1`, `context-provenance-v1` and
+`provenance-verifications-v1`.
 A record of an unknown
 version or kind fails verification rather than being skipped; a manifest of
 an unknown version, storage layout, evidence class or content claim is
