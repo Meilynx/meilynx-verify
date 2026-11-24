@@ -449,6 +449,19 @@ EVIDENCE_MODE_INDEX_FIELDS = ("sequence", "mode", "source")
 # contradicts a counted witnessed head fails, and one that ends before it is
 # coverage not established (exit 4). `verification-receipt-v1` writes the
 # run's content-free `meilynx.verification_receipt.v1` (--receipt).
+# `context-provenance-v1` reads v1.25 llm_request records: recomputes the
+# hash with the context provenance digest, recomputes that digest from the
+# stored provenance list (list integrity), and, where the record retains its
+# messages as captured (capture policy `full`, stored prompt digest equal to
+# the captured one), checks that every tool-result block and every declared
+# block has exactly one entry at its locator with the block's sha256 and
+# bytes. Otherwise it reports "content not retained: list integrity only",
+# never a failure and never a content pass.
+# `provenance-verifications-v1` reads the v1.25 provenance.verification
+# record (a gateway's own run of the checks above over a window of its
+# llm_request records): recomputes its hash and checks its window and that
+# its counts add up. `provenance_check_outcome` is the classification such a
+# run counts, so anyone can recount a window from the records in a pack.
 VERIFIER_CAPABILITIES = frozenset(
     {"chain-anchors-v1", "segmented-records-v1", "decision-receipts-v1", "evaluation-trace-v1",
      "data-reach-evidence-v1", "control-plane-chain-v1", "ocsf-export-v1", "customer-scope-v1",
@@ -456,7 +469,7 @@ VERIFIER_CAPABILITIES = frozenset(
      "record-signatures-v1", "compliance-records-v1", "local-chain-evidence-v1", "coverage-claim-v1",
      "evidence-modes-v1", "gateway-evidence-key-v1", "judgment-verdicts-v1",
      "judgment-verdicts-v2", "control-probe-runs-v1", "judgment-verdicts-v3", "witness-file-v1",
-     "verification-receipt-v1"}
+     "verification-receipt-v1", "context-provenance-v1", "provenance-verifications-v1"}
 )
 # The stripped profile of a manifest 1.5 Exchange pack. Mirror of
 # `exchange::STRIPPED_FIELDS` / `WITHHELD_FIELDS` / `STUB_FIELDS` /
@@ -643,6 +656,8 @@ EVENT_KIND_COMPLIANCE_RECORD = 'compliance.record'
 EVENT_KIND_JUDGMENT_VERDICT = 'judgment.verdict'
 # The scheduled control-probe run kind (v1.23 bucket).
 EVENT_KIND_CONTROL_PROBE_RUN = 'control_probe.run'
+# The provenance verification kind (v1.25 bucket).
+EVENT_KIND_PROVENANCE_VERIFICATION = 'provenance.verification'
 
 MCP_EVENT_KINDS = {
     EVENT_KIND_MCP_TOOL_CALL,
@@ -677,6 +692,8 @@ SERDE_EVENT_KIND_TO_WIRE = {
     'judgment_verdict': EVENT_KIND_JUDGMENT_VERDICT,
     # Serde snake_case form of the v1.23 kind.
     'control_probe_run': EVENT_KIND_CONTROL_PROBE_RUN,
+    # Serde snake_case form of the v1.25 verification kind.
+    'provenance_verification': EVENT_KIND_PROVENANCE_VERIFICATION,
 }
 
 
@@ -1927,6 +1944,108 @@ def check_control_probe_run(event):
     return problems, notes
 
 
+# The v1.25 provenance.verification bucket.
+PROVENANCE_VERIFICATION_SCHEMA_VERSION = 'v1.25'
+# The payload feed: (field, kind) in `ProvenanceVerificationFields`
+# struct-definition order. `str` feeds length-prefixed (the v1.19 feed),
+# `u64` 8 little-endian bytes. Every member is fed; nothing rides beside it.
+PROVENANCE_VERIFICATION_FEED = (
+    ('verification_id', 'str'), ('window_start', 'str'), ('cutoff', 'str'),
+    ('verifier_version', 'str'), ('evidence_mode', 'str'),
+    ('eligible_calls', 'u64'), ('complete_verified', 'u64'), ('integrity_only', 'u64'),
+    ('missing_list', 'u64'), ('integrity_failures', 'u64'), ('records_unreadable', 'u64'),
+)
+PROVENANCE_VERIFIER_VERSIONS = ('provenance-check.v1',)
+PROVENANCE_EVIDENCE_MODES = ('write_once', 'local_chain')
+_UUID = re.compile(r'\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z')
+
+
+def compute_event_hash_v1_25_provenance_verification(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    verification,
+):
+    """v1.25 provenance.verification hash. `verification` is a dict matching
+    `ProvenanceVerificationFields`. Mirror of
+    `compute_event_hash_v1_25_provenance_verification` in sqlite.rs: the SAME
+    v1.2 prefix, then the event_kind wire-name, then the 11 members in
+    `PROVENANCE_VERIFICATION_FEED` order. Its own function, not shared with
+    the v1.23 one."""
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_PROVENANCE_VERIFICATION.encode('utf-8'))
+    for name, kind in PROVENANCE_VERIFICATION_FEED:
+        value = verification.get(name)
+        if kind == 'str':
+            if not isinstance(value, str):
+                raise ValueError(f"provenance_verification.{name} is not a string, so the record has no defined preimage.")
+            h.update(encode_len_prefixed_str(value))
+        else:
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2 ** 64:
+                raise ValueError(f"provenance_verification.{name} is not an unsigned integer, so the record has no defined preimage.")
+            h.update(struct.pack('<Q', value))
+    return h.hexdigest()
+
+
+def _utc_instant(text):
+    """The instant of an RFC 3339 timestamp in UTC (`Z` or a zero offset), or
+    None."""
+    if not isinstance(text, str) or len(text) < 20:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(text.replace('Z', '+00:00').replace('z', '+00:00'))
+    except ValueError:
+        return None
+    if parsed.utcoffset() != datetime.timedelta(0):
+        return None
+    return parsed
+
+
+def check_provenance_verification(event):
+    """The checks of a v1.25 provenance.verification record that its hash does
+    not cover: the classes of its members, a window that ends after it
+    starts, and `eligible_calls` equal to the sum of the four outcome counts.
+    Returns a list of problems, each naming a member, never a value. Mirror of
+    `check_provenance_verification_fields` in meilynx-core."""
+    fields = event.get('provenance_verification')
+    if fields is None:
+        return []
+    version = event.get('schema_version') or 'v1'
+    if version != PROVENANCE_VERIFICATION_SCHEMA_VERSION:
+        return [f'{version} record carries a provenance_verification payload; it is hashed only in the v1.25 bucket']
+    if not isinstance(fields, dict) or set(fields) != {name for name, _ in PROVENANCE_VERIFICATION_FEED}:
+        return ['the provenance_verification payload is not exactly the v1.25 members']
+    problems = []
+    if not (isinstance(fields['verification_id'], str) and _UUID.match(fields['verification_id'])):
+        problems.append('provenance_verification.verification_id is not a UUID')
+    start = _utc_instant(fields['window_start'])
+    cutoff = _utc_instant(fields['cutoff'])
+    if start is None:
+        problems.append('provenance_verification.window_start is not an RFC 3339 UTC timestamp')
+    if cutoff is None:
+        problems.append('provenance_verification.cutoff is not an RFC 3339 UTC timestamp')
+    if start is not None and cutoff is not None and cutoff <= start:
+        problems.append('provenance_verification.cutoff is not after window_start')
+    if fields['verifier_version'] not in PROVENANCE_VERIFIER_VERSIONS:
+        problems.append('provenance_verification.verifier_version is not provenance-check.v1')
+    if fields['evidence_mode'] not in PROVENANCE_EVIDENCE_MODES:
+        problems.append('provenance_verification.evidence_mode is not write_once or local_chain')
+    counts = [fields[name] for name, kind in PROVENANCE_VERIFICATION_FEED if kind == 'u64']
+    if any(isinstance(c, bool) or not isinstance(c, int) or c < 0 for c in counts):
+        problems.append('provenance_verification carries a count that is not an unsigned integer')
+    elif (fields['complete_verified'] + fields['integrity_only'] + fields['missing_list']
+          + fields['integrity_failures']) != fields['eligible_calls']:
+        problems.append('provenance_verification.eligible_calls is not complete_verified + integrity_only + '
+                        'missing_list + integrity_failures')
+    return problems
+
+
 def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=None):
     """For a v1.21 record, check what the hash alone cannot.
 
@@ -2805,7 +2924,7 @@ def _trace_rules(record):
     """(rule ids, deciding rule id) of a sealed evaluation trace, else ((), None)."""
     trace = record.get('evaluation_trace')
     outcomes = trace.get('outcomes') if isinstance(trace, dict) else None
-    if record.get('schema_version') not in ('v1.16', 'v1.18', 'v1.19') or not isinstance(outcomes, dict):
+    if record.get('schema_version') not in ('v1.16', 'v1.18', 'v1.19', 'v1.25') or not isinstance(outcomes, dict):
         return (), None
     rules = outcomes.get('rules')
     ids = tuple(r.get('rule_id') for r in rules if isinstance(r, dict)) if isinstance(rules, list) else ()
@@ -3324,9 +3443,9 @@ def check_sealed_identity(event, stripped=frozenset()):
     the hash and is not re-derived."""
     version = event.get('schema_version') or 'v1'
     identity = event.get('identity')
-    if version in ('v1.14', 'v1.17', 'v1.18', 'v1.19') and identity is None:
+    if version in ('v1.14', 'v1.17', 'v1.18', 'v1.19', 'v1.25') and identity is None:
         return []
-    if version not in ('v1.12', 'v1.14', 'v1.17', 'v1.18', 'v1.19'):
+    if version not in ('v1.12', 'v1.14', 'v1.17', 'v1.18', 'v1.19', 'v1.25'):
         return []
     if not isinstance(identity, dict):
         return [f"{version} record has no identity block"]
@@ -3507,12 +3626,12 @@ def check_customer_scope(event):
     checked when present, and whole without one."""
     version = event.get('schema_version') or 'v1'
     customer = event.get('customer')
-    if version not in ('v1.18', 'v1.19'):
+    if version not in ('v1.18', 'v1.19', 'v1.25'):
         if customer is not None:
             return [f'{version} record carries a customer block; it is hashed only in the v1.18 and v1.19 buckets']
         return []
     if customer is None:
-        return [] if version == 'v1.19' else ['v1.18 record has no customer block']
+        return [] if version in ('v1.19', 'v1.25') else ['v1.18 record has no customer block']
     problem = customer_shape_problem(customer)
     if problem is not None:
         return [f'malformed customer block: {problem}']
@@ -3653,6 +3772,291 @@ def compute_event_hash_v1_19_llm_request(
     return h.hexdigest()
 
 
+def compute_event_hash_v1_25_llm_request(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    join_context, content, identity, evaluation_trace, customer,
+    policy_version, model_executed,
+):
+    """v1.25 llm_request hash: every v1.19 feed, then the context provenance
+    digest `content.provenance_sha256_jcs` (the JCS SHA-256 of the stored
+    `content.provenance` list): a presence byte, then length-prefixed when
+    present. The list itself rides beside the hash; check_context_provenance
+    recomputes the digest from it. Mirror of
+    `compute_event_hash_v1_25_llm_request` in sqlite.rs. The v1.19 feeds are
+    duplicated, not shared."""
+    if not isinstance(policy_version, str):
+        raise ValueError('schema_version v1.25 requires a policy_version string')
+    if model_executed is not None and not isinstance(model_executed, str):
+        raise ValueError('model_executed must be a string when present')
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_LLM_REQUEST.encode('utf-8'))
+    join = join_context or {}
+    h.update(encode_optional_str(join.get('correlation_id')))
+    h.update(encode_optional_str(join.get('session_id')))
+    h.update(encode_optional_str(join.get('agent_name')))
+    if content is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(content['capture_policy'].encode('utf-8'))
+        h.update(encode_optional_str(content.get('prompt_sha256_jcs')))
+        h.update(encode_optional_str(content.get('response_sha256')))
+        h.update(encode_optional_str(content.get('stored_prompt_sha256_jcs')))
+        h.update(encode_optional_str(content.get('stored_response_sha256')))
+        h.update(encode_optional_str(content.get('findings_sha256_jcs')))
+        h.update(encode_optional_str(content.get('tool_calls_sha256_jcs')))
+        h.update(encode_optional_str(content.get('stored_tool_calls_sha256_jcs')))
+    if identity is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(encode_sealed_identity(identity))
+    if evaluation_trace is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(evaluation_trace['outcomes_sha256_jcs'].encode('utf-8'))
+    if customer is None:
+        h.update(b'\x00')
+    else:
+        h.update(encode_sealed_customer(customer))
+    h.update(encode_len_prefixed_str(policy_version))
+    if model_executed is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(encode_len_prefixed_str(model_executed))
+    # The v1.25 addition.
+    digest = content.get('provenance_sha256_jcs') if isinstance(content, dict) else None
+    if digest is None:
+        h.update(b'\x00')
+    else:
+        if not isinstance(digest, str):
+            raise ValueError('content.provenance_sha256_jcs must be a string when present')
+        h.update(b'\x01')
+        h.update(encode_len_prefixed_str(digest))
+    return h.hexdigest()
+
+
+def _has_provenance(content):
+    return isinstance(content, dict) and (
+        content.get('provenance_sha256_jcs') is not None or content.get('provenance') is not None
+    )
+
+
+# ---------------------------------------------------------------------------
+# Context provenance (v1.25). Mirror of
+# meilynx-core/src/types/provenance.rs: the same units, canonical
+# bytes, labels and list, computed over the record's stored `messages`.
+# ---------------------------------------------------------------------------
+
+PROVENANCE_CONTENT_NOT_RETAINED = 'content not retained: list integrity only'
+PROVENANCE_KINDS = ('tool_result', 'declared_context')
+
+
+def _locator_key(locator):
+    """(message_index, block_index or -1) of a stored locator, or None when
+    it is not one."""
+    if not isinstance(locator, dict) or set(locator) - {'message_index', 'block_index'}:
+        return None
+    m = locator.get('message_index')
+    b = locator.get('block_index', -1)
+    if not isinstance(m, int) or isinstance(m, bool) or m < 0:
+        return None
+    if b is None or not isinstance(b, int) or isinstance(b, bool) or b < -1:
+        return None
+    return (m, b)
+
+
+def _content_blocks(message):
+    blocks = message.get('content_blocks') if isinstance(message, dict) else None
+    return blocks if isinstance(blocks, list) else None
+
+
+def provenance_block_bytes(messages, key):
+    """The canonical bytes of the message or block `key` names: JCS of a
+    message's `content_blocks` when present, else the UTF-8 bytes of its
+    `content` (empty when absent); a `text` block's `text`, else JCS of the
+    block. None when the key names nothing."""
+    m, b = key
+    if m >= len(messages) or not isinstance(messages[m], dict):
+        return None
+    message = messages[m]
+    if b == -1:
+        blocks = _content_blocks(message)
+        if blocks is not None:
+            return jcs_dumps(blocks).encode('utf-8')
+        content = message.get('content')
+        return (content if isinstance(content, str) else '').encode('utf-8')
+    blocks = _content_blocks(message)
+    if blocks is None or b >= len(blocks):
+        return None
+    block = blocks[b]
+    if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str):
+        return block['text'].encode('utf-8')
+    return jcs_dumps(block).encode('utf-8')
+
+
+def provenance_tool_result_keys(messages):
+    """Every tool-result unit: a `role: tool` message whole, and each
+    `tool_result` block of any other message."""
+    out = []
+    for i, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get('role') == 'tool':
+            out.append((i, -1))
+            continue
+        for j, block in enumerate(_content_blocks(message) or []):
+            if isinstance(block, dict) and block.get('type') == 'tool_result':
+                out.append((i, j))
+    return out
+
+
+def check_context_provenance(event, stripped=frozenset()):
+    """For a v1.25 llm_request, what its hash cannot show of the context
+    provenance list. Returns (problems, notes).
+
+    List integrity, always: the stored list must hash to the sealed
+    `provenance_sha256_jcs`, have the closed shape, name each locator once,
+    and give every accepted declaration an entry at its locator labelled with
+    its source id. Content, only where the record retains its messages as
+    captured (capture policy `full` and the stored prompt digest equal to the
+    captured one, in a pack that kept the messages): every tool-result block
+    and every declared block has exactly one entry at its locator, of the
+    right kind, whose sha256 and bytes are the block's, and no other entry
+    exists. Otherwise a note says the content was not retained and only the
+    list's integrity was checked: never a failure, never a content pass. A
+    pass shows the stated list was recorded and has not changed since; it
+    does not show a label names an authentic source."""
+    version = event.get('schema_version') or 'v1'
+    content = event.get('content')
+    if version != 'v1.25' or not isinstance(content, dict):
+        return [], []
+    listing = content.get('provenance')
+    sealed = content.get('provenance_sha256_jcs')
+    if listing is None and sealed is None:
+        return [], []
+    if listing is None:
+        return ['provenance_sha256_jcs sealed but the record stores no provenance list'], []
+    if sealed is None:
+        return ['provenance present but no provenance_sha256_jcs was sealed'], []
+    try:
+        if sha256_jcs(listing) != sealed:
+            return ['provenance does not match provenance_sha256_jcs (the provenance list was changed after sealing)'], []
+    except ValueError:
+        return ['provenance is not JSON a JCS digest covers'], []
+    if not (isinstance(listing, dict) and set(listing) == {'entries', 'declarations', 'complete'}
+            and isinstance(listing['entries'], list) and isinstance(listing['declarations'], list)
+            and isinstance(listing['complete'], bool)):
+        return ['provenance is not an {entries, declarations, complete} object'], []
+    problems = []
+    entries = {}
+    for entry in listing['entries']:
+        key = _locator_key(entry.get('locator')) if isinstance(entry, dict) else None
+        if (key is None or set(entry) != {'locator', 'kind', 'label', 'asserted_by', 'sha256', 'bytes'}
+                or entry['kind'] not in PROVENANCE_KINDS or entry['asserted_by'] != 'caller'
+                or not (entry['label'] is None or isinstance(entry['label'], str))
+                or not (isinstance(entry['sha256'], str) and _LOWER_SHA256.match(entry['sha256']))
+                or not isinstance(entry['bytes'], int) or isinstance(entry['bytes'], bool) or entry['bytes'] < 0):
+            problems.append('a provenance entry is not a {locator, kind, label, asserted_by, sha256, bytes} entry')
+            continue
+        if key in entries:
+            problems.append(f'two provenance entries name the block at {key}')
+            continue
+        entries[key] = entry
+    declared = {}
+    for declaration in listing['declarations']:
+        key = _locator_key(declaration.get('locator')) if isinstance(declaration, dict) else None
+        if key is None or set(declaration) != {'locator', 'source_id'} or not isinstance(declaration['source_id'], str):
+            problems.append('a provenance declaration is not a {locator, source_id} object')
+            continue
+        if key in declared:
+            problems.append(f'two provenance declarations name the block at {key}')
+            continue
+        declared[key] = declaration['source_id']
+        entry = entries.get(key)
+        if entry is None:
+            problems.append(f'the declaration at {key} has no entry')
+        elif entry['label'] != declaration['source_id']:
+            problems.append(f'the entry at {key} is not labelled with its declared source')
+    if problems:
+        return problems, []
+    retained = (
+        content.get('capture_policy') == 'full'
+        and 'messages' not in stripped
+        and content.get('stored_prompt_sha256_jcs') is not None
+        and content.get('stored_prompt_sha256_jcs') == content.get('prompt_sha256_jcs')
+    )
+    if not retained:
+        return [], [PROVENANCE_CONTENT_NOT_RETAINED]
+    messages = event.get('messages') or []
+    units = provenance_tool_result_keys(messages)
+    expected = set(units) | set(declared)
+    for key in sorted(expected):
+        entry = entries.get(key)
+        if entry is None:
+            problems.append(f'the block at {key} has no provenance entry')
+            continue
+        block = provenance_block_bytes(messages, key)
+        if block is None:
+            problems.append(f'the provenance entry at {key} names no block')
+            continue
+        kind = 'tool_result' if key in units else 'declared_context'
+        if entry['kind'] != kind:
+            problems.append(f'the provenance entry at {key} is a {entry["kind"]}, the block is a {kind}')
+        if entry['sha256'] != hashlib.sha256(block).hexdigest() or entry['bytes'] != len(block):
+            problems.append(f'the provenance entry at {key} does not match the block as captured')
+    for key in sorted(set(entries) - expected):
+        problems.append(f'the provenance entry at {key} names no tool-result or declared block')
+    if not problems and listing['complete'] is not True:
+        problems.append('the provenance list says it is incomplete')
+    return problems, []
+
+
+PROVENANCE_OUTCOMES = ('not_eligible', 'complete_verified', 'integrity_only', 'missing_list', 'integrity_failure')
+
+
+def provenance_check_outcome(event, stripped=frozenset()):
+    """How one record counts in a provenance verification: one of
+    `PROVENANCE_OUTCOMES`. Mirror of `provenance_check_outcome` in
+    meilynx-core, which a gateway runs in process over its own records (the
+    two are tested against each other on shared cases). Eligibility is
+    derived from the captured messages (a tool-result block), not from
+    whether a list exists; a record that carries a list is eligible too. A
+    record with no content block was sealed with no capture policy and says
+    nothing about provenance: not eligible. The record's own hash is checked
+    apart (a record whose hash fails is not counted as verified)."""
+    if (event.get('event_kind') or 'llm_request') != 'llm_request':
+        return 'not_eligible'
+    content = event.get('content')
+    if not isinstance(content, dict):
+        return 'not_eligible'
+    has_list = content.get('provenance') is not None or content.get('provenance_sha256_jcs') is not None
+    messages = None if 'messages' in stripped else event.get('messages')
+    messages = messages if isinstance(messages, list) else []
+    if not has_list and not provenance_tool_result_keys(messages):
+        return 'not_eligible'
+    if not has_list:
+        return 'missing_list'
+    if event.get('schema_version') != 'v1.25':
+        return 'integrity_failure'
+    problems, notes = check_context_provenance(event, stripped)
+    if problems:
+        return 'integrity_failure'
+    if notes:
+        return 'integrity_only'
+    return 'complete_verified'
+
+
 def check_evaluation_trace(event):
     """A v1.16 record's hash covers the digest of its
     evaluation outcomes, not the outcomes themselves. Recompute the digest from
@@ -3662,14 +4066,14 @@ def check_evaluation_trace(event):
     `check_evaluation_trace` in meilynx-audit/src/evaluation_trace.rs."""
     version = event.get('schema_version') or 'v1'
     trace = event.get('evaluation_trace')
-    if version not in ('v1.16', 'v1.18', 'v1.19'):
+    if version not in ('v1.16', 'v1.18', 'v1.19', 'v1.25'):
         if trace is not None:
             return [f'{version} record carries an evaluation_trace; it is hashed only in the v1.16, v1.18 and v1.19 buckets']
         return []
     if trace is None:
         # v1.18 and v1.19 presence-tag the trace: a refusal sealed before
         # evaluation carries none and is whole.
-        return [] if version in ('v1.18', 'v1.19') else ['v1.16 record has no evaluation_trace']
+        return [] if version in ('v1.18', 'v1.19', 'v1.25') else ['v1.16 record has no evaluation_trace']
     sealed = trace.get('outcomes_sha256_jcs')
     if not isinstance(sealed, str):
         return ['evaluation_trace has no outcomes_sha256_jcs']
@@ -4016,10 +4420,10 @@ def _on_behalf_of_is_verified(mcp_event):
 # and self-test assertion 31e pins the v1.18 member (36d the v1.19 one). `check_llm_content` reads
 # the same tuple, so a bucket that seals the digests is also one whose stored
 # content is re-derived from them (assertions 35a-35c).
-CONTENT_ATTESTATION_VERSIONS = ('v1.10', 'v1.11', 'v1.12', 'v1.16', 'v1.18', 'v1.19')
+CONTENT_ATTESTATION_VERSIONS = ('v1.10', 'v1.11', 'v1.12', 'v1.16', 'v1.18', 'v1.19', 'v1.25')
 # The members whose preimage presence-tags the content block: a record sealed
 # with no capture policy carries none and stores its content unhashed.
-CONTENT_PRESENCE_TAGGED_VERSIONS = ('v1.12', 'v1.16', 'v1.18', 'v1.19')
+CONTENT_PRESENCE_TAGGED_VERSIONS = ('v1.12', 'v1.16', 'v1.18', 'v1.19', 'v1.25')
 
 
 def compute_event_hash_dispatch(
@@ -4033,6 +4437,7 @@ def compute_event_hash_dispatch(
     identity=None, coverage_key_inventory=None, decision_receipt=None,
     evaluation_trace=None, customer=None, policy_version=None, model_executed=None,
     compliance_record=None, judgment_verdict=None, control_probe_run=None,
+    provenance_verification=None,
 ):
     """Python mirror of compute_event_hash_dispatch in sqlite.rs.
 
@@ -4049,7 +4454,7 @@ def compute_event_hash_dispatch(
     if customer is not None:
         lane_bucket = (
             (schema_version == 'v1.18' and (event_kind == EVENT_KIND_LLM_REQUEST or event_kind in MCP_EVENT_KINDS))
-            or (schema_version == 'v1.19' and event_kind == EVENT_KIND_LLM_REQUEST)
+            or (schema_version in ('v1.19', 'v1.25') and event_kind == EVENT_KIND_LLM_REQUEST)
         )
         if not lane_bucket:
             raise ValueError(
@@ -4065,7 +4470,7 @@ def compute_event_hash_dispatch(
     # carries it forward, presence-tagged); anywhere else the trace would sit
     # on the record unhashed.
     if evaluation_trace is not None and (
-        schema_version not in ('v1.16', 'v1.18', 'v1.19') or event_kind != EVENT_KIND_LLM_REQUEST
+        schema_version not in ('v1.16', 'v1.18', 'v1.19', 'v1.25') or event_kind != EVENT_KIND_LLM_REQUEST
     ):
         raise ValueError(
             f"evaluation_trace present on a {schema_version!r} "
@@ -4077,6 +4482,16 @@ def compute_event_hash_dispatch(
         isinstance(evaluation_trace, dict) and isinstance(evaluation_trace.get('outcomes_sha256_jcs'), str)
     ):
         raise ValueError("evaluation_trace has no outcomes_sha256_jcs, so the record has no defined preimage.")
+    # Fail closed. The provenance verification payload is hashed only by the
+    # v1.25 provenance.verification hasher; anywhere else it would sit on the
+    # record unhashed.
+    if provenance_verification is not None and (
+        schema_version != PROVENANCE_VERIFICATION_SCHEMA_VERSION or event_kind != EVENT_KIND_PROVENANCE_VERIFICATION
+    ):
+        raise ValueError(
+            f"provenance_verification payload present on a {schema_version!r} "
+            f"{event_kind!r} event — it is hashed only in the v1.25 provenance.verification bucket."
+        )
     # Fail closed. The probe-run payload is hashed only by the v1.23
     # control_probe.run hasher; anywhere else it would sit on the record
     # unhashed.
@@ -4164,15 +4579,27 @@ def compute_event_hash_dispatch(
         raise ValueError("content attestation has no capture_policy, so the record has no defined preimage.")
     # And the tool-call digests only in v1.11: the v1.10 hash does
     # not read them, so a v1.10 record carrying one would present it unhashed.
-    if _has_tool_call_digests(content) and schema_version not in ('v1.11', 'v1.12', 'v1.16', 'v1.18', 'v1.19'):
+    if _has_tool_call_digests(content) and schema_version not in ('v1.11', 'v1.12', 'v1.16', 'v1.18', 'v1.19', 'v1.25'):
         raise ValueError(
             f"tool-call digests present on a {schema_version!r} event — "
             f"they are hashed only in the v1.11, v1.12, v1.16 and v1.18 buckets."
         )
+    # Fail closed. The context provenance digest enters only the v1.25
+    # llm_request preimage and the stored list is bound only through it;
+    # anywhere else either would ride the record unhashed. A list with no
+    # digest is refused too.
+    if _has_provenance(content):
+        if schema_version != 'v1.25' or event_kind != EVENT_KIND_LLM_REQUEST:
+            raise ValueError(
+                f"context provenance present on a {schema_version!r} {event_kind!r} event — "
+                f"it is hashed only in the v1.25 llm_request bucket."
+            )
+        if content.get('provenance') is not None and content.get('provenance_sha256_jcs') is None:
+            raise ValueError("a context provenance list with no provenance_sha256_jcs would ride the record unattested.")
     # Fail closed. The sealed identity enters only the
     # v1.12 preimage (both lanes); on any other version it would sit on the
     # record unhashed, rewritable without breaking the chain.
-    if identity is not None and schema_version not in ('v1.12', 'v1.14', 'v1.16', 'v1.17', 'v1.18', 'v1.19'):
+    if identity is not None and schema_version not in ('v1.12', 'v1.14', 'v1.16', 'v1.17', 'v1.18', 'v1.19', 'v1.25'):
         raise ValueError(
             f"identity block present on a {schema_version!r} event — "
             f"it is hashed only in the v1.12 bucket (and the MCP v1.14 and v1.17, "
@@ -4208,7 +4635,7 @@ def compute_event_hash_dispatch(
                 "identity.delegated_human disagrees with the principal chain's "
                 "on_behalf_of_attestation — the two must agree"
             )
-    if join_context is not None and schema_version not in ('v1.9', 'v1.10', 'v1.11', 'v1.12', 'v1.14', 'v1.16', 'v1.17', 'v1.18', 'v1.19'):
+    if join_context is not None and schema_version not in ('v1.9', 'v1.10', 'v1.11', 'v1.12', 'v1.14', 'v1.16', 'v1.17', 'v1.18', 'v1.19', 'v1.25'):
         raise ValueError(
             f"join_context present on a {schema_version!r} event — "
             f"caller-asserted join keys are hashed only in the v1.9, v1.10, v1.11, v1.12, "
@@ -4694,6 +5121,45 @@ def compute_event_hash_dispatch(
                 "sealed without one must stay in its pre-v1.19 bucket."
             )
         return compute_event_hash_v1_19_llm_request(
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            join_context, content, identity, evaluation_trace, customer,
+            policy_version, model_executed,
+        )
+    if schema_version == 'v1.25' and event_kind == EVENT_KIND_PROVENANCE_VERIFICATION:
+        # The bucket's one other event class: a gateway's own run of the
+        # provenance checks. Another kind's payload or an LLM field has no
+        # place in this preimage.
+        if not isinstance(provenance_verification, dict):
+            raise ValueError("ProvenanceVerification event missing provenance_verification payload")
+        if any(p is not None for p in (auth_session, admin_action, mcp_event, coverage, content, join_context,
+                                       identity, policy_version, model_executed)):
+            raise ValueError(
+                "a v1.25 provenance.verification event carries another kind's payload; "
+                "it would ride the record unhashed."
+            )
+        return compute_event_hash_v1_25_provenance_verification(
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            provenance_verification,
+        )
+    if schema_version == 'v1.25':
+        # The v1.19 llm_request preimage, then the context provenance digest,
+        # presence-tagged. Like v1.19 it requires a policy version.
+        if event_kind != EVENT_KIND_LLM_REQUEST:
+            raise ValueError(
+                f"schema_version v1.25 is defined only for llm_request events; got event_kind {event_kind!r}"
+            )
+        if policy_version is None:
+            raise ValueError(
+                "schema_version v1.25 requires a policy_version; a record "
+                "sealed without one has no defined v1.25 preimage."
+            )
+        return compute_event_hash_v1_25_llm_request(
             sequence_number, timestamp_utc, event_id, request_id,
             model_requested, action, input_tokens, output_tokens,
             total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
@@ -6748,6 +7214,247 @@ def run_self_test():
     else:
         ok = False
 
+    # Assertion 42a — the v1.25 llm_request fixtures (direct fn and the
+    # dispatcher): every v1.19 feed, then the context provenance digest,
+    # presence-tagged. Paired with mei3869_provenance_chain_round_trip.rs.
+    v125_content = {
+        'capture_policy': 'full',
+        'prompt_sha256_jcs': V1_25_PROMPT_FIXTURE_DIGEST,
+        'stored_prompt_sha256_jcs': V1_25_PROMPT_FIXTURE_DIGEST,
+        'provenance_sha256_jcs': V1_25_PROVENANCE_FIXTURE_DIGEST,
+    }
+    got = [
+        compute_event_hash_v1_25_llm_request(
+            *_V1_16_FIXTURE_ARGS, None, v125_content, None, None, _V1_18_CUSTOMER_NONE_FIXTURE,
+            V1_19_POLICY_VERSION_FIXTURE, V1_19_MODEL_EXECUTED_FIXTURE,
+        ),
+        compute_event_hash_v1_25_llm_request(
+            *_V1_16_FIXTURE_ARGS, None, None, None, None, _V1_18_CUSTOMER_NONE_FIXTURE,
+            V1_19_POLICY_VERSION_FIXTURE, None,
+        ),
+        compute_event_hash_dispatch('v1.25', *_V1_16_FIXTURE_ARGS, event_kind=EVENT_KIND_LLM_REQUEST,
+                                    content=dict(v125_content, provenance=_V1_25_PROVENANCE_FIXTURE),
+                                    customer=_V1_18_CUSTOMER_NONE_FIXTURE,
+                                    policy_version=V1_19_POLICY_VERSION_FIXTURE,
+                                    model_executed=V1_19_MODEL_EXECUTED_FIXTURE),
+    ]
+    expected = [V1_25_LLM_FIXTURE_HASH, V1_25_LLM_NO_PROVENANCE_FIXTURE_HASH, V1_25_LLM_FIXTURE_HASH]
+    # The trailing tag is a feed of its own: v1.25 without a digest is not v1.19.
+    if got == expected and V1_25_LLM_NO_PROVENANCE_FIXTURE_HASH != V1_19_LLM_BUDGET_BLOCK_FIXTURE_HASH:
+        print('SELF-TEST assertion 42a PASS: v1.25 fixture hashes match')
+    else:
+        print(f'SELF-TEST assertion 42a FAIL: v1.25 fixture drift: {got} != {expected}', file=sys.stderr)
+        ok = False
+
+    # Assertion 42b — the production recompute path binds the digest: an
+    # edited, removed or added provenance digest moves the hash, and the
+    # stored list is outside the preimage (bound through the digest only).
+    v125 = dict(
+        schema_version='v1.25', event_id='evt-v116-fixture', request_id='req-v116-fixture',
+        timestamp_utc='2026-10-09T16:21:00Z', model_requested='gpt-6-luna', action='block',
+        input_tokens=452, output_tokens=70, total_tokens=522,
+        customer=dict(_V1_18_CUSTOMER_NONE_FIXTURE),
+        policy_version=V1_19_POLICY_VERSION_FIXTURE, model_executed=V1_19_MODEL_EXECUTED_FIXTURE,
+        content=dict(v125_content, provenance=_V1_25_PROVENANCE_FIXTURE),
+    )
+    base = recompute_event_hash(v125, 7, 'deadbeef' * 8)
+    no_digest = dict(v125, content=dict(v125_content))
+    del no_digest['content']['provenance_sha256_jcs']
+    moved = [
+        recompute_event_hash(dict(v125, content=dict(v125['content'], provenance_sha256_jcs='6a' * 32)), 7, 'deadbeef' * 8) != base,
+        recompute_event_hash(no_digest, 7, 'deadbeef' * 8) != base,
+    ]
+    relisted = dict(v125, content=dict(v125['content'], provenance={'entries': [], 'declarations': [], 'complete': True}))
+    if base == V1_25_LLM_FIXTURE_HASH and all(moved) and recompute_event_hash(relisted, 7, 'deadbeef' * 8) == base:
+        print('SELF-TEST assertion 42b PASS: v1.25 binds provenance_sha256_jcs (edit, add and remove are caught); the list rides beside it')
+    else:
+        print(f'SELF-TEST assertion 42b FAIL: base {base}, moved {moved}', file=sys.stderr)
+        ok = False
+
+    # Assertion 42c — fail closed: provenance on v1.19 or off the LLM lane,
+    # v1.25 without a policy version, a list with no digest.
+    cases = [
+        ('v1.19', dict(event_kind=EVENT_KIND_LLM_REQUEST, content=dict(v125_content),
+                       policy_version=V1_19_POLICY_VERSION_FIXTURE)),
+        ('v1.19', dict(event_kind=EVENT_KIND_LLM_REQUEST,
+                       content={'capture_policy': 'full', 'provenance': _V1_25_PROVENANCE_FIXTURE},
+                       policy_version=V1_19_POLICY_VERSION_FIXTURE)),
+        ('v1.25', dict(event_kind=EVENT_KIND_ADMIN_ACTION, content=dict(v125_content),
+                       policy_version=V1_19_POLICY_VERSION_FIXTURE)),
+        ('v1.25', dict(event_kind=EVENT_KIND_LLM_REQUEST, content=dict(v125_content))),
+        ('v1.25', dict(event_kind=EVENT_KIND_LLM_REQUEST,
+                       content={'capture_policy': 'full', 'provenance': _V1_25_PROVENANCE_FIXTURE},
+                       policy_version=V1_19_POLICY_VERSION_FIXTURE)),
+    ]
+    rejected = 0
+    for version, kwargs in cases:
+        try:
+            compute_event_hash_dispatch(version, 7, '2026-10-10T12:00:01+00:00', 'e', 'r', '', 'allow',
+                                        0, 0, None, None, None, None, None, None, 'deadbeef' * 8, **kwargs)
+        except ValueError:
+            rejected += 1
+    if rejected == len(cases):
+        print(f'SELF-TEST assertion 42c PASS: all {len(cases)} misplaced or unattested provenance records are rejected')
+    else:
+        print(f'SELF-TEST assertion 42c FAIL: only {rejected} of {len(cases)} fail-closed cases rejected', file=sys.stderr)
+        ok = False
+
+    # Assertion 42d — check_context_provenance. The fixture
+    # list is what its messages give (each entry's sha256 and bytes are the
+    # block's); intact under `full` it passes with content checked; an
+    # edited list fails list integrity; a re-sealed list that drops an entry,
+    # mislabels a declared block or misstates a block fails the content
+    # check; under `redacted`, `hash_only` or in a stripped pack it is a note,
+    # never a failure.
+    def sealed_record(listing, **content):
+        record_content = dict(v125_content, provenance=listing, provenance_sha256_jcs=sha256_jcs(listing))
+        record_content.update(content)
+        return dict(v125, messages=_V1_25_PROVENANCE_MESSAGES, content=record_content)
+
+    def resealed(mutate):
+        listing = json.loads(json.dumps(_V1_25_PROVENANCE_FIXTURE))
+        mutate(listing)
+        return sealed_record(listing)
+
+    intact = sealed_record(_V1_25_PROVENANCE_FIXTURE)
+    edited = dict(intact, content=dict(intact['content'], provenance=dict(_V1_25_PROVENANCE_FIXTURE, complete=False)))
+    failing = {
+        'edited after sealing': edited,
+        'tool result entry dropped': resealed(lambda l: l['entries'].pop(1)),
+        'declared label rewritten': resealed(lambda l: l['entries'][0].update(label='ehr:note/10')),
+        'bytes misstated': resealed(lambda l: l['entries'][2].update(bytes=13)),
+        'kind misstated': resealed(lambda l: l['entries'][3].update(kind='declared_context')),
+        'extra entry': resealed(lambda l: l['entries'].append(dict(l['entries'][1], locator={'message_index': 1}))),
+        'no digest': dict(intact, content={k: v for k, v in intact['content'].items() if k != 'provenance_sha256_jcs'}),
+    }
+    caught = {name: bool(check_context_provenance(r)[0]) for name, r in failing.items()}
+    redacted = sealed_record(_V1_25_PROVENANCE_FIXTURE, capture_policy='redacted', stored_prompt_sha256_jcs='3' * 64)
+    hash_only = sealed_record(_V1_25_PROVENANCE_FIXTURE, capture_policy='hash_only', stored_prompt_sha256_jcs=None)
+    notes_only = [
+        check_context_provenance(redacted),
+        check_context_provenance(hash_only),
+        check_context_provenance(intact, frozenset(STRIPPED_FIELDS)),
+    ]
+    entries_are_the_blocks = all(
+        provenance_block_bytes(_V1_25_PROVENANCE_MESSAGES, _locator_key(e['locator'])) is not None
+        and hashlib.sha256(provenance_block_bytes(_V1_25_PROVENANCE_MESSAGES, _locator_key(e['locator']))).hexdigest() == e['sha256']
+        for e in _V1_25_PROVENANCE_FIXTURE['entries']
+    )
+    if (sha256_jcs(_V1_25_PROVENANCE_FIXTURE) == V1_25_PROVENANCE_FIXTURE_DIGEST
+            and sha256_jcs(_V1_25_PROVENANCE_MESSAGES) == V1_25_PROMPT_FIXTURE_DIGEST
+            and entries_are_the_blocks
+            and check_context_provenance(intact) == ([], [])
+            and all(caught.values())
+            and all(r == ([], [PROVENANCE_CONTENT_NOT_RETAINED]) for r in notes_only)
+            and check_context_provenance(dict(intact, schema_version='v1.19')) == ([], [])):
+        print('SELF-TEST assertion 42d PASS: the provenance list is checked for integrity always, '
+              'against the blocks where the content is retained, and is a note otherwise')
+    else:
+        print(f'SELF-TEST assertion 42d FAIL: intact {check_context_provenance(intact)}, caught {caught}, '
+              f'notes {notes_only}, entries are the blocks {entries_are_the_blocks}', file=sys.stderr)
+        ok = False
+
+    # Assertion 42e — the v1.25 provenance.verification fixture (direct fn and
+    # the production recompute path). Paired with
+    # mei3869_provenance_verification_chain_round_trip.rs (meilynx-audit), which
+    # pins the same hash.
+    pv_args = dict(
+        sequence_number=1, timestamp_utc='2026-11-24T00:05:00+00:00',
+        event_id='evt-provenance-verification-fixture', request_id='evt-provenance-verification-fixture',
+        model_requested='', action='allow', input_tokens=0, output_tokens=0, total_tokens=None,
+        cache_creation_input_tokens=None, cache_read_input_tokens=None, cached_input_tokens=None,
+        reasoning_tokens=None, estimated_cost_usd=None, previous_hash='deadbeef' * 8,
+    )
+    got_pv = compute_event_hash_v1_25_provenance_verification(
+        verification=_V1_25_PROVENANCE_VERIFICATION_FIXTURE, **pv_args)
+    pv_event = {
+        'schema_version': 'v1.25', 'event_kind': 'provenance_verification',
+        'event_id': pv_args['event_id'], 'request_id': pv_args['request_id'],
+        'timestamp_utc': '2026-11-24T00:05:00Z', 'model_requested': '', 'action': 'allow',
+        'input_tokens': 0, 'output_tokens': 0,
+        'provenance_verification': dict(_V1_25_PROVENANCE_VERIFICATION_FIXTURE),
+    }
+    via_record = recompute_event_hash(pv_event, 1, 'deadbeef' * 8)
+    moved = recompute_event_hash(
+        dict(pv_event, provenance_verification=dict(_V1_25_PROVENANCE_VERIFICATION_FIXTURE, integrity_only=3)),
+        1, 'deadbeef' * 8)
+    if got_pv == V1_25_PROVENANCE_VERIFICATION_FIXTURE_HASH == via_record and moved != via_record:
+        print('SELF-TEST assertion 42e PASS: v1.25 provenance.verification fixture hash pinned; every count is bound')
+    else:
+        print(f'SELF-TEST assertion 42e FAIL: {got_pv} / {via_record} != {V1_25_PROVENANCE_VERIFICATION_FIXTURE_HASH}',
+              file=sys.stderr)
+        ok = False
+
+    # Assertion 42f — check_provenance_verification and the fail-closed
+    # dispatcher: an intact payload passes; a window that does not end after
+    # it starts, counts that do not add up, an unknown member or vocabulary
+    # are caught; the payload on another version or kind, a verification
+    # without it, or one carrying an LLM field is refused.
+    def pv_with(**change):
+        return dict(pv_event, provenance_verification=dict(_V1_25_PROVENANCE_VERIFICATION_FIXTURE, **change))
+    pv_caught = {
+        'window': bool(check_provenance_verification(pv_with(cutoff='2026-11-23T00:00:00Z'))),
+        'offset': bool(check_provenance_verification(pv_with(window_start='2026-11-23T01:00:00+01:00'))),
+        'sums': bool(check_provenance_verification(pv_with(eligible_calls=121))),
+        'vocabulary': bool(check_provenance_verification(pv_with(verifier_version='provenance-check.v2'))),
+        'member': bool(check_provenance_verification(pv_with(label='fetch_note'))),
+        'version': bool(check_provenance_verification(dict(pv_event, schema_version='v1.23'))),
+    }
+    pv_base = (1, '2026-11-24T00:05:00+00:00', 'e', 'r', '', 'allow', 0, 0, None, None, None, None, None, None,
+               'deadbeef' * 8)
+    pv_refusals = (
+        dict(version='v1.23', event_kind=EVENT_KIND_PROVENANCE_VERIFICATION,
+             provenance_verification=_V1_25_PROVENANCE_VERIFICATION_FIXTURE),
+        dict(version='v1.25', event_kind=EVENT_KIND_LLM_REQUEST,
+             provenance_verification=_V1_25_PROVENANCE_VERIFICATION_FIXTURE),
+        dict(version='v1.25', event_kind=EVENT_KIND_PROVENANCE_VERIFICATION),
+        dict(version='v1.25', event_kind=EVENT_KIND_PROVENANCE_VERIFICATION,
+             provenance_verification=_V1_25_PROVENANCE_VERIFICATION_FIXTURE, content={'capture_policy': 'full'}),
+        dict(version='v1.25', event_kind=EVENT_KIND_PROVENANCE_VERIFICATION,
+             provenance_verification=_V1_25_PROVENANCE_VERIFICATION_FIXTURE, policy_version='5f' * 32),
+    )
+    pv_rejected = 0
+    for refusal in pv_refusals:
+        kwargs = dict(refusal)
+        version = kwargs.pop('version')
+        try:
+            compute_event_hash_dispatch(version, *pv_base, **kwargs)
+        except ValueError:
+            pv_rejected += 1
+    if (check_provenance_verification(pv_event) == [] and all(pv_caught.values())
+            and pv_rejected == len(pv_refusals) and 'provenance-verifications-v1' in VERIFIER_CAPABILITIES):
+        print('SELF-TEST assertion 42f PASS: provenance.verification payloads are checked and misplaced ones refused')
+    else:
+        print(f'SELF-TEST assertion 42f FAIL: caught {pv_caught}, refused {pv_rejected} of {len(pv_refusals)}',
+              file=sys.stderr)
+        ok = False
+
+    # Assertion 42g — provenance_check_outcome, the classification a
+    # gateway's own run counts (eligibility from the messages, not from
+    # whether a list exists).
+    bare = dict(v125_content)
+    del bare['provenance_sha256_jcs']
+    outcome_cases = {
+        'complete_verified': intact,
+        'integrity_only': redacted,
+        'integrity_failure': edited,
+        'missing_list': dict(intact, schema_version='v1.19', content=bare),
+        'not_eligible': dict(intact, content=None),
+    }
+    outcomes = {name: provenance_check_outcome(r) for name, r in outcome_cases.items()}
+    extra = [
+        provenance_check_outcome(dict(intact, messages=[{'role': 'user', 'content': 'hi'}], content=bare)),
+        provenance_check_outcome(dict(intact, event_kind='admin_action')),
+        provenance_check_outcome(dict(intact, schema_version='v1.19')),
+        provenance_check_outcome(hash_only),
+    ]
+    if (all(name == got for name, got in outcomes.items())
+            and extra == ['not_eligible', 'not_eligible', 'integrity_failure', 'integrity_only']):
+        print('SELF-TEST assertion 42g PASS: each record counts as its provenance outcome')
+    else:
+        print(f'SELF-TEST assertion 42g FAIL: {outcomes}, {extra}', file=sys.stderr)
+        ok = False
+
     # Assertion 17e — the fail-closed invariant: a join_context on any
     # bucket other than v1.9 is a hard error, not a silently-unhashed field.
     # Mirror of the Rust dispatcher guard. This is the assertion that would
@@ -7506,6 +8213,71 @@ V1_19_LLM_FULL_FIXTURE_HASH = "3bf6543a3d634b6107ef29959878d70b2f489d3bbf524b976
 V1_19_LLM_BUDGET_BLOCK_FIXTURE_HASH = "4bb67bf0944741c79eb7393b72502a58fd85f73150880369470187a0bada263e"
 V1_19_LLM_NO_CUSTOMER_FIXTURE_HASH = "29ceddb5b3bd1d9dbd12ed7c08823396c29ddbc7c7ef1163073babfde979f517"
 
+# v1.25 llm_request and context provenance fixtures. Paired with
+# mei3869_provenance_chain_round_trip.rs (meilynx-audit), which computes the
+# same list from the same messages and declarations in meilynx-core. The
+# messages are the record's stored form: a declared user message, a tool call,
+# the tool's result (labelled with the tool it answers), and a message with a
+# declared text block and a tool_result block whose tool_use is not in the
+# list (label null).
+_V1_25_PROVENANCE_MESSAGES = [
+    {'role': 'user', 'content': 'Summarize the discharge note.'},
+    {'role': 'assistant', 'content': None, 'tool_calls': [
+        {'id': 'call_1', 'type': 'function', 'function': {'name': 'fetch_note', 'arguments': '{"id":9}'}}]},
+    {'role': 'tool', 'content': 'Discharged on day 3.', 'tool_call_id': 'call_1'},
+    {'role': 'user', 'content': 'Caf\u00e9 policy', 'content_blocks': [
+        {'type': 'text', 'text': 'Caf\u00e9 policy'},
+        {'type': 'tool_result', 'tool_use_id': 'toolu_1', 'content': '42'}]},
+]
+_V1_25_PROVENANCE_DECLARATIONS = [
+    {'locator': {'message_index': 0}, 'source_id': 'ehr:note/9'},
+    {'locator': {'message_index': 3, 'block_index': 0}, 'source_id': 'policy:v2'},
+]
+_V1_25_PROVENANCE_FIXTURE = {
+    'entries': [
+        {'locator': {'message_index': 0}, 'kind': 'declared_context', 'label': 'ehr:note/9',
+         'asserted_by': 'caller',
+         'sha256': 'b12203c4c48e952f837095b3602c107deca18030742fe511ea154d10d04544af', 'bytes': 29},
+        {'locator': {'message_index': 2}, 'kind': 'tool_result', 'label': 'fetch_note',
+         'asserted_by': 'caller',
+         'sha256': '2532f5156cbc7d351b1d96d34f8afde7aa13c4e197c626f3d607eb29e74f31a3', 'bytes': 20},
+        {'locator': {'message_index': 3, 'block_index': 0}, 'kind': 'declared_context', 'label': 'policy:v2',
+         'asserted_by': 'caller',
+         'sha256': '06aa2a2388188adc1f172538331c5e339251172c02dc50cb25693186850f8ae5', 'bytes': 12},
+        {'locator': {'message_index': 3, 'block_index': 1}, 'kind': 'tool_result', 'label': None,
+         'asserted_by': 'caller',
+         'sha256': '9fc0006a261b51abc9c595cc81206d82145be10a3f86b7f623b58892919e53d0', 'bytes': 61},
+    ],
+    'declarations': _V1_25_PROVENANCE_DECLARATIONS,
+    'complete': True,
+}
+V1_25_PROMPT_FIXTURE_DIGEST = "9eed76e41e636ecd2b5b84b3c6adccc04d25491ea235e29ad712ea1e11ff9df5"
+V1_25_PROVENANCE_FIXTURE_DIGEST = "f5b42d55035f8f0c189e34260f3dc5707eec91a1032808473feea06a9f93f19d"
+# The v1.16 fixture request (_V1_16_FIXTURE_ARGS), no identity or trace, the
+# `none` customer block, the v1.19 policy version: with a `full` content block
+# carrying the provenance digest and the served model, and with no content
+# block and no served model.
+V1_25_LLM_FIXTURE_HASH = "8192b2497872ad1dbeaa94711f2c094b4f8ba5746c9ba084e87fa2a034af157e"
+V1_25_LLM_NO_PROVENANCE_FIXTURE_HASH = "b8ca3c5f927293707a8c71eda0487f2359e02609b60ad4ac278a1efb517c11cd"
+
+# v1.25 provenance.verification fixture: the route contract's example
+# outcome. Paired with mei3869_provenance_verification_chain_round_trip.rs
+# (meilynx-audit).
+_V1_25_PROVENANCE_VERIFICATION_FIXTURE = {
+    'verification_id': '0193a7c2-5d1e-7b2a-9f00-3c4d5e6f7a8b',
+    'window_start': '2026-11-23T00:00:00Z',
+    'cutoff': '2026-11-24T00:00:00Z',
+    'verifier_version': 'provenance-check.v1',
+    'evidence_mode': 'local_chain',
+    'eligible_calls': 120,
+    'complete_verified': 118,
+    'integrity_only': 2,
+    'missing_list': 0,
+    'integrity_failures': 0,
+    'records_unreadable': 0,
+}
+V1_25_PROVENANCE_VERIFICATION_FIXTURE_HASH = "62ce71dcee7b45b9929b14f6a72cf28915d7a94b4c2d5a9afe84d6c231f0b0d5"
+
 # Tool-call digest fixture. Paired with
 # meilynx-proxy/src/audit_capture.rs::tool_call_digests_are_pinned_for_the_verifier:
 # the record's `tool_calls` exactly as the proxy serializes them, and the
@@ -7610,6 +8382,7 @@ def recompute_event_hash(event, seq, previous_hash):
         compliance_record=event.get('compliance_record'),
         judgment_verdict=event.get('judgment_verdict'),
         control_probe_run=event.get('control_probe_run'),
+        provenance_verification=event.get('provenance_verification'),
     )
 
 
@@ -8694,6 +9467,16 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             report(f"FAIL seq={seq}: {problem}")
             all_passed = False
             content_ok = False
+        # A v1.25 record's hash covers the digest of its context provenance
+        # list; this checks the stored list still matches it and, where the
+        # messages are retained as captured, every entry against them.
+        provenance_problems, provenance_notes = check_context_provenance(event, stripped)
+        for problem in provenance_problems:
+            report(f"FAIL seq={seq}: {problem}")
+            all_passed = False
+            content_ok = False
+        for note in provenance_notes:
+            report(f"NOTE seq={seq}: {note}")
         # A v1.12 record's hash covers the digest of its asserted
         # labels; this checks the stored labels still match it.
         for problem in check_sealed_identity(event, stripped):
@@ -8731,6 +9514,11 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             content_ok = False
         for note in probe_notes:
             report(f"NOTE seq={seq}: {note}")
+        # A v1.25 provenance.verification record: its window and counts.
+        for problem in check_provenance_verification(event):
+            report(f"FAIL seq={seq}: {problem}")
+            all_passed = False
+            content_ok = False
         # A v1.16 record's hash covers the digest of its evaluation
         # outcomes; this checks the stored outcomes still match it.
         for problem in check_evaluation_trace(event):
