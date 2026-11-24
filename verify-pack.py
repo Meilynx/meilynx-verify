@@ -100,6 +100,20 @@ Evidence class (manifest 1.4):
     line; an unknown label, or a 1.4 manifest without one, cannot be
     evaluated.
 
+Witness files (SPEC 6.9) and receipts (SPEC 6.10):
+    A gateway's control plane keeps the chain heads the gateway reported and
+    the timestamp tokens it uploaded. --witness FILE (the ZIP archive the
+    organization downloads, or the same tree as a directory) judges the pack
+    against them: a pack that contradicts a counted witnessed head fails
+    (exit 1), one that ends before it exits 4. Heads backed by a timestamp
+    token over a statement naming the gateway count on their own; heads
+    reported between anchors count only under the file's signature, checked
+    with the project's attestation key (--witness-key or --attestation-key).
+    --receipt FILE writes the run's conclusion as content-free JSON.
+        python verify-pack.py --records ./records --manifest manifest.json \\
+            --allow-unsigned --witness anchor-file.zip \\
+            --witness-key attestation-key.jwk --receipt receipt.json
+
 Content-stripped Exchange pack (manifest 1.5):
     A pack an Evidence Exchange subscriber receives carries no captured
     content and no personal data. Its 1.5 manifest says `content: stripped`
@@ -429,13 +443,20 @@ EVIDENCE_MODE_INDEX_FIELDS = ("sequence", "mode", "source")
 # stored set references and per-case results, recomputes sets_sha256 and
 # results_sha256 from them and recounts passed, failed and not_applicable;
 # when it does not, it reports the digests as bound but not checked.
+# `witness-file-v1` reads a witness file (--witness: the chain heads a gateway
+# reported to its control plane and the timestamp tokens it uploaded, with a
+# witness-manifest.json bound to the gateway and its chains): a pack that
+# contradicts a counted witnessed head fails, and one that ends before it is
+# coverage not established (exit 4). `verification-receipt-v1` writes the
+# run's content-free `meilynx.verification_receipt.v1` (--receipt).
 VERIFIER_CAPABILITIES = frozenset(
     {"chain-anchors-v1", "segmented-records-v1", "decision-receipts-v1", "evaluation-trace-v1",
      "data-reach-evidence-v1", "control-plane-chain-v1", "ocsf-export-v1", "customer-scope-v1",
      "per-tenant-signer-v1", "evidence-class-v1", "content-stripped-v1", "customer-conditions-v1",
      "record-signatures-v1", "compliance-records-v1", "local-chain-evidence-v1", "coverage-claim-v1",
      "evidence-modes-v1", "gateway-evidence-key-v1", "judgment-verdicts-v1",
-     "judgment-verdicts-v2", "control-probe-runs-v1", "judgment-verdicts-v3"}
+     "judgment-verdicts-v2", "control-probe-runs-v1", "judgment-verdicts-v3", "witness-file-v1",
+     "verification-receipt-v1"}
 )
 # The stripped profile of a manifest 1.5 Exchange pack. Mirror of
 # `exchange::STRIPPED_FIELDS` / `WITHHELD_FIELDS` / `STUB_FIELDS` /
@@ -11426,6 +11447,559 @@ def required_coverage_status(manifest, require_through):
     return COVERAGE_NOT_ESTABLISHED
 
 
+# ── Witness files and verification receipts ────────────────────────────────
+# A gateway with no write-once store holds its own record: whoever controls it
+# can rewrite or remove records before a pack is built. Its control plane
+# keeps, append-only, the chain heads the gateway reported (on its heartbeat)
+# and the anchor statements and timestamp tokens it uploaded. A compliance
+# member downloads them as a witness file (SPEC §6.9), and --witness FILE
+# judges the pack against it with the rules of §6.7: a pack that contradicts a
+# witnessed head inside it fails (exit 1); a pack that ends before a witnessed
+# head is coverage not established (exit 4), whatever its manifest claims.
+#
+# Which heads count. A `timestamp` head counts on the timestamp authority's
+# signature alone: a token that verifies over a canonical statement naming
+# this chain at this sequence with this event_hash, whose run_id names the
+# file's gateway (`<proxy_id>/<boot id>`). A `reported` head, and a timestamp
+# head whose statement names no gateway, counts only when the witness
+# manifest's signature verifies under the project's evidence attestation key
+# the reader pins (--attestation-key). An unsigned file therefore counts only
+# timestamp-backed heads, and the verifier says so.
+#
+# --receipt FILE writes what the run concluded as a content-free JSON
+# receipt (`meilynx.verification_receipt.v1`, RFC 8785 bytes).
+
+VERIFIER_VERSION = "0.16.0"
+WITNESS_MANIFEST_FORMAT = "meilynx.witness_manifest.v1"
+WITNESS_MANIFEST_NAME = "witness-manifest.json"
+WITNESS_SIGNATURE_DOMAIN = WITNESS_MANIFEST_FORMAT.encode("ascii") + b"\x00"
+WITNESS_BASIS_TIMESTAMP = "timestamp"
+WITNESS_BASIS_REPORTED = "reported"
+WITNESS_MAX_MEMBER_BYTES = 32 * 1024 * 1024
+RECEIPT_FORMAT = "meilynx.verification_receipt.v1"
+_WITNESS_TIME_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
+_WITNESS_PROXY_RE = re.compile(r"[!-.0-~]{1,127}")
+_WITNESS_TOP_KEYS = {"format", "generated_at", "org_id", "project_id", "proxy_id", "chains", "omitted_chains",
+                     "contradictions", "signing", "disclosure"}
+_WITNESS_CONTRADICTION_KINDS = ("fork", "rewind", "witness_conflict")
+
+
+class WitnessFile:
+    """Read access to a witness file: a ZIP archive or the same tree as a
+    directory. Members are read by name only; nothing is extracted."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.zip = None
+        self.file_sha256 = None
+        if self.path.is_dir():
+            return
+        raw = self.path.read_bytes()
+        self.file_sha256 = hashlib.sha256(raw).hexdigest()
+        import io
+        import zipfile
+        try:
+            self.zip = zipfile.ZipFile(io.BytesIO(raw))
+        except zipfile.BadZipFile as exc:
+            raise ValueError(f"not a ZIP archive or a directory ({exc})")
+        names = self.zip.namelist()
+        if len(set(names)) != len(names):
+            raise ValueError("the archive holds a member name twice")
+
+    def names(self):
+        if self.zip is not None:
+            return sorted(n for n in self.zip.namelist() if not n.endswith("/"))
+        return sorted(p.relative_to(self.path).as_posix() for p in self.path.rglob("*") if p.is_file())
+
+    def read(self, name):
+        """The member's bytes, or None when absent."""
+        if not isinstance(name, str) or name.startswith("/") or ".." in name.split("/") or "\\" in name:
+            return None
+        if self.zip is not None:
+            try:
+                info = self.zip.getinfo(name)
+            except KeyError:
+                return None
+            if info.file_size > WITNESS_MAX_MEMBER_BYTES:
+                raise ValueError(f"{name} is larger than {WITNESS_MAX_MEMBER_BYTES} bytes")
+            return self.zip.read(info)
+        path = self.path / name
+        return path.read_bytes() if path.is_file() else None
+
+
+def witness_statement_path(chain, seq):
+    return f"anchors/{chain}/{seq:020d}.json"
+
+
+def witness_token_path(chain, seq, tsa_id):
+    return f"anchors/{chain}/{seq:020d}.{tsa_id}.tsr"
+
+
+def witness_signed_head_path(chain, seq):
+    return f"head-signatures/{chain}/{seq:020d}.json"
+
+
+def witness_manifest_message(manifest):
+    """The bytes a witness manifest signature covers: the domain tag, then the
+    manifest's RFC 8785 bytes without `signature`."""
+    body = {k: v for k, v in manifest.items() if k != "signature"}
+    return WITNESS_SIGNATURE_DOMAIN + jcs_dumps(body).encode("utf-8")
+
+
+def check_witness_shape(m):
+    """Raise ValueError unless `m` is a meilynx.witness_manifest.v1 document
+    this verifier reads (an unknown format is cannot evaluate)."""
+    if not isinstance(m, dict):
+        raise ValueError("the witness manifest is not a JSON object")
+    if m.get("format") != WITNESS_MANIFEST_FORMAT:
+        raise ValueError(f"witness manifest format {m.get('format')!r} is not one this verifier reads "
+                         f"({WITNESS_MANIFEST_FORMAT}). Re-run with an updated verifier.")
+    keys = set(m)
+    if not _WITNESS_TOP_KEYS <= keys or keys - _WITNESS_TOP_KEYS - {"signature"}:
+        raise ValueError(f"the witness manifest's members are {sorted(keys)}, not those of {WITNESS_MANIFEST_FORMAT}")
+
+    def is_seq(v):
+        return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= _JSON_SAFE_MAX
+
+    def is_hash(v):
+        return isinstance(v, str) and _EVENT_HASH_RE.fullmatch(v) is not None
+
+    def is_time(v):
+        return isinstance(v, str) and _WITNESS_TIME_RE.fullmatch(v) is not None
+
+    def is_object_ref(v):
+        return isinstance(v, dict) and set(v) == {"path", "sha256"} and isinstance(v["path"], str) and is_hash(v["sha256"])
+
+    if not isinstance(m["proxy_id"], str) or not _WITNESS_PROXY_RE.fullmatch(m["proxy_id"]):
+        raise ValueError("proxy_id")
+    for field in ("org_id", "project_id", "disclosure"):
+        if not isinstance(m[field], str) or not m[field]:
+            raise ValueError(field)
+    if not is_time(m["generated_at"]):
+        raise ValueError("generated_at")
+    if not is_seq(m["omitted_chains"]):
+        raise ValueError("omitted_chains")
+    signing = m["signing"]
+    if (not isinstance(signing, dict) or set(signing) != {"state", "key_id", "reason"}
+            or signing["state"] not in ("signed", "unsigned")
+            or signing["reason"] not in ("attestation_key", "no_attestation_key")
+            or not (signing["key_id"] is None or isinstance(signing["key_id"], str))):
+        raise ValueError("signing")
+    if "signature" in m:
+        sig = m["signature"]
+        if (not isinstance(sig, dict) or set(sig) != {"scheme", "alg", "key_id", "value"}
+                or sig["scheme"] != WITNESS_MANIFEST_FORMAT or sig["alg"] != "ES256"
+                or not isinstance(sig["key_id"], str) or not isinstance(sig["value"], str)):
+            raise ValueError("signature")
+    if not isinstance(m["chains"], list) or not isinstance(m["contradictions"], list):
+        raise ValueError("chains or contradictions")
+    names = []
+    for chain in m["chains"]:
+        if not isinstance(chain, dict) or set(chain) != {"chain", "heads", "omitted_earlier_heads"}:
+            raise ValueError("chain entry")
+        name = chain["chain"]
+        if not isinstance(name, str) or not _CHAIN_RE.fullmatch(name) or name in (".", ".."):
+            raise ValueError("chain name")
+        names.append(name.encode("utf-8"))
+        if not is_seq(chain["omitted_earlier_heads"]) or not isinstance(chain["heads"], list):
+            raise ValueError(f"chain {name}")
+        for h in chain["heads"]:
+            if not isinstance(h, dict) or h.get("basis") not in (WITNESS_BASIS_TIMESTAMP, WITNESS_BASIS_REPORTED):
+                raise ValueError(f"chain {name}: head basis")
+            if not is_seq(h.get("seq")) or not is_hash(h.get("event_hash")) or not is_time(h.get("received_at")):
+                raise ValueError(f"chain {name}: head seq, event_hash or received_at")
+            if h["basis"] == WITNESS_BASIS_TIMESTAMP:
+                if set(h) != {"basis", "seq", "event_hash", "received_at", "statement", "tokens"}:
+                    raise ValueError(f"chain {name} seq={h['seq']}: timestamp head members")
+                if not is_object_ref(h["statement"]) or not isinstance(h["tokens"], dict) or not h["tokens"]:
+                    raise ValueError(f"chain {name} seq={h['seq']}: statement or tokens")
+                for tsa_id, token in h["tokens"].items():
+                    if (not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", tsa_id) or not isinstance(token, dict)
+                            or set(token) != {"path", "sha256", "gen_time"} or not isinstance(token["path"], str)
+                            or not is_hash(token["sha256"]) or not is_time(token["gen_time"])):
+                        raise ValueError(f"chain {name} seq={h['seq']}: token {tsa_id!r}")
+            else:
+                if set(h) != {"basis", "seq", "event_hash", "observed_at", "received_at", "signed_head"}:
+                    raise ValueError(f"chain {name} seq={h['seq']}: reported head members")
+                if not is_time(h["observed_at"]) or not (h["signed_head"] is None or is_object_ref(h["signed_head"])):
+                    raise ValueError(f"chain {name} seq={h['seq']}: observed_at or signed_head")
+    if names != sorted(names) or len(set(names)) != len(names):
+        raise ValueError("chains are not sorted by name, or a chain repeats")
+    for c in m["contradictions"]:
+        if (not isinstance(c, dict) or set(c) != {"kind", "chain", "seq", "event_hash", "earlier_seq",
+                                                  "earlier_event_hash", "source", "detected_at"}
+                or c["kind"] not in _WITNESS_CONTRADICTION_KINDS or not isinstance(c["chain"], str)
+                or not is_seq(c["seq"]) or not is_hash(c["event_hash"])
+                or not (c["earlier_seq"] is None or is_seq(c["earlier_seq"]))
+                or not (c["earlier_event_hash"] is None or is_hash(c["earlier_event_hash"]))
+                or c["source"] not in ("heartbeat", "witness") or not is_time(c["detected_at"])):
+            raise ValueError("contradiction entry")
+
+
+def witness_signature_status(m, pins):
+    """(status, line) for the witness manifest's signature: `verified`,
+    `unsigned`, `not_checked` (signed, no pin given) or `failed`."""
+    signing = m["signing"]
+    sig = m.get("signature")
+    if sig is None:
+        if signing["state"] != "unsigned":
+            return "failed", ("FAIL witness file: signing.state says signed, but the manifest carries no signature "
+                              "(the file was altered)")
+        return "unsigned", ("WITNESS FILE UNSIGNED: the control plane that built it has no evidence attestation key; "
+                            "only heads backed by a timestamp token count, reported heads are listed for information")
+    if signing["state"] != "signed" or signing["key_id"] != sig["key_id"]:
+        return "failed", "FAIL witness file: signing does not name the key the signature names"
+    if not pins:
+        return "not_checked", (f"NOTICE witness file: signed by attestation key {sig['key_id']}, not checked: pass "
+                               f"--witness-key or --attestation-key (the project's attestation key) to count "
+                               f"reported heads")
+    pin = next((p for p in pins if p[1] == sig["key_id"]), None)
+    if pin is None:
+        return "failed", (f"FAIL witness file: signed by attestation key {sig['key_id']!r}, not the project key you "
+                          f"pinned ({', '.join(p[1] for p in pins)})")
+    try:
+        raw = base64.b64decode(sig["value"], validate=True)
+        digest = hashlib.sha256(witness_manifest_message(m)).digest()
+    except (binascii.Error, ValueError) as exc:
+        return "failed", f"FAIL witness file: the signature cannot be read ({exc})"
+    if len(raw) != 64 or not ecdsa_verify(P256, pin[0], digest, int.from_bytes(raw[:32], "big"),
+                                          int.from_bytes(raw[32:], "big")):
+        return "failed", (f"FAIL witness file: the signature does not verify under the project key you pinned "
+                          f"({pin[1]}); the file changed after it was signed")
+    return "verified", f"WITNESS FILE SIGNED: by the project attestation key you pinned ({pin[1]})"
+
+
+def pack_gateway(manifest):
+    """(gateway id, source) the pack is labelled with: its manifest's proxy_id,
+    else the gateway in a `local-chain:<gateway>` bucket label."""
+    proxy = manifest.get("proxy_id")
+    if isinstance(proxy, str) and proxy:
+        return proxy, "pack_label"
+    bucket = manifest.get("bucket")
+    if isinstance(bucket, str) and bucket.startswith("local-chain:") and len(bucket) > len("local-chain:"):
+        return bucket[len("local-chain:"):], "pack_label"
+    return None, "none"
+
+
+class WitnessOutcome:
+    """What --witness concluded; `summary` feeds the receipt."""
+
+    def __init__(self):
+        self.status = PASSED
+        self.file_sha256 = None
+        self.manifest_sha256 = None
+        self.proxy_id = None
+        self.generated_at = None
+        self.signature = "not_checked"
+        self.key_id = None
+        self.counted = 0
+        self.matched = 0
+        self.after = 0
+        self.not_counted = 0
+        self.through = None
+        self.bound = False
+
+    def receipt(self):
+        return {"file_sha256": self.file_sha256, "manifest_sha256": self.manifest_sha256, "proxy_id": self.proxy_id,
+                "generated_at": self.generated_at, "signature": self.signature, "key_id": self.key_id,
+                "heads_counted": self.counted, "heads_matched": self.matched, "heads_after_pack": self.after,
+                "heads_not_counted": self.not_counted}
+
+
+def _witness_timestamp_head(wf, m, chain, h, roots_for, signed):
+    """Judge one timestamp head's objects. Returns (verdict, detail, at):
+    `counted`, `not_counted`, `failed` or `cannot`."""
+    seq = h["seq"]
+    if h["statement"]["path"] != witness_statement_path(chain, seq):
+        return "failed", "the statement path does not match the witness layout", None
+    raw = wf.read(h["statement"]["path"])
+    if raw is None:
+        return "failed", "the statement object is missing", None
+    if hashlib.sha256(raw).hexdigest() != h["statement"]["sha256"]:
+        return "failed", "the statement does not match the manifest's digest", None
+    try:
+        statement = parse_anchor_statement(raw)
+    except AnchorFailure as exc:
+        return "failed", f"the statement is not a canonical anchor statement ({exc})", None
+    named = next((x for x in statement["heads"] if x["chain"] == chain and x["seq"] == seq), None)
+    if named is None:
+        return "failed", f"the statement does not name chain {chain} at this sequence", None
+    if named["event_hash"] != h["event_hash"]:
+        return "failed", "the statement names another event_hash than the manifest", None
+    run_id = statement["run_id"]
+    gateway = run_id.rsplit("/", 1)[0] if "/" in run_id else None
+    if gateway is not None and gateway != m["proxy_id"]:
+        return "failed", f"the statement names gateway {gateway!r}, not {m['proxy_id']!r}", None
+    imprint = anchor_imprint(raw)
+    verified, cannot = [], []
+    for tsa_id in sorted(h["tokens"]):
+        listed = h["tokens"][tsa_id]
+        if listed["path"] != witness_token_path(chain, seq, tsa_id):
+            return "failed", f"token {tsa_id}: the path does not match the witness layout", None
+        token = wf.read(listed["path"])
+        if token is None:
+            return "failed", f"token {tsa_id}: the object is missing", None
+        if hashlib.sha256(token).hexdigest() != listed["sha256"]:
+            return "failed", f"token {tsa_id}: the object does not match the manifest's digest", None
+        roots = roots_for(tsa_id)
+        if roots is None:
+            cannot.append(f"no trust root for witness {tsa_id}; pass --tsa-root {tsa_id}=FILE")
+            continue
+        try:
+            result = verify_tsa_token(token, imprint, roots)
+        except AnchorFailure as exc:
+            if exc.code == "malformed":
+                cannot.append(f"token {tsa_id} cannot be parsed ({exc.detail})")
+                continue
+            return "failed", f"token {tsa_id} does not verify ({exc})", None
+        if _iso(result["gen_time"]) != listed["gen_time"]:
+            return "failed", f"token {tsa_id}: the manifest's gen_time does not match the token", None
+        verified.append((result["gen_time"], f"{tsa_id} {_iso(result['gen_time'])}"))
+    if not verified:
+        if signed:
+            return "counted", "no token could be checked here; counted under the signed witness file", h["received_at"]
+        return "cannot", "; ".join(cannot), None
+    at = _iso(min(t for t, _ in verified))
+    detail = "; ".join(d for _, d in verified)
+    if gateway is None and not signed:
+        return "not_counted", (f"{detail}; its statement names no gateway (run_id {run_id!r}), so it is bound to "
+                               f"{m['proxy_id']} only by a signed witness file"), at
+    return "counted", detail, at
+
+
+def _witness_signed_head(wf, m, chain, h, keys):
+    """Check a reported head's gateway-signed head (ADR-0113). Returns
+    (failure line or None, note or None)."""
+    ref = h["signed_head"]
+    seq = h["seq"]
+    if ref["path"] != witness_signed_head_path(chain, seq):
+        return f"FAIL witness seq={seq}: the signed head path does not match the witness layout", None
+    raw = wf.read(ref["path"])
+    if raw is None:
+        return f"FAIL witness seq={seq}: the signed head object is missing", None
+    if hashlib.sha256(raw).hexdigest() != ref["sha256"]:
+        return f"FAIL witness seq={seq}: the signed head does not match the manifest's digest", None
+    try:
+        doc = json.loads(raw)
+    except ValueError as exc:
+        return f"FAIL witness seq={seq}: the signed head is not JSON ({exc})", None
+    statement, signature, problem = chain_head_parts(doc, f"{seq:020d}.json")
+    if problem:
+        return f"FAIL witness seq={seq}: the signed head {problem}", None
+    if (statement["proxy_id"] != m["proxy_id"] or statement["chain_id"] != chain
+            or statement["head_event_hash"] != h["event_hash"]):
+        return f"FAIL witness seq={seq}: the signed head names another gateway, chain or head than the manifest", None
+    if keys is None or keys.mode == "none":
+        return None, "its gateway signature was not checked (no --attestation-key or --gateway-key)"
+    key, problem = keys.resolve(statement["key_fingerprint"], statement["key_seq"])
+    if problem:
+        return None, f"its gateway signature was not checked ({problem})"
+    try:
+        message = CHAIN_HEAD_DOMAIN + jcs_dumps(statement).encode("utf-8")
+    except ValueError as exc:
+        return f"FAIL witness seq={seq}: the signed head has no RFC 8785 form ({exc})", None
+    if not ed25519_verify(key, message, signature):
+        return f"FAIL witness seq={seq}: the gateway signature on the head does not verify", None
+    return None, f"signed by gateway key {statement['key_fingerprint']}"
+
+
+def judge_witness(witness_path, manifest, records, pins, roots_for, keys, report=print):
+    """Judge the pack against a witness file. Returns a WitnessOutcome whose
+    status is PASSED, FAILED, CANNOT_EVALUATE or COVERAGE_NOT_ESTABLISHED.
+    `records` is seq -> record as the chain walk read it."""
+    out = WitnessOutcome()
+    try:
+        wf = WitnessFile(witness_path)
+        out.file_sha256 = wf.file_sha256
+        raw = wf.read(WITNESS_MANIFEST_NAME)
+        if raw is None:
+            raise ValueError(f"it holds no {WITNESS_MANIFEST_NAME}")
+        out.manifest_sha256 = hashlib.sha256(raw).hexdigest()
+        m = json.loads(raw)
+        check_witness_shape(m)
+    except (OSError, ValueError) as exc:
+        report(f"ERROR: --witness {witness_path}: cannot read the witness file ({exc})")
+        out.status = CANNOT_EVALUATE
+        return out
+    out.proxy_id, out.generated_at = m["proxy_id"], m["generated_at"]
+    out.key_id = (m.get("signature") or {}).get("key_id")
+    out.signature, line = witness_signature_status(m, pins)
+    report(f"WITNESS FILE: gateway {m['proxy_id']}, {len(m['chains'])} chain(s), built {m['generated_at']}")
+    report(line)
+    if out.signature == "failed":
+        out.status = FAILED
+        return out
+    signed = out.signature == "verified"
+
+    gateway, _ = pack_gateway(manifest)
+    if gateway is None:
+        report(f"ERROR: --witness: the pack names no gateway (no proxy_id and no local-chain bucket label), so the "
+               f"witness file of {m['proxy_id']} cannot be bound to it")
+        out.status = CANNOT_EVALUATE
+        return out
+    if gateway != m["proxy_id"]:
+        report(f"ERROR: --witness: the witness file is for gateway {m['proxy_id']}; the pack is labelled with gateway "
+               f"{gateway}. Download the witness file of the pack's gateway.")
+        out.status = CANNOT_EVALUATE
+        return out
+    out.bound = True
+    chain = chain_for_prefix(manifest.get("prefix", ""))
+    lo, hi = manifest.get("from_sequence"), manifest.get("to_sequence")
+    if chain is None or not _is_count(lo) or not _is_count(hi):
+        report("ERROR: --witness: the pack's chain or sequence bounds cannot be read")
+        out.status = CANNOT_EVALUATE
+        return out
+    for c in m["contradictions"]:
+        earlier = f", after seq={c['earlier_seq']}" if c["earlier_seq"] is not None else ""
+        report(f"NOTICE witness: the control plane recorded a {c['kind']} on chain {c['chain']} at seq={c['seq']}"
+               f"{earlier} ({c['source']}, {c['detected_at']})")
+    others = [c["chain"] for c in m["chains"] if c["chain"] != chain]
+    if others:
+        report(f"NOTICE witness: {len(others)} other chain(s) of gateway {m['proxy_id']} in the file were not judged")
+    entry = next((c for c in m["chains"] if c["chain"] == chain), None)
+    heads = entry["heads"] if entry else []
+    if entry and entry["omitted_earlier_heads"]:
+        report(f"NOTICE witness: {entry['omitted_earlier_heads']} earlier head(s) of chain {chain} are not in the file")
+
+    failures, cannot, counted = [], [], []
+    for h in heads:
+        seq, basis = h["seq"], h["basis"]
+        if basis == WITNESS_BASIS_TIMESTAMP:
+            verdict, detail, at = _witness_timestamp_head(wf, m, chain, h, roots_for, signed)
+        else:
+            verdict, detail, at = ("counted", f"received {h['received_at']}", h["received_at"]) if signed else (
+                "not_counted", "the witness file is not signed under a key you pinned", None)
+            if h["signed_head"] is not None:
+                failure, note = _witness_signed_head(wf, m, chain, h, keys)
+                if failure:
+                    verdict, detail = "failed", failure
+                elif note:
+                    detail = f"{detail}; {note}"
+        if verdict == "failed":
+            failures.append(detail if detail.startswith("FAIL") else f"FAIL witness seq={seq} ({basis}): {detail}")
+            continue
+        if verdict == "cannot":
+            cannot.append(f"ERROR: witness seq={seq} ({basis}) could not be evaluated: {detail}")
+            continue
+        record = records.get(seq) if lo <= seq <= hi else None
+        if verdict == "not_counted":
+            out.not_counted += 1
+            disagrees = record is not None and record.get("event_hash") != h["event_hash"]
+            report(f"NOTICE witness seq={seq} ({basis}): not counted: {detail}"
+                   + ("; it names another event_hash than the pack's record" if disagrees else ""))
+            continue
+        out.counted += 1
+        counted.append((seq, h["event_hash"], basis, at))
+        if seq > hi:
+            out.after += 1
+            report(f"COVERAGE witness seq={seq} ({basis}, {detail}): names chain {chain} at seq={seq}, after this "
+                   f"pack's last record seq={hi}")
+        elif seq < lo:
+            report(f"NOTICE witness seq={seq} ({basis}): before this pack's first record seq={lo}; not judged")
+        elif record is None:
+            report(f"NOTICE witness seq={seq} ({basis}): the record at that sequence was not read; not compared")
+        elif record.get("event_hash") != h["event_hash"]:
+            witness = "a timestamp authority saw" if basis == WITNESS_BASIS_TIMESTAMP else "the gateway reported"
+            failures.append(f"FAIL witness seq={seq} ({basis}, {detail}): {witness} head "
+                            f"{h['event_hash'][:16]}... at seq={seq}, but the pack's record there has "
+                            f"{str(record.get('event_hash'))[:16]}...; the pack contradicts a witnessed head")
+        else:
+            out.matched += 1
+            report(f"WITNESS seq={seq} ({basis}, {detail}): matches the pack's record")
+    if counted:
+        top = max(counted, key=lambda x: (x[0], x[2] == WITNESS_BASIS_TIMESTAMP))
+        out.through = {"seq": top[0], "event_hash": top[1], "basis": top[2], "at": top[3]}
+    for line in cannot + failures:
+        report(line)
+    if failures:
+        out.status = FAILED
+    elif cannot:
+        out.status = CANNOT_EVALUATE
+    elif not counted:
+        report(f"WITNESS COVERAGE NOT ESTABLISHED: no witnessed head of chain {chain} counts"
+               + ("" if signed or not heads else "; pass --witness-key to count reported heads in a signed file"))
+        out.status = COVERAGE_NOT_ESTABLISHED
+    elif out.after:
+        top = out.through
+        report(f"WITNESS COVERAGE NOT ESTABLISHED through seq={top['seq']}: the control plane witnessed chain {chain} "
+               f"at seq={top['seq']} ({top['basis']}, {top['at']}), and the pack ends at seq={hi}. The pack was built "
+               f"before that head, or records after seq={hi} were removed. Get a pack that runs through "
+               f"seq={top['seq']}.")
+        out.status = COVERAGE_NOT_ESTABLISHED
+    else:
+        top = out.through
+        report(f"WITNESS OK: chain {chain} matches {out.matched} witnessed head(s) inside the pack, witnessed through "
+               f"seq={top['seq']} ({top['basis']}, {top['at']}); the pack is tamper-evident against the witnessed "
+               f"heads, not proven complete")
+    return out
+
+
+def verification_receipt(code, manifest, manifest_bytes, records, signature_status, witness, require_through,
+                         args_allow_unsigned, pins, tsa_root_ids, verifier_bytes, now=None):
+    """The `meilynx.verification_receipt.v1` document of one run."""
+    verdicts = {EXIT_OK: "pass", EXIT_FAIL: "fail", EXIT_CANNOT_EVALUATE: "cannot_evaluate",
+                EXIT_UNSIGNED: "unsigned", EXIT_COVERAGE_NOT_ESTABLISHED: "coverage_not_established"}
+    gateway, source = pack_gateway(manifest)
+    if witness is not None and witness.bound:
+        gateway, source = witness.proxy_id, "witness_file"
+    lo, hi = manifest.get("from_sequence"), manifest.get("to_sequence")
+    lo, hi = (lo if _is_count(lo) else None), (hi if _is_count(hi) else None)
+    head = None
+    if hi is not None:
+        record = records.get(hi)
+        head = record.get("event_hash") if isinstance(record, dict) else None
+        if head is None:
+            head = next((e.get("stored_event_hash") for e in manifest.get("events", [])
+                         if isinstance(e, dict) and e.get("sequence") == hi), None)
+    if not (isinstance(head, str) and _EVENT_HASH_RE.fullmatch(head)):
+        head = None
+    try:
+        scope = manifest_claim(manifest)[0]
+    except (ValueError, ClaimContradiction):
+        scope = None
+    if witness is None and require_through is None:
+        coverage = "not_checked"
+    else:
+        reached = witness is None or (witness.bound and witness.status == PASSED)
+        if require_through is not None:
+            reached = reached and hi is not None and hi >= require_through
+        coverage = "established" if reached else "not_established"
+    events = manifest.get("events")
+    return {
+        "format": RECEIPT_FORMAT,
+        "verified_at": (now or datetime.datetime.now(datetime.timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "verifier": {"name": "meilynx-verify", "version": VERIFIER_VERSION,
+                     "sha256": hashlib.sha256(verifier_bytes).hexdigest()},
+        "result": {"exit_code": code, "verdict": verdicts[code]},
+        "gateway": {"proxy_id": gateway, "source": source},
+        "pack": {
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "pack_id": manifest.get("pack_id") if isinstance(manifest.get("pack_id"), str) else None,
+            "evidence_class": (manifest.get("evidence_class") if isinstance(manifest.get("evidence_class"), str)
+                               else None),
+            "signed": signature_status == PASSED,
+            "claim_scope": scope,
+            "records": len(events) if isinstance(events, list) else 0,
+        },
+        "chains": [{
+            "chain": chain_for_prefix(manifest.get("prefix", "")),
+            "from_sequence": lo,
+            "to_sequence": hi,
+            "head_event_hash": head,
+            "required_through": require_through,
+            "witnessed_through": witness.through if witness is not None else None,
+            "coverage": coverage,
+        }],
+        "witness_file": witness.receipt() if witness is not None else None,
+        "options": {"allow_unsigned": bool(args_allow_unsigned), "attestation_key_ids": sorted(p[1] for p in pins),
+                    "tsa_root_ids": sorted(tsa_root_ids)},
+    }
+
+
+def write_receipt(path, receipt):
+    Path(path).write_bytes(jcs_dumps(receipt).encode("utf-8"))
+
+
 def evidence_mode_findings(manifest, records):
     """Check the manifest's `evidence_modes` against the evidence_mode_resolved
     seals among the pack's records (`records`: seq -> parsed record) and print
@@ -17180,6 +17754,75 @@ def gateway_evidence_key_self_test():
     return ok
 
 
+def witness_self_test():
+    """Witness files and receipts (SPEC §6.9, §6.10): the signature over the
+    domain-tagged RFC 8785 bytes verifies under the pinned key and fails when
+    the manifest changes or another key is pinned (41a), an unsigned file and
+    an unpinned signed one are reported as such (41b), the closed shape
+    refuses an unknown member and an unsorted chain list (41c), the pack's
+    gateway label is read from proxy_id or a local-chain bucket (41d), and the
+    capabilities (41e). fixtures/run-witness-cases.py runs the command line
+    over the fixture witness files."""
+    ok = True
+
+    def check(label, passed, what, detail=''):
+        nonlocal ok
+        if passed:
+            print(f'SELF-TEST assertion {label} PASS: {what}')
+        else:
+            print(f'SELF-TEST assertion {label} FAIL: {what} {detail}', file=sys.stderr)
+            ok = False
+
+    d = 0x5A1F3C7E9B2D4F6A8C0E1B3D5F7A9C2E4B6D8F0A1C3E5B7D9F2A4C6E8B0D1F3A
+    pin = load_attestation_pin(json.dumps(_p256_self_test_jwk(d)))
+    other = load_attestation_pin(json.dumps(_p256_self_test_jwk(d + 1)))
+    m = {'chains': [], 'contradictions': [], 'disclosure': 'self-test', 'format': WITNESS_MANIFEST_FORMAT,
+         'generated_at': '2026-11-24T00:00:00Z', 'omitted_chains': 0, 'org_id': 'org', 'project_id': 'prj',
+         'proxy_id': 'pxy_self_test', 'signing': {'key_id': pin[1], 'reason': 'attestation_key', 'state': 'signed'}}
+    m['signature'] = {'alg': 'ES256', 'key_id': pin[1], 'scheme': WITNESS_MANIFEST_FORMAT,
+                      'value': base64.b64encode(_p256_self_test_sign(d, witness_manifest_message(m))).decode()}
+    edited = dict(m, generated_at='2026-11-24T00:00:01Z')
+    check('41a', witness_manifest_message(m).startswith(b'meilynx.witness_manifest.v1\x00{"chains":[]')
+          and witness_signature_status(m, [pin])[0] == 'verified'
+          and witness_signature_status(edited, [pin])[0] == 'failed'
+          and witness_signature_status(m, [other])[0] == 'failed',
+          'a witness manifest signature verifies under the pinned key over the domain-tagged RFC 8785 bytes, and '
+          'fails when the manifest changes or another key is pinned')
+    unsigned = {k: v for k, v in m.items() if k != 'signature'}
+    unsigned['signing'] = {'key_id': None, 'reason': 'no_attestation_key', 'state': 'unsigned'}
+    stripped = {k: v for k, v in m.items() if k != 'signature'}
+    check('41b', witness_signature_status(unsigned, [pin])[0] == 'unsigned'
+          and witness_signature_status(m, [])[0] == 'not_checked'
+          and witness_signature_status(stripped, [pin])[0] == 'failed',
+          'an unsigned file is unsigned, a signed file with no pin is not checked, and a file that says it is '
+          'signed but carries no signature fails')
+    refused = []
+    for bad in (dict(m, extra=1), dict(m, chains=[{'chain': 'b', 'heads': [], 'omitted_earlier_heads': 0},
+                                                  {'chain': 'a', 'heads': [], 'omitted_earlier_heads': 0}]),
+                dict(m, proxy_id='a/b'), dict(m, format='meilynx.witness_manifest.v2')):
+        try:
+            check_witness_shape(bad)
+        except ValueError:
+            refused.append(True)
+    try:
+        check_witness_shape(m)
+        accepted = True
+    except ValueError:
+        accepted = False
+    check('41c', accepted and len(refused) == 4,
+          'the witness manifest shape is closed: an unknown member, unsorted chains, a proxy_id with a slash and '
+          'an unknown format are refused')
+    check('41d', pack_gateway({'proxy_id': 'pxy_a', 'bucket': 'local-chain:pxy_b'}) == ('pxy_a', 'pack_label')
+          and pack_gateway({'bucket': 'local-chain:pxy_b'}) == ('pxy_b', 'pack_label')
+          and pack_gateway({'bucket': 'audit-bucket'}) == (None, 'none'),
+          "the pack's gateway is its manifest proxy_id, else the gateway of a local-chain bucket label")
+    check('41e', {'witness-file-v1', 'verification-receipt-v1'} <= VERIFIER_CAPABILITIES
+          and re.fullmatch(r'\d+\.\d+\.\d+', VERIFIER_VERSION) is not None,
+          'VERIFIER_CAPABILITIES advertises witness-file-v1 and verification-receipt-v1, and the version is '
+          'stated')
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Meilynx Integrity Pack reproducer — independently verifies GCS WORM audit chain.'
@@ -17329,6 +17972,37 @@ def main():
         ),
     )
     parser.add_argument(
+        '--witness',
+        metavar='FILE',
+        help=(
+            "A witness file (anchor file) downloaded from the gateway's control plane: a ZIP archive, or the same "
+            "tree as a directory, with witness-manifest.json. The pack must be labelled with the file's gateway. "
+            "A pack that contradicts a counted witnessed head fails (exit 1); one that ends before a counted "
+            f"witnessed head exits {EXIT_COVERAGE_NOT_ESTABLISHED} (coverage not established), whatever its manifest "
+            "claims. Heads backed by a timestamp token count on their own; heads the gateway reported between "
+            "anchors count only when the file's signature verifies under --attestation-key."
+        ),
+    )
+    parser.add_argument(
+        '--witness-key',
+        action='append',
+        default=[],
+        metavar='JWK',
+        help=(
+            "The project's evidence attestation key (the --attestation-key file) for the witness file's signature "
+            "only, for a pack that carries no evidence keys. --attestation-key also pins the witness file."
+        ),
+    )
+    parser.add_argument(
+        '--receipt',
+        metavar='FILE',
+        help=(
+            "Also write what this run concluded to FILE as a content-free JSON receipt "
+            "(meilynx.verification_receipt.v1, RFC 8785 bytes): the gateway, the chain, the pack's manifest digest, "
+            "the witness file's digests, the coverage bounds, the verifier version and digest, and the exit code."
+        ),
+    )
+    parser.add_argument(
         '--allow-unsigned',
         action='store_true',
         help=(
@@ -17356,6 +18030,7 @@ def main():
         ok = ocsf_export_self_test() and ok
         ok = record_signature_self_test() and ok
         ok = gateway_evidence_key_self_test() and ok
+        ok = witness_self_test() and ok
         sys.exit(0 if ok else 1)
 
     if not (args.bucket or args.records) or not args.manifest:
@@ -17375,6 +18050,15 @@ def main():
         parser.error("--conditions-acceptance needs --conditions-sha256")
     if args.require_through is not None and args.require_through < 0:
         parser.error("--require-through must be a sequence number (0 or more)")
+    if args.witness and not Path(args.witness).exists():
+        parser.error(f"--witness {args.witness}: no such file or directory")
+    if args.witness_key and not args.witness:
+        parser.error("--witness-key needs --witness")
+    try:
+        witness_pins = [load_attestation_pin(Path(k).read_text(encoding='utf-8')) for k in args.witness_key]
+    except (OSError, ValueError, KeyError, TypeError, binascii.Error) as exc:
+        parser.error(f"--witness-key must be a file holding the project's P-256 attestation key as a JWK ({exc})")
+    witness_pins += [p for p in attestation_pins if p[1] not in {w[1] for w in witness_pins}]
     supplied_acceptance = None
     if args.conditions_acceptance:
         try:
@@ -17402,11 +18086,35 @@ def main():
         print(f"ERROR: manifest is not valid JSON: {exc}", file=sys.stderr)
         sys.exit(EXIT_FAIL)
 
+    witness_outcome = None
+
+    def finish(code, records=None, signature_status=None):
+        """Exit with `code`, first writing the receipt when --receipt asks."""
+        if args.receipt:
+            if args.witness and witness_outcome is None:
+                outcome = WitnessOutcome()
+                outcome.status = CANNOT_EVALUATE
+            else:
+                outcome = witness_outcome
+            receipt = verification_receipt(
+                code, manifest, manifest_bytes, records or {}, signature_status, outcome, args.require_through,
+                args.allow_unsigned, witness_pins, [s.partition('=')[0] for s in args.tsa_root],
+                Path(__file__).read_bytes())
+            try:
+                write_receipt(args.receipt, receipt)
+                print(f"RECEIPT: {RECEIPT_FORMAT} written to {args.receipt}")
+            except OSError as exc:
+                print(f"ERROR: cannot write the receipt to {args.receipt} ({exc})", file=sys.stderr)
+        sys.exit(code)
+
+    if not isinstance(manifest, dict):
+        print("ERROR: manifest is not a JSON object", file=sys.stderr)
+        sys.exit(EXIT_FAIL)
     version_error = (manifest_schema_version_error(manifest) or manifest_storage_layout_error(manifest)
                      or manifest_evidence_class_error(manifest) or manifest_content_error(manifest))
     if version_error:
         print(f"ERROR: {version_error}", file=sys.stderr)
-        sys.exit(EXIT_CANNOT_EVALUATE)
+        finish(EXIT_CANNOT_EVALUATE)
     if evidence_class_suffix(manifest):
         print(f"EVIDENCE CLASS: {manifest['evidence_class']} ({EVIDENCE_CLASSES[manifest['evidence_class']]}).")
     # What the pack claims to hold; anchors are judged against it.
@@ -17422,12 +18130,12 @@ def main():
         print("ERROR: this pack's records are content-stripped (manifest 1.5); --bucket would read the holder's "
               "full records, which are not what the manifest describes. Verify the pack's own records with "
               "--records.", file=sys.stderr)
-        sys.exit(EXIT_CANNOT_EVALUATE)
+        finish(EXIT_CANNOT_EVALUATE)
     try:
         tsa_roots = load_tsa_roots(args.tsa_root)
     except (OSError, ValueError, DerError) as exc:
         print(f"ERROR: unusable --tsa-root ({exc})", file=sys.stderr)
-        sys.exit(EXIT_CANNOT_EVALUATE)
+        finish(EXIT_CANNOT_EVALUATE)
 
     signed = pack_is_signed(manifest)
     # A manifest signed by the gateway evidence key is judged
@@ -17532,15 +18240,25 @@ def main():
             chain_status = CANNOT_EVALUATE
         print()
         anchor_status = verify_anchors(manifest, fetch, anchor_source, tsa_roots.get, record_times)
+        # The pack against the heads its gateway's control plane witnessed.
+        if args.witness:
+            print()
+            if chain_status == CANNOT_EVALUATE:
+                print("NOTICE: --witness was not judged: the pack's records could not be evaluated")
+            else:
+                witness_outcome = judge_witness(args.witness, manifest, pack_full_records, witness_pins,
+                                                tsa_roots.get, evidence_keys)
     count = len(manifest.get('events', []))
     # The verdict counts the hash-only stubs it linked through.
     stub_count = len(manifest_stubs(manifest))
     stubbed = (f", {stub_count} of them as hash-only stubs (linked, hash not recomputed)" if stub_count else "")
     # The gateway evidence-key verdict (attestations, seals, signed heads)
     # combines with the chain's by the same precedence.
-    code = final_exit_code(combine_with_anchor_status(
+    witness_status = witness_outcome.status if witness_outcome is not None else (
+        CANNOT_EVALUATE if args.witness else PASSED)
+    code = final_exit_code(combine_with_anchor_status(combine_with_anchor_status(
         combine_with_anchor_status(combine_with_anchor_status(chain_status, claim_status), anchor_status),
-        evidence_status or PASSED), signature_status, bool(args.allow_unsigned))
+        evidence_status or PASSED), witness_status), signature_status, bool(args.allow_unsigned))
     # The OCSF export beside the pack. Its verdict
     # combines with the pack's by the same precedence (1 > 2 > 4 > 3 > 0).
     if args.ocsf_export:
@@ -17605,12 +18323,18 @@ def main():
             print(f"\nFAIL: the manifest signature did not verify (see above).{label}", file=sys.stderr)
         if evidence_status == FAILED:
             print(f"\nFAIL: the gateway evidence-key check failed (see above).{label}", file=sys.stderr)
+        if witness_status == FAILED:
+            print(f"\nFAIL: the pack contradicts a witnessed head, or the witness file is inconsistent "
+                  f"(see above).{label}", file=sys.stderr)
     elif code == EXIT_CANNOT_EVALUATE and gateway_signed and signature_status == CANNOT_EVALUATE:
         print(f"\nCANNOT EVALUATE: {NO_PINNED_KEY}. This pack is signed by a gateway evidence key; nothing in it "
               f"can say whose key that is. Pass --attestation-key (the project's attestation key) or "
               f"--gateway-key (the gateway's own key).{label}", file=sys.stderr)
     elif code == EXIT_CANNOT_EVALUATE and evidence_status == CANNOT_EVALUATE and chain_status != CANNOT_EVALUATE:
         print(f"\nCANNOT EVALUATE: the gateway evidence-key check could not be evaluated (see above).{label}",
+              file=sys.stderr)
+    elif code == EXIT_CANNOT_EVALUATE and witness_status == CANNOT_EVALUATE and chain_status != CANNOT_EVALUATE:
+        print(f"\nCANNOT EVALUATE: the pack could not be judged against the witness file (see above).{label}",
               file=sys.stderr)
     elif code == EXIT_CANNOT_EVALUATE and conditions_status == CANNOT_EVALUATE and chain_status != CANNOT_EVALUATE:
         print(f"\nCANNOT EVALUATE: the customer-conditions verdict cannot be evaluated from this pack "
@@ -17621,7 +18345,8 @@ def main():
     elif code == EXIT_COVERAGE_NOT_ESTABLISHED:
         if signature_status != PASSED:
             print(f"\n{UNSIGNED_NOTICE}")
-        witness = ("a chain head the gateway signed" if evidence_status == COVERAGE_NOT_ESTABLISHED
+        witness = ("a head the control plane witnessed" if witness_status == COVERAGE_NOT_ESTABLISHED
+                   else "a chain head the gateway signed" if evidence_status == COVERAGE_NOT_ESTABLISHED
                    else "a verified anchor")
         print(f"\nINTEGRITY OK, COVERAGE NOT ESTABLISHED: all {count} events verified{stubbed}, but {witness} "
               f"shows the chain went on past the head this pack claims (see above). This is not a "
@@ -17641,7 +18366,7 @@ def main():
                 f"is unsigned. Pass --allow-unsigned to accept an unsigned pack.{label}",
                 file=sys.stderr,
             )
-    sys.exit(code)
+    finish(code, pack_full_records, signature_status)
 
 
 if __name__ == '__main__':
