@@ -11768,7 +11768,7 @@ def _witness_timestamp_head(wf, m, chain, h, roots_for, signed):
 
 
 def _witness_signed_head(wf, m, chain, h, keys):
-    """Check a reported head's gateway-signed head (ADR-0113). Returns
+    """Check a reported head's gateway-signed head (SPEC §12). Returns
     (failure line or None, note or None)."""
     ref = h["signed_head"]
     seq = h["seq"]

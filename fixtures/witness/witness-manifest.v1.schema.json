@@ -113,7 +113,7 @@
         "received_at": {"$ref": "#/$defs/time", "description": "The control plane's clock when it received the report: the witnessed time."},
         "signed_head": {
           "oneOf": [{"type": "null"}, {"$ref": "#/$defs/object"}],
-          "description": "head-signatures/<chain>/<seq:020d>.json: {statement, signature}, the meilynx.evidence.chain_head.v1 statement the gateway signed with its evidence key (ADR-0113) naming this proxy_id, chain, seq and event_hash, as relayed on the heartbeat. Checked under the pack's evidence keys when the reader pins them; it never makes a head count on its own."
+          "description": "head-signatures/<chain>/<seq:020d>.json: {statement, signature}, the meilynx.evidence.chain_head.v1 statement the gateway signed with its evidence key (meilynx-verify SPEC §12) naming this proxy_id, chain, seq and event_hash, as relayed on the heartbeat. Checked under the pack's evidence keys when the reader pins them; it never makes a head count on its own."
         }
       }
     },
