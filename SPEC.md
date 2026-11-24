@@ -1377,6 +1377,139 @@ seq=N: <old> -> <new> (<source>)` where the mode differs from the seal before
 it. A pack with no seal prints `EVIDENCE MODE: no evidence-mode seal among
 this pack's records`.
 
+### 6.9 Witness files
+
+A gateway with no write-once store holds its own record (§6.5): whoever
+controls it can rewrite or remove records before a pack is built, and the
+anchors inside the pack come from the same gateway. A gateway enrolled with
+a control plane reports its chain heads there: on each heartbeat the head of
+every chain (sequence and `event_hash`, with the head its evidence key
+signed, §12), and, on an upload of their own, each anchor statement (§6.1)
+with every timestamp token over it. The control plane verifies each token on
+arrival and keeps all of it append-only. The organization's compliance
+members download it as a **witness file**, and `--witness FILE` judges a
+pack against it.
+
+**Layout.** A ZIP archive, or the same tree as a directory:
+
+| Member | Content |
+|---|---|
+| `witness-manifest.json` | The index below, as RFC 8785 bytes |
+| `anchors/{chain}/{seq:020d}.json` | An anchor statement, the exact bytes the tokens are over |
+| `anchors/{chain}/{seq:020d}.{tsa_id}.tsr` | One `TimeStampResp` per witness, each verified by the control plane on arrival |
+| `head-signatures/{chain}/{head_sequence:020d}.json` | `{statement, signature}`: a chain head the gateway signed (§12), as it reported it |
+
+**Manifest** (`meilynx.witness_manifest.v1`; the JSON schema and an example
+are `fixtures/witness/witness-manifest.v1.schema.json` and
+`fixtures/witness/witness-manifest.v1.example.json`):
+
+```json
+{
+  "format": "meilynx.witness_manifest.v1",
+  "generated_at": "2026-11-24T00:00:00Z",
+  "org_id": "…", "project_id": "…", "proxy_id": "<gateway>",
+  "chains": [{
+    "chain": "<chain name>",
+    "heads": [
+      {"basis": "reported", "seq": 3, "event_hash": "<hex>", "observed_at": "…", "received_at": "…",
+       "signed_head": {"path": "head-signatures/<chain>/00000000000000000003.json", "sha256": "<hex>"} | null},
+      {"basis": "timestamp", "seq": 4, "event_hash": "<hex>", "received_at": "…",
+       "statement": {"path": "anchors/<chain>/00000000000000000004.json", "sha256": "<hex>"},
+       "tokens": {"<tsa_id>": {"path": "anchors/<chain>/00000000000000000004.<tsa_id>.tsr", "sha256": "<hex>",
+                               "gen_time": "…"}}}
+    ],
+    "omitted_earlier_heads": 0
+  }],
+  "omitted_chains": 0,
+  "contradictions": [{"kind": "fork" | "rewind" | "witness_conflict", "chain": "…", "seq": 4, "event_hash": "<hex>",
+                      "earlier_seq": 6, "earlier_event_hash": "<hex>", "source": "heartbeat" | "witness",
+                      "detected_at": "…"}],
+  "signing": {"state": "signed" | "unsigned", "key_id": "<thumbprint>" | null,
+              "reason": "attestation_key" | "no_attestation_key"},
+  "disclosure": "<fixed text>",
+  "signature": {"scheme": "meilynx.witness_manifest.v1", "alg": "ES256", "key_id": "<thumbprint>",
+                "value": "<base64>"}
+}
+```
+
+Times are UTC to the second. `chains` is sorted by name and `heads` by
+sequence. `signature` is present exactly when `signing.state` is `signed`:
+ECDSA P-256 with SHA-256 over `"meilynx.witness_manifest.v1" 0x00` followed
+by the RFC 8785 bytes of the manifest without `signature`; `value` is the
+64-byte `r || s` in standard base64 and `key_id` the RFC 7638 thumbprint of
+the project's evidence attestation key (the key of §12's attestations).
+`contradictions` lists what the control plane recorded as an integrity
+finding: another hash at a sequence already reported (a fork), a lower
+sequence after a higher one (a rewind), or another payload under a held
+key. The heads on both sides are in `heads`, so a pack can match at most one
+of them.
+
+**Which heads count.** A `timestamp` head counts on the timestamp
+authority's signature alone: at least one of its tokens verifies (§6.1, with
+the roots of §6.1 and `--tsa-root`) over a canonical statement that names
+this chain at this sequence with this `event_hash`, and whose `run_id` is
+`<proxy_id>/<boot id>` for the file's gateway. A `reported` head, and a
+timestamp head whose statement names no gateway, counts only when the
+manifest's signature verifies under the attestation key the reader pins
+(`--witness-key`, or `--attestation-key`). A file without a signature counts
+only timestamp-backed heads; the verifier says so, and lists the others as
+not counted. A head's `signed_head` is checked when the reader pins the
+gateway's key (`--gateway-key`) or the pack carries attestations
+(`--attestation-key`); it never makes a head count on its own.
+
+**What a verifier checks** (`verify-pack.py --witness FILE` does all of these):
+
+| Finding | Verdict |
+|---|---|
+| The file cannot be read, has no `witness-manifest.json`, or its manifest is outside the format | Cannot evaluate (exit 2) |
+| The pack names no gateway (no `proxy_id`, no `local-chain:<gateway>` bucket label), or another gateway than the file | Cannot evaluate (exit 2) |
+| A signature that does not verify under the pinned key, a key that is not pinned, or a `signing` member that disagrees with the signature | Fail (exit 1) |
+| A listed object that is missing, does not match its digest or path, a statement that is not canonical or names another head, gateway or chain, a token that does not verify, a `gen_time` that is not the token's, or a signed head that names another gateway, chain or head | Fail (exit 1) |
+| A counted head inside the pack whose record carries another `event_hash` | Fail (exit 1): the pack contradicts a witnessed head |
+| A counted head after the pack's last record, whatever the pack claims | Coverage not established (exit 4) |
+| No counted head for the pack's chain | Coverage not established (exit 4) |
+| A head that does not count, a head before the pack's first record, another chain of the gateway, a recorded contradiction | NOTICE |
+| A token whose witness has no trust root, or that cannot be parsed, on a head that does not otherwise count | Cannot evaluate (exit 2) |
+
+A pass prints `WITNESS OK: chain <chain> matches <n> witnessed head(s)
+inside the pack, witnessed through seq=<seq> (<basis>, <time>)`. A witnessed
+head shows that the gateway reported that head, or that a timestamp
+authority saw it, at that time; it does not show that the records behind it
+were kept. A pack that passes is tamper-evident against the witnessed heads,
+not proven complete: records written after the last witnessed head are
+shown only to be consistent with each other.
+
+### 6.10 Verification receipts
+
+`--receipt FILE` writes what the run concluded as a content-free JSON
+document, `meilynx.verification_receipt.v1`, in RFC 8785 bytes (schema and
+example: `fixtures/witness/verification-receipt.v1.schema.json` and
+`fixtures/witness/verification-receipt.v1.example.json`). It binds:
+
+- the result: `exit_code` and its name (`pass`, `fail`, `cannot_evaluate`,
+  `unsigned`, `coverage_not_established`);
+- the verifier: `version` and the SHA-256 of the `verify-pack.py` that ran;
+- the gateway: the witness file's `proxy_id` when it was bound to the pack,
+  else the pack's own label;
+- the pack: the SHA-256 of its `manifest.json` (which lists every record's
+  hash), its id, evidence class, claim scope, record count and whether its
+  signature verified;
+- each chain: its sequence bounds, the `event_hash` it ends at, the
+  `--require-through` value, the highest counted witnessed head, and whether
+  coverage was established;
+- the witness file: the SHA-256 of the file and of its manifest, its
+  gateway, signature result and key, and the heads counted, matched, after
+  the pack and not counted;
+- the options that change the verdict: `--allow-unsigned`, the pinned
+  attestation keys and the witnesses given roots.
+
+`verified_at` is the clock of the host that ran the verifier, and nothing in
+the receipt vouches for it. The receipt is unsigned: re-running the same
+verifier on the same pack and witness file gives the same receipt apart from
+`verified_at`. A receipt is written for every run that read the pack's
+manifest (not for a usage error or an unreadable manifest or records
+directory). Only exit 0 is a pass.
+
 ## 7. Signed packs (window B)
 
 ### 7.1 Descriptor and bundle

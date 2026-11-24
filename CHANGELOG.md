@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.16.0 (unreleased)
+
+- Witness files (SPEC §6.9, `--witness FILE`): a pack checked against the
+  chain heads its gateway reported to its control plane and the timestamp
+  tokens it uploaded there, as a ZIP archive (or directory) with
+  `witness-manifest.json` (`meilynx.witness_manifest.v1`) bound to the
+  gateway and its chains.
+  - A pack that contradicts a counted witnessed head fails (exit 1); one
+    that ends before one is coverage not established (exit 4), whatever its
+    manifest claims; a witness file of another gateway is cannot evaluate
+    (exit 2). Precedence stays 1, 2, 4, 3.
+  - Heads backed by a timestamp token over a statement that names the
+    gateway count on their own. Heads reported between anchors count only
+    when the file's signature verifies under the project's attestation key
+    (`--witness-key`, or `--attestation-key`).
+- Verification receipts (SPEC §6.10, `--receipt FILE`): the run's
+  conclusion as content-free JSON (`meilynx.verification_receipt.v1`).
+- `VERIFIER_CAPABILITIES` adds `witness-file-v1` and
+  `verification-receipt-v1`; `VERIFIER_VERSION` states the version. Self-test
+  assertions 41a to 41e; `fixtures/witness/` with nine witness files and
+  twenty runs (`fixtures/run-witness-cases.py`).
+- Packs checked without `--witness` verify as before.
+
 ## 0.15.0 (2026-11-22)
 
 - `verify-pack.py` from meilynx-proxy `69d533f`.
