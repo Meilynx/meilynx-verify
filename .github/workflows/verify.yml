@@ -125,6 +125,26 @@ jobs:
           diff -r /tmp/regen/local-chain fixtures/local-chain
       - name: Local-chain packs; coverage claims (exit 4) and evidence modes exit with their verdicts
         run: python fixtures/run-local-chain-cases.py
+      - name: Witness files; each pack exits as expected against them, and every run writes its receipt
+        run: python fixtures/run-witness-cases.py
+      - name: Witness files were generated from this verifier (member for member)
+        run: |
+          python fixtures/gen-witness-fixtures.py /tmp/regen/witness
+          for f in attestation-key.jwk wrong-attestation-key.jwk witness-manifest.v1.example.json; do
+            diff /tmp/regen/witness/$f fixtures/witness/$f
+          done
+          python - <<'EOF'
+          import sys, zipfile
+          from pathlib import Path
+          new, old = Path('/tmp/regen/witness/files'), Path('fixtures/witness/files')
+          names = sorted(p.name for p in old.iterdir())
+          if names != sorted(p.name for p in new.iterdir()):
+              sys.exit(f'witness files differ: {names}')
+          for name in names:
+              a, b = zipfile.ZipFile(old / name), zipfile.ZipFile(new / name)
+              if a.namelist() != b.namelist() or any(a.read(n) != b.read(n) for n in a.namelist()):
+                  sys.exit(f'{name} was not generated from this verifier')
+          EOF
       - name: Record signatures; each writer-sealed case exits with its verdict
         run: python fixtures/run-record-sig-cases.py
       - name: Embedded signature test vectors match their generator
