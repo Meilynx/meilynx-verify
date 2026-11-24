@@ -58,6 +58,15 @@ python3 verify-pack.py --records fixtures/local-chain/judgment-verdicts-v2/recor
 # 7. Verify a chain that holds scheduled control probe runs
 python3 verify-pack.py --records fixtures/local-chain/control-probe-runs/records \
   --manifest fixtures/local-chain/control-probe-runs/manifest.json --allow-unsigned
+
+# 8. Check the local-chain pack against the heads its control plane witnessed,
+#    with the test project's attestation key, and write a receipt
+python3 verify-pack.py --records fixtures/local-chain/clean/records \
+  --manifest fixtures/local-chain/clean/manifest.json --allow-unsigned \
+  --tsa-root test-rsa=fixtures/anchors/roots/rsa-root.pem \
+  --tsa-root test-ec=fixtures/anchors/roots/ec-root.pem \
+  --witness fixtures/witness/files/signed.zip \
+  --witness-key fixtures/witness/attestation-key.jwk --receipt /tmp/receipt.json
 ```
 
 Exit codes, the same online and offline:
@@ -65,10 +74,10 @@ Exit codes, the same online and offline:
 | Code | Meaning |
 |---|---|
 | `0` | Every record verified, and on a signed pack the signature too. An unsigned pack reaches `0` only with `--allow-unsigned`, and the output still says authenticity is not established. |
-| `1` | Verification failed. The output names the first record that failed and why (hash mismatch, chain break, missing record, unknown record kind, two stored copies of one record that differ), why the signature failed, which chain-head anchor failed and why, or which gateway evidence-key check failed (see "Gateway evidence key" below). |
+| `1` | Verification failed. The output names the first record that failed and why (hash mismatch, chain break, missing record, unknown record kind, two stored copies of one record that differ), why the signature failed, which chain-head anchor failed and why, which gateway evidence-key check failed (see "Gateway evidence key" below), or which witnessed head the pack contradicts (see "Witness files" below). |
 | `2` | This verifier cannot evaluate the pack: an unsupported hash version, manifest version, storage layout, evidence class, content claim, signature method or bundle format (use a newer release), an unusable `--trusted-root`, an anchor from a witness with no trust root (pass `--tsa-root`), a pack signed by a per-tenant signer checked without `--certificate-identity`, a pack or export signed by a gateway evidence key checked with neither `--attestation-key` nor `--gateway-key`, or a content-stripped pack read with `--bucket` or still carrying a removed field. |
 | `3` | The records verified, but the pack is unsigned, so nothing shows who produced the manifest. |
-| `4` | Integrity passed, coverage not established. Every record verified, but the pack does not reach a sequence the chain is known to have reached: the pack claims the whole chain up to its head and a verified chain-head anchor, or a chain head the gateway signed, names a later head, or the pack stops before the sequence you passed with `--require-through`. Not a pass, and not a tampering verdict (see "Local-chain evidence" below). |
+| `4` | Integrity passed, coverage not established. Every record verified, but the pack does not reach a sequence the chain is known to have reached: the pack claims the whole chain up to its head and a verified chain-head anchor, or a chain head the gateway signed, names a later head, the pack stops before the sequence you passed with `--require-through`, or it stops before a head its control plane witnessed (`--witness`). Not a pass, and not a tampering verdict (see "Local-chain evidence" below). |
 
 When more than one applies, `1` outranks `2`, `2` outranks `4`, and `4`
 outranks `3`. `--allow-unsigned` turns `3` into `0`; it never turns `4` into
@@ -408,6 +417,60 @@ manifest (exit `1`), and the six judgment verdict packs described below.
 and output lines; `fixtures/gen-local-chain-fixtures.py` writes them and says
 where each record comes from.
 
+## Witness files
+
+A local-chain pack comes from the gateway whose record it is, and so do the
+anchors inside it. A gateway enrolled with a control plane also reports its
+chain heads there, on every heartbeat, and uploads each anchor statement
+with its timestamp tokens. The control plane verifies the tokens when they
+arrive and keeps everything append-only. The organization's compliance
+members download it for one gateway as a witness file (a ZIP archive with
+`witness-manifest.json`, the statements and tokens under `anchors/` and the
+heads the gateway signed under `head-signatures/`, [SPEC.md](SPEC.md) §6.9),
+and check a pack against it:
+
+```bash
+python3 verify-pack.py --records ./records --manifest manifest.json --allow-unsigned \
+  --witness anchor-file.zip --witness-key attestation-key.jwk --receipt receipt.json
+```
+
+- A pack that contradicts a witnessed head inside it fails (exit `1`): the
+  record at that sequence carries another hash than the one the gateway
+  reported or a timestamp authority saw.
+- A pack that ends before a witnessed head is coverage not established (exit
+  `4`), whatever its manifest claims. Ask for a pack that runs through it.
+- The pack must be labelled with the file's gateway; a file of another
+  gateway is cannot evaluate (exit `2`).
+
+**Which heads count.** A head backed by a timestamp token counts on the
+timestamp authority's signature alone, when the anchor statement names the
+gateway. A head the gateway reported between anchors counts only when the
+witness file is signed with the project's evidence attestation key and you
+pin that key (`--witness-key`; `--attestation-key` also pins it, and checks
+the pack's own evidence keys). An unsigned witness file counts only
+timestamp-backed heads, and the verifier says so; a control plane that has
+no attestation key configured serves unsigned files.
+
+**What it shows.** A witnessed head shows that the gateway reported that
+head, or that a timestamp authority saw it, at that time. A pack that passes
+is tamper-evident against the witnessed heads: a record the gateway changed
+or removed at or before a witnessed head no longer matches it. It does not
+show that the records behind a head were kept, or anything about records
+written after the last witnessed head.
+
+**Receipts.** `--receipt FILE` writes the run's conclusion as content-free
+JSON (`meilynx.verification_receipt.v1`, SPEC §6.10): the gateway, the
+chain and its bounds, the SHA-256 of the pack's manifest and of the witness
+file, the highest witnessed head that counted, the verifier's version and
+the SHA-256 of the file that ran, and the exit code. It is unsigned, and
+re-running the same verifier on the same inputs gives the same receipt apart
+from its time.
+
+`fixtures/witness/` holds nine witness files for the local-chain packs and
+the two schemas with an example each; `fixtures/run-witness-cases.py` runs
+twenty checks against them and `fixtures/gen-witness-fixtures.py` writes
+them and says where each byte comes from.
+
 ## Judgment verdict receipts
 
 A gateway can run judgments: checks of a model request against an
@@ -646,7 +709,7 @@ It does **not** prove:
 ## Versions
 
 The verifier understands chain records with `schema_version` v1 through
-v1.24, stored per record or in segment objects, and pack manifests 1.0
+v1.25, stored per record or in segment objects, and pack manifests 1.0
 through 1.5 (1.1 adds chain-head anchors, 1.2 the storage layout, 1.3 the
 control-plane chain, 1.4 the evidence class label, 1.5 the content-stripped
 pack with its hash-only stubs). It declares the pack features it checks in
@@ -657,7 +720,9 @@ pack with its hash-only stubs). It declares the pack features it checks in
 `customer-conditions-v1`, `record-signatures-v1`, `compliance-records-v1`,
 `local-chain-evidence-v1`, `coverage-claim-v1`, `evidence-modes-v1`,
 `gateway-evidence-key-v1`, `judgment-verdicts-v1`,
-`judgment-verdicts-v2`, `control-probe-runs-v1` and `judgment-verdicts-v3`.
+`judgment-verdicts-v2`, `control-probe-runs-v1`, `judgment-verdicts-v3`,
+`witness-file-v1`, `verification-receipt-v1`, `context-provenance-v1` and
+`provenance-verifications-v1`.
 A record of an unknown
 version or kind fails verification rather than being skipped; a manifest of
 an unknown version, storage layout, evidence class or content claim is

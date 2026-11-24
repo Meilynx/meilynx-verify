@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.16.0 (2026-11-24)
+
+- `verify-pack.py` from meilynx-proxy `e786536`.
+- **Upgrade before verifying chains or packs written after this release.**
+  A verifier older than 0.16.0 fails every v1.25 record (exit 1). It never
+  reports such a chain as a pass.
+- Witness files (SPEC §6.9, `--witness FILE`): a pack checked against the
+  chain heads its gateway reported to its control plane and the timestamp
+  tokens it uploaded there, as a ZIP archive (or directory) with
+  `witness-manifest.json` (`meilynx.witness_manifest.v1`) bound to the
+  gateway and its chains.
+  - A pack that contradicts a counted witnessed head fails (exit 1); one
+    that ends before one is coverage not established (exit 4), whatever its
+    manifest claims; a witness file of another gateway is cannot evaluate
+    (exit 2). Precedence stays 1, 2, 4, 3.
+  - Heads backed by a timestamp token over a statement that names the
+    gateway count on their own. Heads reported between anchors count only
+    when the file's signature verifies under the project's attestation key
+    (`--witness-key`, or `--attestation-key`).
+- Verification receipts (SPEC §6.10, `--receipt FILE`): the run's
+  conclusion as content-free JSON (`meilynx.verification_receipt.v1`).
+- `VERIFIER_CAPABILITIES` adds `witness-file-v1` and
+  `verification-receipt-v1`; `VERIFIER_VERSION` states the version. Self-test
+  assertions 41a to 41e; `fixtures/witness/` with nine witness files and
+  twenty runs (`fixtures/run-witness-cases.py`).
+- Chain v1.25 (SPEC §4.3): an `llm_request` sealed with its context
+  provenance list. The `content` block adds `provenance_sha256_jcs`, the JCS
+  SHA-256 of the list, fed presence-tagged after every v1.19 feed. The list
+  (`content.provenance`: `entries`, `declarations`, `complete`) is stored
+  beside the record, bound through the digest, and stays in a
+  content-stripped pack. Each entry names one tool-result or
+  caller-declared block by its locator, with its kind, a label as asserted
+  by the caller, and the SHA-256 and length of the block's canonical bytes.
+  - The list's integrity is always checked: it hashes to the sealed digest,
+    has the closed shape, names each locator once, and gives every declared
+    block an entry labelled with its declared source id.
+  - Where the record retains its messages as captured (capture policy
+    `full`, stored prompt digest equal to the captured one), each entry is
+    also checked against its block: every tool-result and declared block
+    has exactly one entry of the right kind whose sha256 and bytes are the
+    block's, no entry names anything else, and the list says it is
+    complete. Otherwise the verifier notes "content not retained: list
+    integrity only", never a failure and never a content pass.
+  - A provenance digest or list on any other version or off the LLM lane, a
+    list without its digest, and a v1.25 `llm_request` without a policy
+    version fail.
+  - A pass shows that the stated list was recorded and has not changed
+    since, not that a label names the source it claims.
+- Chain v1.25 also holds a new kind, `provenance.verification`: a gateway's
+  own run of these checks over its `llm_request` records of a window, as
+  counts. 27 hashed fields: the kind attestation, then the run id, the
+  window start and cutoff, the verifier version, the evidence mode, and the
+  eligible, complete-verified, integrity-only, missing-list,
+  integrity-failure and unreadable counts.
+  - The verifier checks that the payload has exactly these members, the id
+    is a UUID, the window is in UTC and ends after it starts, the verifier
+    version is `provenance-check.v1`, the evidence mode is `write_once` or
+    `local_chain`, and the eligible count is the sum of the complete,
+    integrity-only, missing-list and integrity-failure counts.
+  - The payload on any other version or kind, a verification record
+    without it, and one that also carries another kind's payload or an LLM
+    field fail.
+  - `provenance_check_outcome` is the classification such a run counts, so
+    a window can be recounted from the records in a pack.
+- `VERIFIER_CAPABILITIES` adds `context-provenance-v1` and
+  `provenance-verifications-v1`. Self-test assertions 42a to 42g.
+- Packs without v1.25 records, checked without `--witness`, verify as
+  before.
+
 ## 0.15.0 (2026-11-22)
 
 - `verify-pack.py` from meilynx-proxy `69d533f`.

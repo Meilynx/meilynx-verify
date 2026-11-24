@@ -1,0 +1,63 @@
+{
+  "chains": [
+    {
+      "chain": "chain_tnt_fixture_run_a",
+      "coverage": "established",
+      "from_sequence": 0,
+      "head_event_hash": "528c8f5d0117b04e1941a42a0b895b900c79980bd334ea38b1c3b6d6218672a2",
+      "required_through": null,
+      "to_sequence": 4,
+      "witnessed_through": {
+        "at": "2026-11-23T23:50:59Z",
+        "basis": "timestamp",
+        "event_hash": "528c8f5d0117b04e1941a42a0b895b900c79980bd334ea38b1c3b6d6218672a2",
+        "seq": 4
+      }
+    }
+  ],
+  "format": "meilynx.verification_receipt.v1",
+  "gateway": {
+    "proxy_id": "fixture-gateway",
+    "source": "witness_file"
+  },
+  "options": {
+    "allow_unsigned": true,
+    "attestation_key_ids": [
+      "ZeoJWtpvlHI9cznA4RZLpHcE5qFB5Kcb94UbIndvWEU"
+    ],
+    "tsa_root_ids": [
+      "test-ec",
+      "test-rsa"
+    ]
+  },
+  "pack": {
+    "claim_scope": "chain_to_head",
+    "evidence_class": "local-chain-not-write-once",
+    "manifest_sha256": "fac26b9f7ec46316e6fa54b4ad8e6e908281b2a71278655d091a2534c6071899",
+    "pack_id": "00000000-0000-0000-0000-000000002758",
+    "records": 5,
+    "signed": false
+  },
+  "result": {
+    "exit_code": 0,
+    "verdict": "pass"
+  },
+  "verified_at": "2026-11-24T00:05:00Z",
+  "verifier": {
+    "name": "meilynx-verify",
+    "sha256": "7928f6d5065289fe7334273a6e851ecdac5b5373d1bb7f6871a8cee7cb37dc84",
+    "version": "0.16.0"
+  },
+  "witness_file": {
+    "file_sha256": "93bb64bd3953fcc7e411ef7e0397feb0d7cb76430cf900c061d9e5797f95b814",
+    "generated_at": "2026-11-24T00:00:00Z",
+    "heads_after_pack": 0,
+    "heads_counted": 2,
+    "heads_matched": 2,
+    "heads_not_counted": 0,
+    "key_id": "ZeoJWtpvlHI9cznA4RZLpHcE5qFB5Kcb94UbIndvWEU",
+    "manifest_sha256": "8bf99851a3ebd55a9ef7dd7a86dc1856d5701a9d2d86cf34034850ee64c2d63d",
+    "proxy_id": "fixture-gateway",
+    "signature": "verified"
+  }
+}

@@ -100,6 +100,20 @@ Evidence class (manifest 1.4):
     line; an unknown label, or a 1.4 manifest without one, cannot be
     evaluated.
 
+Witness files (SPEC 6.9) and receipts (SPEC 6.10):
+    A gateway's control plane keeps the chain heads the gateway reported and
+    the timestamp tokens it uploaded. --witness FILE (the ZIP archive the
+    organization downloads, or the same tree as a directory) judges the pack
+    against them: a pack that contradicts a counted witnessed head fails
+    (exit 1), one that ends before it exits 4. Heads backed by a timestamp
+    token over a statement naming the gateway count on their own; heads
+    reported between anchors count only under the file's signature, checked
+    with the project's attestation key (--witness-key or --attestation-key).
+    --receipt FILE writes the run's conclusion as content-free JSON.
+        python verify-pack.py --records ./records --manifest manifest.json \\
+            --allow-unsigned --witness anchor-file.zip \\
+            --witness-key attestation-key.jwk --receipt receipt.json
+
 Content-stripped Exchange pack (manifest 1.5):
     A pack an Evidence Exchange subscriber receives carries no captured
     content and no personal data. Its 1.5 manifest says `content: stripped`
@@ -429,13 +443,33 @@ EVIDENCE_MODE_INDEX_FIELDS = ("sequence", "mode", "source")
 # stored set references and per-case results, recomputes sets_sha256 and
 # results_sha256 from them and recounts passed, failed and not_applicable;
 # when it does not, it reports the digests as bound but not checked.
+# `witness-file-v1` reads a witness file (--witness: the chain heads a gateway
+# reported to its control plane and the timestamp tokens it uploaded, with a
+# witness-manifest.json bound to the gateway and its chains): a pack that
+# contradicts a counted witnessed head fails, and one that ends before it is
+# coverage not established (exit 4). `verification-receipt-v1` writes the
+# run's content-free `meilynx.verification_receipt.v1` (--receipt).
+# `context-provenance-v1` reads v1.25 llm_request records: recomputes the
+# hash with the context provenance digest, recomputes that digest from the
+# stored provenance list (list integrity), and, where the record retains its
+# messages as captured (capture policy `full`, stored prompt digest equal to
+# the captured one), checks that every tool-result block and every declared
+# block has exactly one entry at its locator with the block's sha256 and
+# bytes. Otherwise it reports "content not retained: list integrity only",
+# never a failure and never a content pass.
+# `provenance-verifications-v1` reads the v1.25 provenance.verification
+# record (a gateway's own run of the checks above over a window of its
+# llm_request records): recomputes its hash and checks its window and that
+# its counts add up. `provenance_check_outcome` is the classification such a
+# run counts, so anyone can recount a window from the records in a pack.
 VERIFIER_CAPABILITIES = frozenset(
     {"chain-anchors-v1", "segmented-records-v1", "decision-receipts-v1", "evaluation-trace-v1",
      "data-reach-evidence-v1", "control-plane-chain-v1", "ocsf-export-v1", "customer-scope-v1",
      "per-tenant-signer-v1", "evidence-class-v1", "content-stripped-v1", "customer-conditions-v1",
      "record-signatures-v1", "compliance-records-v1", "local-chain-evidence-v1", "coverage-claim-v1",
      "evidence-modes-v1", "gateway-evidence-key-v1", "judgment-verdicts-v1",
-     "judgment-verdicts-v2", "control-probe-runs-v1", "judgment-verdicts-v3"}
+     "judgment-verdicts-v2", "control-probe-runs-v1", "judgment-verdicts-v3", "witness-file-v1",
+     "verification-receipt-v1", "context-provenance-v1", "provenance-verifications-v1"}
 )
 # The stripped profile of a manifest 1.5 Exchange pack. Mirror of
 # `exchange::STRIPPED_FIELDS` / `WITHHELD_FIELDS` / `STUB_FIELDS` /
@@ -622,6 +656,8 @@ EVENT_KIND_COMPLIANCE_RECORD = 'compliance.record'
 EVENT_KIND_JUDGMENT_VERDICT = 'judgment.verdict'
 # The scheduled control-probe run kind (v1.23 bucket).
 EVENT_KIND_CONTROL_PROBE_RUN = 'control_probe.run'
+# The provenance verification kind (v1.25 bucket).
+EVENT_KIND_PROVENANCE_VERIFICATION = 'provenance.verification'
 
 MCP_EVENT_KINDS = {
     EVENT_KIND_MCP_TOOL_CALL,
@@ -656,6 +692,8 @@ SERDE_EVENT_KIND_TO_WIRE = {
     'judgment_verdict': EVENT_KIND_JUDGMENT_VERDICT,
     # Serde snake_case form of the v1.23 kind.
     'control_probe_run': EVENT_KIND_CONTROL_PROBE_RUN,
+    # Serde snake_case form of the v1.25 verification kind.
+    'provenance_verification': EVENT_KIND_PROVENANCE_VERIFICATION,
 }
 
 
@@ -1906,6 +1944,108 @@ def check_control_probe_run(event):
     return problems, notes
 
 
+# The v1.25 provenance.verification bucket.
+PROVENANCE_VERIFICATION_SCHEMA_VERSION = 'v1.25'
+# The payload feed: (field, kind) in `ProvenanceVerificationFields`
+# struct-definition order. `str` feeds length-prefixed (the v1.19 feed),
+# `u64` 8 little-endian bytes. Every member is fed; nothing rides beside it.
+PROVENANCE_VERIFICATION_FEED = (
+    ('verification_id', 'str'), ('window_start', 'str'), ('cutoff', 'str'),
+    ('verifier_version', 'str'), ('evidence_mode', 'str'),
+    ('eligible_calls', 'u64'), ('complete_verified', 'u64'), ('integrity_only', 'u64'),
+    ('missing_list', 'u64'), ('integrity_failures', 'u64'), ('records_unreadable', 'u64'),
+)
+PROVENANCE_VERIFIER_VERSIONS = ('provenance-check.v1',)
+PROVENANCE_EVIDENCE_MODES = ('write_once', 'local_chain')
+_UUID = re.compile(r'\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\Z')
+
+
+def compute_event_hash_v1_25_provenance_verification(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    verification,
+):
+    """v1.25 provenance.verification hash. `verification` is a dict matching
+    `ProvenanceVerificationFields`. Mirror of
+    `compute_event_hash_v1_25_provenance_verification` in sqlite.rs: the SAME
+    v1.2 prefix, then the event_kind wire-name, then the 11 members in
+    `PROVENANCE_VERIFICATION_FEED` order. Its own function, not shared with
+    the v1.23 one."""
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_PROVENANCE_VERIFICATION.encode('utf-8'))
+    for name, kind in PROVENANCE_VERIFICATION_FEED:
+        value = verification.get(name)
+        if kind == 'str':
+            if not isinstance(value, str):
+                raise ValueError(f"provenance_verification.{name} is not a string, so the record has no defined preimage.")
+            h.update(encode_len_prefixed_str(value))
+        else:
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2 ** 64:
+                raise ValueError(f"provenance_verification.{name} is not an unsigned integer, so the record has no defined preimage.")
+            h.update(struct.pack('<Q', value))
+    return h.hexdigest()
+
+
+def _utc_instant(text):
+    """The instant of an RFC 3339 timestamp in UTC (`Z` or a zero offset), or
+    None."""
+    if not isinstance(text, str) or len(text) < 20:
+        return None
+    try:
+        parsed = datetime.datetime.fromisoformat(text.replace('Z', '+00:00').replace('z', '+00:00'))
+    except ValueError:
+        return None
+    if parsed.utcoffset() != datetime.timedelta(0):
+        return None
+    return parsed
+
+
+def check_provenance_verification(event):
+    """The checks of a v1.25 provenance.verification record that its hash does
+    not cover: the classes of its members, a window that ends after it
+    starts, and `eligible_calls` equal to the sum of the four outcome counts.
+    Returns a list of problems, each naming a member, never a value. Mirror of
+    `check_provenance_verification_fields` in meilynx-core."""
+    fields = event.get('provenance_verification')
+    if fields is None:
+        return []
+    version = event.get('schema_version') or 'v1'
+    if version != PROVENANCE_VERIFICATION_SCHEMA_VERSION:
+        return [f'{version} record carries a provenance_verification payload; it is hashed only in the v1.25 bucket']
+    if not isinstance(fields, dict) or set(fields) != {name for name, _ in PROVENANCE_VERIFICATION_FEED}:
+        return ['the provenance_verification payload is not exactly the v1.25 members']
+    problems = []
+    if not (isinstance(fields['verification_id'], str) and _UUID.match(fields['verification_id'])):
+        problems.append('provenance_verification.verification_id is not a UUID')
+    start = _utc_instant(fields['window_start'])
+    cutoff = _utc_instant(fields['cutoff'])
+    if start is None:
+        problems.append('provenance_verification.window_start is not an RFC 3339 UTC timestamp')
+    if cutoff is None:
+        problems.append('provenance_verification.cutoff is not an RFC 3339 UTC timestamp')
+    if start is not None and cutoff is not None and cutoff <= start:
+        problems.append('provenance_verification.cutoff is not after window_start')
+    if fields['verifier_version'] not in PROVENANCE_VERIFIER_VERSIONS:
+        problems.append('provenance_verification.verifier_version is not provenance-check.v1')
+    if fields['evidence_mode'] not in PROVENANCE_EVIDENCE_MODES:
+        problems.append('provenance_verification.evidence_mode is not write_once or local_chain')
+    counts = [fields[name] for name, kind in PROVENANCE_VERIFICATION_FEED if kind == 'u64']
+    if any(isinstance(c, bool) or not isinstance(c, int) or c < 0 for c in counts):
+        problems.append('provenance_verification carries a count that is not an unsigned integer')
+    elif (fields['complete_verified'] + fields['integrity_only'] + fields['missing_list']
+          + fields['integrity_failures']) != fields['eligible_calls']:
+        problems.append('provenance_verification.eligible_calls is not complete_verified + integrity_only + '
+                        'missing_list + integrity_failures')
+    return problems
+
+
 def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=None):
     """For a v1.21 record, check what the hash alone cannot.
 
@@ -2784,7 +2924,7 @@ def _trace_rules(record):
     """(rule ids, deciding rule id) of a sealed evaluation trace, else ((), None)."""
     trace = record.get('evaluation_trace')
     outcomes = trace.get('outcomes') if isinstance(trace, dict) else None
-    if record.get('schema_version') not in ('v1.16', 'v1.18', 'v1.19') or not isinstance(outcomes, dict):
+    if record.get('schema_version') not in ('v1.16', 'v1.18', 'v1.19', 'v1.25') or not isinstance(outcomes, dict):
         return (), None
     rules = outcomes.get('rules')
     ids = tuple(r.get('rule_id') for r in rules if isinstance(r, dict)) if isinstance(rules, list) else ()
@@ -3303,9 +3443,9 @@ def check_sealed_identity(event, stripped=frozenset()):
     the hash and is not re-derived."""
     version = event.get('schema_version') or 'v1'
     identity = event.get('identity')
-    if version in ('v1.14', 'v1.17', 'v1.18', 'v1.19') and identity is None:
+    if version in ('v1.14', 'v1.17', 'v1.18', 'v1.19', 'v1.25') and identity is None:
         return []
-    if version not in ('v1.12', 'v1.14', 'v1.17', 'v1.18', 'v1.19'):
+    if version not in ('v1.12', 'v1.14', 'v1.17', 'v1.18', 'v1.19', 'v1.25'):
         return []
     if not isinstance(identity, dict):
         return [f"{version} record has no identity block"]
@@ -3486,12 +3626,12 @@ def check_customer_scope(event):
     checked when present, and whole without one."""
     version = event.get('schema_version') or 'v1'
     customer = event.get('customer')
-    if version not in ('v1.18', 'v1.19'):
+    if version not in ('v1.18', 'v1.19', 'v1.25'):
         if customer is not None:
             return [f'{version} record carries a customer block; it is hashed only in the v1.18 and v1.19 buckets']
         return []
     if customer is None:
-        return [] if version == 'v1.19' else ['v1.18 record has no customer block']
+        return [] if version in ('v1.19', 'v1.25') else ['v1.18 record has no customer block']
     problem = customer_shape_problem(customer)
     if problem is not None:
         return [f'malformed customer block: {problem}']
@@ -3632,6 +3772,291 @@ def compute_event_hash_v1_19_llm_request(
     return h.hexdigest()
 
 
+def compute_event_hash_v1_25_llm_request(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    join_context, content, identity, evaluation_trace, customer,
+    policy_version, model_executed,
+):
+    """v1.25 llm_request hash: every v1.19 feed, then the context provenance
+    digest `content.provenance_sha256_jcs` (the JCS SHA-256 of the stored
+    `content.provenance` list): a presence byte, then length-prefixed when
+    present. The list itself rides beside the hash; check_context_provenance
+    recomputes the digest from it. Mirror of
+    `compute_event_hash_v1_25_llm_request` in sqlite.rs. The v1.19 feeds are
+    duplicated, not shared."""
+    if not isinstance(policy_version, str):
+        raise ValueError('schema_version v1.25 requires a policy_version string')
+    if model_executed is not None and not isinstance(model_executed, str):
+        raise ValueError('model_executed must be a string when present')
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_LLM_REQUEST.encode('utf-8'))
+    join = join_context or {}
+    h.update(encode_optional_str(join.get('correlation_id')))
+    h.update(encode_optional_str(join.get('session_id')))
+    h.update(encode_optional_str(join.get('agent_name')))
+    if content is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(content['capture_policy'].encode('utf-8'))
+        h.update(encode_optional_str(content.get('prompt_sha256_jcs')))
+        h.update(encode_optional_str(content.get('response_sha256')))
+        h.update(encode_optional_str(content.get('stored_prompt_sha256_jcs')))
+        h.update(encode_optional_str(content.get('stored_response_sha256')))
+        h.update(encode_optional_str(content.get('findings_sha256_jcs')))
+        h.update(encode_optional_str(content.get('tool_calls_sha256_jcs')))
+        h.update(encode_optional_str(content.get('stored_tool_calls_sha256_jcs')))
+    if identity is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(encode_sealed_identity(identity))
+    if evaluation_trace is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(evaluation_trace['outcomes_sha256_jcs'].encode('utf-8'))
+    if customer is None:
+        h.update(b'\x00')
+    else:
+        h.update(encode_sealed_customer(customer))
+    h.update(encode_len_prefixed_str(policy_version))
+    if model_executed is None:
+        h.update(b'\x00')
+    else:
+        h.update(b'\x01')
+        h.update(encode_len_prefixed_str(model_executed))
+    # The v1.25 addition.
+    digest = content.get('provenance_sha256_jcs') if isinstance(content, dict) else None
+    if digest is None:
+        h.update(b'\x00')
+    else:
+        if not isinstance(digest, str):
+            raise ValueError('content.provenance_sha256_jcs must be a string when present')
+        h.update(b'\x01')
+        h.update(encode_len_prefixed_str(digest))
+    return h.hexdigest()
+
+
+def _has_provenance(content):
+    return isinstance(content, dict) and (
+        content.get('provenance_sha256_jcs') is not None or content.get('provenance') is not None
+    )
+
+
+# ---------------------------------------------------------------------------
+# Context provenance (v1.25). Mirror of
+# meilynx-core/src/types/provenance.rs: the same units, canonical
+# bytes, labels and list, computed over the record's stored `messages`.
+# ---------------------------------------------------------------------------
+
+PROVENANCE_CONTENT_NOT_RETAINED = 'content not retained: list integrity only'
+PROVENANCE_KINDS = ('tool_result', 'declared_context')
+
+
+def _locator_key(locator):
+    """(message_index, block_index or -1) of a stored locator, or None when
+    it is not one."""
+    if not isinstance(locator, dict) or set(locator) - {'message_index', 'block_index'}:
+        return None
+    m = locator.get('message_index')
+    b = locator.get('block_index', -1)
+    if not isinstance(m, int) or isinstance(m, bool) or m < 0:
+        return None
+    if b is None or not isinstance(b, int) or isinstance(b, bool) or b < -1:
+        return None
+    return (m, b)
+
+
+def _content_blocks(message):
+    blocks = message.get('content_blocks') if isinstance(message, dict) else None
+    return blocks if isinstance(blocks, list) else None
+
+
+def provenance_block_bytes(messages, key):
+    """The canonical bytes of the message or block `key` names: JCS of a
+    message's `content_blocks` when present, else the UTF-8 bytes of its
+    `content` (empty when absent); a `text` block's `text`, else JCS of the
+    block. None when the key names nothing."""
+    m, b = key
+    if m >= len(messages) or not isinstance(messages[m], dict):
+        return None
+    message = messages[m]
+    if b == -1:
+        blocks = _content_blocks(message)
+        if blocks is not None:
+            return jcs_dumps(blocks).encode('utf-8')
+        content = message.get('content')
+        return (content if isinstance(content, str) else '').encode('utf-8')
+    blocks = _content_blocks(message)
+    if blocks is None or b >= len(blocks):
+        return None
+    block = blocks[b]
+    if isinstance(block, dict) and block.get('type') == 'text' and isinstance(block.get('text'), str):
+        return block['text'].encode('utf-8')
+    return jcs_dumps(block).encode('utf-8')
+
+
+def provenance_tool_result_keys(messages):
+    """Every tool-result unit: a `role: tool` message whole, and each
+    `tool_result` block of any other message."""
+    out = []
+    for i, message in enumerate(messages):
+        if not isinstance(message, dict):
+            continue
+        if message.get('role') == 'tool':
+            out.append((i, -1))
+            continue
+        for j, block in enumerate(_content_blocks(message) or []):
+            if isinstance(block, dict) and block.get('type') == 'tool_result':
+                out.append((i, j))
+    return out
+
+
+def check_context_provenance(event, stripped=frozenset()):
+    """For a v1.25 llm_request, what its hash cannot show of the context
+    provenance list. Returns (problems, notes).
+
+    List integrity, always: the stored list must hash to the sealed
+    `provenance_sha256_jcs`, have the closed shape, name each locator once,
+    and give every accepted declaration an entry at its locator labelled with
+    its source id. Content, only where the record retains its messages as
+    captured (capture policy `full` and the stored prompt digest equal to the
+    captured one, in a pack that kept the messages): every tool-result block
+    and every declared block has exactly one entry at its locator, of the
+    right kind, whose sha256 and bytes are the block's, and no other entry
+    exists. Otherwise a note says the content was not retained and only the
+    list's integrity was checked: never a failure, never a content pass. A
+    pass shows the stated list was recorded and has not changed since; it
+    does not show a label names an authentic source."""
+    version = event.get('schema_version') or 'v1'
+    content = event.get('content')
+    if version != 'v1.25' or not isinstance(content, dict):
+        return [], []
+    listing = content.get('provenance')
+    sealed = content.get('provenance_sha256_jcs')
+    if listing is None and sealed is None:
+        return [], []
+    if listing is None:
+        return ['provenance_sha256_jcs sealed but the record stores no provenance list'], []
+    if sealed is None:
+        return ['provenance present but no provenance_sha256_jcs was sealed'], []
+    try:
+        if sha256_jcs(listing) != sealed:
+            return ['provenance does not match provenance_sha256_jcs (the provenance list was changed after sealing)'], []
+    except ValueError:
+        return ['provenance is not JSON a JCS digest covers'], []
+    if not (isinstance(listing, dict) and set(listing) == {'entries', 'declarations', 'complete'}
+            and isinstance(listing['entries'], list) and isinstance(listing['declarations'], list)
+            and isinstance(listing['complete'], bool)):
+        return ['provenance is not an {entries, declarations, complete} object'], []
+    problems = []
+    entries = {}
+    for entry in listing['entries']:
+        key = _locator_key(entry.get('locator')) if isinstance(entry, dict) else None
+        if (key is None or set(entry) != {'locator', 'kind', 'label', 'asserted_by', 'sha256', 'bytes'}
+                or entry['kind'] not in PROVENANCE_KINDS or entry['asserted_by'] != 'caller'
+                or not (entry['label'] is None or isinstance(entry['label'], str))
+                or not (isinstance(entry['sha256'], str) and _LOWER_SHA256.match(entry['sha256']))
+                or not isinstance(entry['bytes'], int) or isinstance(entry['bytes'], bool) or entry['bytes'] < 0):
+            problems.append('a provenance entry is not a {locator, kind, label, asserted_by, sha256, bytes} entry')
+            continue
+        if key in entries:
+            problems.append(f'two provenance entries name the block at {key}')
+            continue
+        entries[key] = entry
+    declared = {}
+    for declaration in listing['declarations']:
+        key = _locator_key(declaration.get('locator')) if isinstance(declaration, dict) else None
+        if key is None or set(declaration) != {'locator', 'source_id'} or not isinstance(declaration['source_id'], str):
+            problems.append('a provenance declaration is not a {locator, source_id} object')
+            continue
+        if key in declared:
+            problems.append(f'two provenance declarations name the block at {key}')
+            continue
+        declared[key] = declaration['source_id']
+        entry = entries.get(key)
+        if entry is None:
+            problems.append(f'the declaration at {key} has no entry')
+        elif entry['label'] != declaration['source_id']:
+            problems.append(f'the entry at {key} is not labelled with its declared source')
+    if problems:
+        return problems, []
+    retained = (
+        content.get('capture_policy') == 'full'
+        and 'messages' not in stripped
+        and content.get('stored_prompt_sha256_jcs') is not None
+        and content.get('stored_prompt_sha256_jcs') == content.get('prompt_sha256_jcs')
+    )
+    if not retained:
+        return [], [PROVENANCE_CONTENT_NOT_RETAINED]
+    messages = event.get('messages') or []
+    units = provenance_tool_result_keys(messages)
+    expected = set(units) | set(declared)
+    for key in sorted(expected):
+        entry = entries.get(key)
+        if entry is None:
+            problems.append(f'the block at {key} has no provenance entry')
+            continue
+        block = provenance_block_bytes(messages, key)
+        if block is None:
+            problems.append(f'the provenance entry at {key} names no block')
+            continue
+        kind = 'tool_result' if key in units else 'declared_context'
+        if entry['kind'] != kind:
+            problems.append(f'the provenance entry at {key} is a {entry["kind"]}, the block is a {kind}')
+        if entry['sha256'] != hashlib.sha256(block).hexdigest() or entry['bytes'] != len(block):
+            problems.append(f'the provenance entry at {key} does not match the block as captured')
+    for key in sorted(set(entries) - expected):
+        problems.append(f'the provenance entry at {key} names no tool-result or declared block')
+    if not problems and listing['complete'] is not True:
+        problems.append('the provenance list says it is incomplete')
+    return problems, []
+
+
+PROVENANCE_OUTCOMES = ('not_eligible', 'complete_verified', 'integrity_only', 'missing_list', 'integrity_failure')
+
+
+def provenance_check_outcome(event, stripped=frozenset()):
+    """How one record counts in a provenance verification: one of
+    `PROVENANCE_OUTCOMES`. Mirror of `provenance_check_outcome` in
+    meilynx-core, which a gateway runs in process over its own records (the
+    two are tested against each other on shared cases). Eligibility is
+    derived from the captured messages (a tool-result block), not from
+    whether a list exists; a record that carries a list is eligible too. A
+    record with no content block was sealed with no capture policy and says
+    nothing about provenance: not eligible. The record's own hash is checked
+    apart (a record whose hash fails is not counted as verified)."""
+    if (event.get('event_kind') or 'llm_request') != 'llm_request':
+        return 'not_eligible'
+    content = event.get('content')
+    if not isinstance(content, dict):
+        return 'not_eligible'
+    has_list = content.get('provenance') is not None or content.get('provenance_sha256_jcs') is not None
+    messages = None if 'messages' in stripped else event.get('messages')
+    messages = messages if isinstance(messages, list) else []
+    if not has_list and not provenance_tool_result_keys(messages):
+        return 'not_eligible'
+    if not has_list:
+        return 'missing_list'
+    if event.get('schema_version') != 'v1.25':
+        return 'integrity_failure'
+    problems, notes = check_context_provenance(event, stripped)
+    if problems:
+        return 'integrity_failure'
+    if notes:
+        return 'integrity_only'
+    return 'complete_verified'
+
+
 def check_evaluation_trace(event):
     """A v1.16 record's hash covers the digest of its
     evaluation outcomes, not the outcomes themselves. Recompute the digest from
@@ -3641,14 +4066,14 @@ def check_evaluation_trace(event):
     `check_evaluation_trace` in meilynx-audit/src/evaluation_trace.rs."""
     version = event.get('schema_version') or 'v1'
     trace = event.get('evaluation_trace')
-    if version not in ('v1.16', 'v1.18', 'v1.19'):
+    if version not in ('v1.16', 'v1.18', 'v1.19', 'v1.25'):
         if trace is not None:
             return [f'{version} record carries an evaluation_trace; it is hashed only in the v1.16, v1.18 and v1.19 buckets']
         return []
     if trace is None:
         # v1.18 and v1.19 presence-tag the trace: a refusal sealed before
         # evaluation carries none and is whole.
-        return [] if version in ('v1.18', 'v1.19') else ['v1.16 record has no evaluation_trace']
+        return [] if version in ('v1.18', 'v1.19', 'v1.25') else ['v1.16 record has no evaluation_trace']
     sealed = trace.get('outcomes_sha256_jcs')
     if not isinstance(sealed, str):
         return ['evaluation_trace has no outcomes_sha256_jcs']
@@ -3995,10 +4420,10 @@ def _on_behalf_of_is_verified(mcp_event):
 # and self-test assertion 31e pins the v1.18 member (36d the v1.19 one). `check_llm_content` reads
 # the same tuple, so a bucket that seals the digests is also one whose stored
 # content is re-derived from them (assertions 35a-35c).
-CONTENT_ATTESTATION_VERSIONS = ('v1.10', 'v1.11', 'v1.12', 'v1.16', 'v1.18', 'v1.19')
+CONTENT_ATTESTATION_VERSIONS = ('v1.10', 'v1.11', 'v1.12', 'v1.16', 'v1.18', 'v1.19', 'v1.25')
 # The members whose preimage presence-tags the content block: a record sealed
 # with no capture policy carries none and stores its content unhashed.
-CONTENT_PRESENCE_TAGGED_VERSIONS = ('v1.12', 'v1.16', 'v1.18', 'v1.19')
+CONTENT_PRESENCE_TAGGED_VERSIONS = ('v1.12', 'v1.16', 'v1.18', 'v1.19', 'v1.25')
 
 
 def compute_event_hash_dispatch(
@@ -4012,6 +4437,7 @@ def compute_event_hash_dispatch(
     identity=None, coverage_key_inventory=None, decision_receipt=None,
     evaluation_trace=None, customer=None, policy_version=None, model_executed=None,
     compliance_record=None, judgment_verdict=None, control_probe_run=None,
+    provenance_verification=None,
 ):
     """Python mirror of compute_event_hash_dispatch in sqlite.rs.
 
@@ -4028,7 +4454,7 @@ def compute_event_hash_dispatch(
     if customer is not None:
         lane_bucket = (
             (schema_version == 'v1.18' and (event_kind == EVENT_KIND_LLM_REQUEST or event_kind in MCP_EVENT_KINDS))
-            or (schema_version == 'v1.19' and event_kind == EVENT_KIND_LLM_REQUEST)
+            or (schema_version in ('v1.19', 'v1.25') and event_kind == EVENT_KIND_LLM_REQUEST)
         )
         if not lane_bucket:
             raise ValueError(
@@ -4044,7 +4470,7 @@ def compute_event_hash_dispatch(
     # carries it forward, presence-tagged); anywhere else the trace would sit
     # on the record unhashed.
     if evaluation_trace is not None and (
-        schema_version not in ('v1.16', 'v1.18', 'v1.19') or event_kind != EVENT_KIND_LLM_REQUEST
+        schema_version not in ('v1.16', 'v1.18', 'v1.19', 'v1.25') or event_kind != EVENT_KIND_LLM_REQUEST
     ):
         raise ValueError(
             f"evaluation_trace present on a {schema_version!r} "
@@ -4056,6 +4482,16 @@ def compute_event_hash_dispatch(
         isinstance(evaluation_trace, dict) and isinstance(evaluation_trace.get('outcomes_sha256_jcs'), str)
     ):
         raise ValueError("evaluation_trace has no outcomes_sha256_jcs, so the record has no defined preimage.")
+    # Fail closed. The provenance verification payload is hashed only by the
+    # v1.25 provenance.verification hasher; anywhere else it would sit on the
+    # record unhashed.
+    if provenance_verification is not None and (
+        schema_version != PROVENANCE_VERIFICATION_SCHEMA_VERSION or event_kind != EVENT_KIND_PROVENANCE_VERIFICATION
+    ):
+        raise ValueError(
+            f"provenance_verification payload present on a {schema_version!r} "
+            f"{event_kind!r} event — it is hashed only in the v1.25 provenance.verification bucket."
+        )
     # Fail closed. The probe-run payload is hashed only by the v1.23
     # control_probe.run hasher; anywhere else it would sit on the record
     # unhashed.
@@ -4143,15 +4579,27 @@ def compute_event_hash_dispatch(
         raise ValueError("content attestation has no capture_policy, so the record has no defined preimage.")
     # And the tool-call digests only in v1.11: the v1.10 hash does
     # not read them, so a v1.10 record carrying one would present it unhashed.
-    if _has_tool_call_digests(content) and schema_version not in ('v1.11', 'v1.12', 'v1.16', 'v1.18', 'v1.19'):
+    if _has_tool_call_digests(content) and schema_version not in ('v1.11', 'v1.12', 'v1.16', 'v1.18', 'v1.19', 'v1.25'):
         raise ValueError(
             f"tool-call digests present on a {schema_version!r} event — "
             f"they are hashed only in the v1.11, v1.12, v1.16 and v1.18 buckets."
         )
+    # Fail closed. The context provenance digest enters only the v1.25
+    # llm_request preimage and the stored list is bound only through it;
+    # anywhere else either would ride the record unhashed. A list with no
+    # digest is refused too.
+    if _has_provenance(content):
+        if schema_version != 'v1.25' or event_kind != EVENT_KIND_LLM_REQUEST:
+            raise ValueError(
+                f"context provenance present on a {schema_version!r} {event_kind!r} event — "
+                f"it is hashed only in the v1.25 llm_request bucket."
+            )
+        if content.get('provenance') is not None and content.get('provenance_sha256_jcs') is None:
+            raise ValueError("a context provenance list with no provenance_sha256_jcs would ride the record unattested.")
     # Fail closed. The sealed identity enters only the
     # v1.12 preimage (both lanes); on any other version it would sit on the
     # record unhashed, rewritable without breaking the chain.
-    if identity is not None and schema_version not in ('v1.12', 'v1.14', 'v1.16', 'v1.17', 'v1.18', 'v1.19'):
+    if identity is not None and schema_version not in ('v1.12', 'v1.14', 'v1.16', 'v1.17', 'v1.18', 'v1.19', 'v1.25'):
         raise ValueError(
             f"identity block present on a {schema_version!r} event — "
             f"it is hashed only in the v1.12 bucket (and the MCP v1.14 and v1.17, "
@@ -4187,7 +4635,7 @@ def compute_event_hash_dispatch(
                 "identity.delegated_human disagrees with the principal chain's "
                 "on_behalf_of_attestation — the two must agree"
             )
-    if join_context is not None and schema_version not in ('v1.9', 'v1.10', 'v1.11', 'v1.12', 'v1.14', 'v1.16', 'v1.17', 'v1.18', 'v1.19'):
+    if join_context is not None and schema_version not in ('v1.9', 'v1.10', 'v1.11', 'v1.12', 'v1.14', 'v1.16', 'v1.17', 'v1.18', 'v1.19', 'v1.25'):
         raise ValueError(
             f"join_context present on a {schema_version!r} event — "
             f"caller-asserted join keys are hashed only in the v1.9, v1.10, v1.11, v1.12, "
@@ -4673,6 +5121,45 @@ def compute_event_hash_dispatch(
                 "sealed without one must stay in its pre-v1.19 bucket."
             )
         return compute_event_hash_v1_19_llm_request(
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            join_context, content, identity, evaluation_trace, customer,
+            policy_version, model_executed,
+        )
+    if schema_version == 'v1.25' and event_kind == EVENT_KIND_PROVENANCE_VERIFICATION:
+        # The bucket's one other event class: a gateway's own run of the
+        # provenance checks. Another kind's payload or an LLM field has no
+        # place in this preimage.
+        if not isinstance(provenance_verification, dict):
+            raise ValueError("ProvenanceVerification event missing provenance_verification payload")
+        if any(p is not None for p in (auth_session, admin_action, mcp_event, coverage, content, join_context,
+                                       identity, policy_version, model_executed)):
+            raise ValueError(
+                "a v1.25 provenance.verification event carries another kind's payload; "
+                "it would ride the record unhashed."
+            )
+        return compute_event_hash_v1_25_provenance_verification(
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            provenance_verification,
+        )
+    if schema_version == 'v1.25':
+        # The v1.19 llm_request preimage, then the context provenance digest,
+        # presence-tagged. Like v1.19 it requires a policy version.
+        if event_kind != EVENT_KIND_LLM_REQUEST:
+            raise ValueError(
+                f"schema_version v1.25 is defined only for llm_request events; got event_kind {event_kind!r}"
+            )
+        if policy_version is None:
+            raise ValueError(
+                "schema_version v1.25 requires a policy_version; a record "
+                "sealed without one has no defined v1.25 preimage."
+            )
+        return compute_event_hash_v1_25_llm_request(
             sequence_number, timestamp_utc, event_id, request_id,
             model_requested, action, input_tokens, output_tokens,
             total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
@@ -6727,6 +7214,247 @@ def run_self_test():
     else:
         ok = False
 
+    # Assertion 42a — the v1.25 llm_request fixtures (direct fn and the
+    # dispatcher): every v1.19 feed, then the context provenance digest,
+    # presence-tagged. Paired with mei3869_provenance_chain_round_trip.rs.
+    v125_content = {
+        'capture_policy': 'full',
+        'prompt_sha256_jcs': V1_25_PROMPT_FIXTURE_DIGEST,
+        'stored_prompt_sha256_jcs': V1_25_PROMPT_FIXTURE_DIGEST,
+        'provenance_sha256_jcs': V1_25_PROVENANCE_FIXTURE_DIGEST,
+    }
+    got = [
+        compute_event_hash_v1_25_llm_request(
+            *_V1_16_FIXTURE_ARGS, None, v125_content, None, None, _V1_18_CUSTOMER_NONE_FIXTURE,
+            V1_19_POLICY_VERSION_FIXTURE, V1_19_MODEL_EXECUTED_FIXTURE,
+        ),
+        compute_event_hash_v1_25_llm_request(
+            *_V1_16_FIXTURE_ARGS, None, None, None, None, _V1_18_CUSTOMER_NONE_FIXTURE,
+            V1_19_POLICY_VERSION_FIXTURE, None,
+        ),
+        compute_event_hash_dispatch('v1.25', *_V1_16_FIXTURE_ARGS, event_kind=EVENT_KIND_LLM_REQUEST,
+                                    content=dict(v125_content, provenance=_V1_25_PROVENANCE_FIXTURE),
+                                    customer=_V1_18_CUSTOMER_NONE_FIXTURE,
+                                    policy_version=V1_19_POLICY_VERSION_FIXTURE,
+                                    model_executed=V1_19_MODEL_EXECUTED_FIXTURE),
+    ]
+    expected = [V1_25_LLM_FIXTURE_HASH, V1_25_LLM_NO_PROVENANCE_FIXTURE_HASH, V1_25_LLM_FIXTURE_HASH]
+    # The trailing tag is a feed of its own: v1.25 without a digest is not v1.19.
+    if got == expected and V1_25_LLM_NO_PROVENANCE_FIXTURE_HASH != V1_19_LLM_BUDGET_BLOCK_FIXTURE_HASH:
+        print('SELF-TEST assertion 42a PASS: v1.25 fixture hashes match')
+    else:
+        print(f'SELF-TEST assertion 42a FAIL: v1.25 fixture drift: {got} != {expected}', file=sys.stderr)
+        ok = False
+
+    # Assertion 42b — the production recompute path binds the digest: an
+    # edited, removed or added provenance digest moves the hash, and the
+    # stored list is outside the preimage (bound through the digest only).
+    v125 = dict(
+        schema_version='v1.25', event_id='evt-v116-fixture', request_id='req-v116-fixture',
+        timestamp_utc='2026-10-09T16:21:00Z', model_requested='gpt-6-luna', action='block',
+        input_tokens=452, output_tokens=70, total_tokens=522,
+        customer=dict(_V1_18_CUSTOMER_NONE_FIXTURE),
+        policy_version=V1_19_POLICY_VERSION_FIXTURE, model_executed=V1_19_MODEL_EXECUTED_FIXTURE,
+        content=dict(v125_content, provenance=_V1_25_PROVENANCE_FIXTURE),
+    )
+    base = recompute_event_hash(v125, 7, 'deadbeef' * 8)
+    no_digest = dict(v125, content=dict(v125_content))
+    del no_digest['content']['provenance_sha256_jcs']
+    moved = [
+        recompute_event_hash(dict(v125, content=dict(v125['content'], provenance_sha256_jcs='6a' * 32)), 7, 'deadbeef' * 8) != base,
+        recompute_event_hash(no_digest, 7, 'deadbeef' * 8) != base,
+    ]
+    relisted = dict(v125, content=dict(v125['content'], provenance={'entries': [], 'declarations': [], 'complete': True}))
+    if base == V1_25_LLM_FIXTURE_HASH and all(moved) and recompute_event_hash(relisted, 7, 'deadbeef' * 8) == base:
+        print('SELF-TEST assertion 42b PASS: v1.25 binds provenance_sha256_jcs (edit, add and remove are caught); the list rides beside it')
+    else:
+        print(f'SELF-TEST assertion 42b FAIL: base {base}, moved {moved}', file=sys.stderr)
+        ok = False
+
+    # Assertion 42c — fail closed: provenance on v1.19 or off the LLM lane,
+    # v1.25 without a policy version, a list with no digest.
+    cases = [
+        ('v1.19', dict(event_kind=EVENT_KIND_LLM_REQUEST, content=dict(v125_content),
+                       policy_version=V1_19_POLICY_VERSION_FIXTURE)),
+        ('v1.19', dict(event_kind=EVENT_KIND_LLM_REQUEST,
+                       content={'capture_policy': 'full', 'provenance': _V1_25_PROVENANCE_FIXTURE},
+                       policy_version=V1_19_POLICY_VERSION_FIXTURE)),
+        ('v1.25', dict(event_kind=EVENT_KIND_ADMIN_ACTION, content=dict(v125_content),
+                       policy_version=V1_19_POLICY_VERSION_FIXTURE)),
+        ('v1.25', dict(event_kind=EVENT_KIND_LLM_REQUEST, content=dict(v125_content))),
+        ('v1.25', dict(event_kind=EVENT_KIND_LLM_REQUEST,
+                       content={'capture_policy': 'full', 'provenance': _V1_25_PROVENANCE_FIXTURE},
+                       policy_version=V1_19_POLICY_VERSION_FIXTURE)),
+    ]
+    rejected = 0
+    for version, kwargs in cases:
+        try:
+            compute_event_hash_dispatch(version, 7, '2026-10-10T12:00:01+00:00', 'e', 'r', '', 'allow',
+                                        0, 0, None, None, None, None, None, None, 'deadbeef' * 8, **kwargs)
+        except ValueError:
+            rejected += 1
+    if rejected == len(cases):
+        print(f'SELF-TEST assertion 42c PASS: all {len(cases)} misplaced or unattested provenance records are rejected')
+    else:
+        print(f'SELF-TEST assertion 42c FAIL: only {rejected} of {len(cases)} fail-closed cases rejected', file=sys.stderr)
+        ok = False
+
+    # Assertion 42d — check_context_provenance. The fixture
+    # list is what its messages give (each entry's sha256 and bytes are the
+    # block's); intact under `full` it passes with content checked; an
+    # edited list fails list integrity; a re-sealed list that drops an entry,
+    # mislabels a declared block or misstates a block fails the content
+    # check; under `redacted`, `hash_only` or in a stripped pack it is a note,
+    # never a failure.
+    def sealed_record(listing, **content):
+        record_content = dict(v125_content, provenance=listing, provenance_sha256_jcs=sha256_jcs(listing))
+        record_content.update(content)
+        return dict(v125, messages=_V1_25_PROVENANCE_MESSAGES, content=record_content)
+
+    def resealed(mutate):
+        listing = json.loads(json.dumps(_V1_25_PROVENANCE_FIXTURE))
+        mutate(listing)
+        return sealed_record(listing)
+
+    intact = sealed_record(_V1_25_PROVENANCE_FIXTURE)
+    edited = dict(intact, content=dict(intact['content'], provenance=dict(_V1_25_PROVENANCE_FIXTURE, complete=False)))
+    failing = {
+        'edited after sealing': edited,
+        'tool result entry dropped': resealed(lambda l: l['entries'].pop(1)),
+        'declared label rewritten': resealed(lambda l: l['entries'][0].update(label='ehr:note/10')),
+        'bytes misstated': resealed(lambda l: l['entries'][2].update(bytes=13)),
+        'kind misstated': resealed(lambda l: l['entries'][3].update(kind='declared_context')),
+        'extra entry': resealed(lambda l: l['entries'].append(dict(l['entries'][1], locator={'message_index': 1}))),
+        'no digest': dict(intact, content={k: v for k, v in intact['content'].items() if k != 'provenance_sha256_jcs'}),
+    }
+    caught = {name: bool(check_context_provenance(r)[0]) for name, r in failing.items()}
+    redacted = sealed_record(_V1_25_PROVENANCE_FIXTURE, capture_policy='redacted', stored_prompt_sha256_jcs='3' * 64)
+    hash_only = sealed_record(_V1_25_PROVENANCE_FIXTURE, capture_policy='hash_only', stored_prompt_sha256_jcs=None)
+    notes_only = [
+        check_context_provenance(redacted),
+        check_context_provenance(hash_only),
+        check_context_provenance(intact, frozenset(STRIPPED_FIELDS)),
+    ]
+    entries_are_the_blocks = all(
+        provenance_block_bytes(_V1_25_PROVENANCE_MESSAGES, _locator_key(e['locator'])) is not None
+        and hashlib.sha256(provenance_block_bytes(_V1_25_PROVENANCE_MESSAGES, _locator_key(e['locator']))).hexdigest() == e['sha256']
+        for e in _V1_25_PROVENANCE_FIXTURE['entries']
+    )
+    if (sha256_jcs(_V1_25_PROVENANCE_FIXTURE) == V1_25_PROVENANCE_FIXTURE_DIGEST
+            and sha256_jcs(_V1_25_PROVENANCE_MESSAGES) == V1_25_PROMPT_FIXTURE_DIGEST
+            and entries_are_the_blocks
+            and check_context_provenance(intact) == ([], [])
+            and all(caught.values())
+            and all(r == ([], [PROVENANCE_CONTENT_NOT_RETAINED]) for r in notes_only)
+            and check_context_provenance(dict(intact, schema_version='v1.19')) == ([], [])):
+        print('SELF-TEST assertion 42d PASS: the provenance list is checked for integrity always, '
+              'against the blocks where the content is retained, and is a note otherwise')
+    else:
+        print(f'SELF-TEST assertion 42d FAIL: intact {check_context_provenance(intact)}, caught {caught}, '
+              f'notes {notes_only}, entries are the blocks {entries_are_the_blocks}', file=sys.stderr)
+        ok = False
+
+    # Assertion 42e — the v1.25 provenance.verification fixture (direct fn and
+    # the production recompute path). Paired with
+    # mei3869_provenance_verification_chain_round_trip.rs (meilynx-audit), which
+    # pins the same hash.
+    pv_args = dict(
+        sequence_number=1, timestamp_utc='2026-11-24T00:05:00+00:00',
+        event_id='evt-provenance-verification-fixture', request_id='evt-provenance-verification-fixture',
+        model_requested='', action='allow', input_tokens=0, output_tokens=0, total_tokens=None,
+        cache_creation_input_tokens=None, cache_read_input_tokens=None, cached_input_tokens=None,
+        reasoning_tokens=None, estimated_cost_usd=None, previous_hash='deadbeef' * 8,
+    )
+    got_pv = compute_event_hash_v1_25_provenance_verification(
+        verification=_V1_25_PROVENANCE_VERIFICATION_FIXTURE, **pv_args)
+    pv_event = {
+        'schema_version': 'v1.25', 'event_kind': 'provenance_verification',
+        'event_id': pv_args['event_id'], 'request_id': pv_args['request_id'],
+        'timestamp_utc': '2026-11-24T00:05:00Z', 'model_requested': '', 'action': 'allow',
+        'input_tokens': 0, 'output_tokens': 0,
+        'provenance_verification': dict(_V1_25_PROVENANCE_VERIFICATION_FIXTURE),
+    }
+    via_record = recompute_event_hash(pv_event, 1, 'deadbeef' * 8)
+    moved = recompute_event_hash(
+        dict(pv_event, provenance_verification=dict(_V1_25_PROVENANCE_VERIFICATION_FIXTURE, integrity_only=3)),
+        1, 'deadbeef' * 8)
+    if got_pv == V1_25_PROVENANCE_VERIFICATION_FIXTURE_HASH == via_record and moved != via_record:
+        print('SELF-TEST assertion 42e PASS: v1.25 provenance.verification fixture hash pinned; every count is bound')
+    else:
+        print(f'SELF-TEST assertion 42e FAIL: {got_pv} / {via_record} != {V1_25_PROVENANCE_VERIFICATION_FIXTURE_HASH}',
+              file=sys.stderr)
+        ok = False
+
+    # Assertion 42f — check_provenance_verification and the fail-closed
+    # dispatcher: an intact payload passes; a window that does not end after
+    # it starts, counts that do not add up, an unknown member or vocabulary
+    # are caught; the payload on another version or kind, a verification
+    # without it, or one carrying an LLM field is refused.
+    def pv_with(**change):
+        return dict(pv_event, provenance_verification=dict(_V1_25_PROVENANCE_VERIFICATION_FIXTURE, **change))
+    pv_caught = {
+        'window': bool(check_provenance_verification(pv_with(cutoff='2026-11-23T00:00:00Z'))),
+        'offset': bool(check_provenance_verification(pv_with(window_start='2026-11-23T01:00:00+01:00'))),
+        'sums': bool(check_provenance_verification(pv_with(eligible_calls=121))),
+        'vocabulary': bool(check_provenance_verification(pv_with(verifier_version='provenance-check.v2'))),
+        'member': bool(check_provenance_verification(pv_with(label='fetch_note'))),
+        'version': bool(check_provenance_verification(dict(pv_event, schema_version='v1.23'))),
+    }
+    pv_base = (1, '2026-11-24T00:05:00+00:00', 'e', 'r', '', 'allow', 0, 0, None, None, None, None, None, None,
+               'deadbeef' * 8)
+    pv_refusals = (
+        dict(version='v1.23', event_kind=EVENT_KIND_PROVENANCE_VERIFICATION,
+             provenance_verification=_V1_25_PROVENANCE_VERIFICATION_FIXTURE),
+        dict(version='v1.25', event_kind=EVENT_KIND_LLM_REQUEST,
+             provenance_verification=_V1_25_PROVENANCE_VERIFICATION_FIXTURE),
+        dict(version='v1.25', event_kind=EVENT_KIND_PROVENANCE_VERIFICATION),
+        dict(version='v1.25', event_kind=EVENT_KIND_PROVENANCE_VERIFICATION,
+             provenance_verification=_V1_25_PROVENANCE_VERIFICATION_FIXTURE, content={'capture_policy': 'full'}),
+        dict(version='v1.25', event_kind=EVENT_KIND_PROVENANCE_VERIFICATION,
+             provenance_verification=_V1_25_PROVENANCE_VERIFICATION_FIXTURE, policy_version='5f' * 32),
+    )
+    pv_rejected = 0
+    for refusal in pv_refusals:
+        kwargs = dict(refusal)
+        version = kwargs.pop('version')
+        try:
+            compute_event_hash_dispatch(version, *pv_base, **kwargs)
+        except ValueError:
+            pv_rejected += 1
+    if (check_provenance_verification(pv_event) == [] and all(pv_caught.values())
+            and pv_rejected == len(pv_refusals) and 'provenance-verifications-v1' in VERIFIER_CAPABILITIES):
+        print('SELF-TEST assertion 42f PASS: provenance.verification payloads are checked and misplaced ones refused')
+    else:
+        print(f'SELF-TEST assertion 42f FAIL: caught {pv_caught}, refused {pv_rejected} of {len(pv_refusals)}',
+              file=sys.stderr)
+        ok = False
+
+    # Assertion 42g — provenance_check_outcome, the classification a
+    # gateway's own run counts (eligibility from the messages, not from
+    # whether a list exists).
+    bare = dict(v125_content)
+    del bare['provenance_sha256_jcs']
+    outcome_cases = {
+        'complete_verified': intact,
+        'integrity_only': redacted,
+        'integrity_failure': edited,
+        'missing_list': dict(intact, schema_version='v1.19', content=bare),
+        'not_eligible': dict(intact, content=None),
+    }
+    outcomes = {name: provenance_check_outcome(r) for name, r in outcome_cases.items()}
+    extra = [
+        provenance_check_outcome(dict(intact, messages=[{'role': 'user', 'content': 'hi'}], content=bare)),
+        provenance_check_outcome(dict(intact, event_kind='admin_action')),
+        provenance_check_outcome(dict(intact, schema_version='v1.19')),
+        provenance_check_outcome(hash_only),
+    ]
+    if (all(name == got for name, got in outcomes.items())
+            and extra == ['not_eligible', 'not_eligible', 'integrity_failure', 'integrity_only']):
+        print('SELF-TEST assertion 42g PASS: each record counts as its provenance outcome')
+    else:
+        print(f'SELF-TEST assertion 42g FAIL: {outcomes}, {extra}', file=sys.stderr)
+        ok = False
+
     # Assertion 17e — the fail-closed invariant: a join_context on any
     # bucket other than v1.9 is a hard error, not a silently-unhashed field.
     # Mirror of the Rust dispatcher guard. This is the assertion that would
@@ -7485,6 +8213,71 @@ V1_19_LLM_FULL_FIXTURE_HASH = "3bf6543a3d634b6107ef29959878d70b2f489d3bbf524b976
 V1_19_LLM_BUDGET_BLOCK_FIXTURE_HASH = "4bb67bf0944741c79eb7393b72502a58fd85f73150880369470187a0bada263e"
 V1_19_LLM_NO_CUSTOMER_FIXTURE_HASH = "29ceddb5b3bd1d9dbd12ed7c08823396c29ddbc7c7ef1163073babfde979f517"
 
+# v1.25 llm_request and context provenance fixtures. Paired with
+# mei3869_provenance_chain_round_trip.rs (meilynx-audit), which computes the
+# same list from the same messages and declarations in meilynx-core. The
+# messages are the record's stored form: a declared user message, a tool call,
+# the tool's result (labelled with the tool it answers), and a message with a
+# declared text block and a tool_result block whose tool_use is not in the
+# list (label null).
+_V1_25_PROVENANCE_MESSAGES = [
+    {'role': 'user', 'content': 'Summarize the discharge note.'},
+    {'role': 'assistant', 'content': None, 'tool_calls': [
+        {'id': 'call_1', 'type': 'function', 'function': {'name': 'fetch_note', 'arguments': '{"id":9}'}}]},
+    {'role': 'tool', 'content': 'Discharged on day 3.', 'tool_call_id': 'call_1'},
+    {'role': 'user', 'content': 'Caf\u00e9 policy', 'content_blocks': [
+        {'type': 'text', 'text': 'Caf\u00e9 policy'},
+        {'type': 'tool_result', 'tool_use_id': 'toolu_1', 'content': '42'}]},
+]
+_V1_25_PROVENANCE_DECLARATIONS = [
+    {'locator': {'message_index': 0}, 'source_id': 'ehr:note/9'},
+    {'locator': {'message_index': 3, 'block_index': 0}, 'source_id': 'policy:v2'},
+]
+_V1_25_PROVENANCE_FIXTURE = {
+    'entries': [
+        {'locator': {'message_index': 0}, 'kind': 'declared_context', 'label': 'ehr:note/9',
+         'asserted_by': 'caller',
+         'sha256': 'b12203c4c48e952f837095b3602c107deca18030742fe511ea154d10d04544af', 'bytes': 29},
+        {'locator': {'message_index': 2}, 'kind': 'tool_result', 'label': 'fetch_note',
+         'asserted_by': 'caller',
+         'sha256': '2532f5156cbc7d351b1d96d34f8afde7aa13c4e197c626f3d607eb29e74f31a3', 'bytes': 20},
+        {'locator': {'message_index': 3, 'block_index': 0}, 'kind': 'declared_context', 'label': 'policy:v2',
+         'asserted_by': 'caller',
+         'sha256': '06aa2a2388188adc1f172538331c5e339251172c02dc50cb25693186850f8ae5', 'bytes': 12},
+        {'locator': {'message_index': 3, 'block_index': 1}, 'kind': 'tool_result', 'label': None,
+         'asserted_by': 'caller',
+         'sha256': '9fc0006a261b51abc9c595cc81206d82145be10a3f86b7f623b58892919e53d0', 'bytes': 61},
+    ],
+    'declarations': _V1_25_PROVENANCE_DECLARATIONS,
+    'complete': True,
+}
+V1_25_PROMPT_FIXTURE_DIGEST = "9eed76e41e636ecd2b5b84b3c6adccc04d25491ea235e29ad712ea1e11ff9df5"
+V1_25_PROVENANCE_FIXTURE_DIGEST = "f5b42d55035f8f0c189e34260f3dc5707eec91a1032808473feea06a9f93f19d"
+# The v1.16 fixture request (_V1_16_FIXTURE_ARGS), no identity or trace, the
+# `none` customer block, the v1.19 policy version: with a `full` content block
+# carrying the provenance digest and the served model, and with no content
+# block and no served model.
+V1_25_LLM_FIXTURE_HASH = "8192b2497872ad1dbeaa94711f2c094b4f8ba5746c9ba084e87fa2a034af157e"
+V1_25_LLM_NO_PROVENANCE_FIXTURE_HASH = "b8ca3c5f927293707a8c71eda0487f2359e02609b60ad4ac278a1efb517c11cd"
+
+# v1.25 provenance.verification fixture: the route contract's example
+# outcome. Paired with mei3869_provenance_verification_chain_round_trip.rs
+# (meilynx-audit).
+_V1_25_PROVENANCE_VERIFICATION_FIXTURE = {
+    'verification_id': '0193a7c2-5d1e-7b2a-9f00-3c4d5e6f7a8b',
+    'window_start': '2026-11-23T00:00:00Z',
+    'cutoff': '2026-11-24T00:00:00Z',
+    'verifier_version': 'provenance-check.v1',
+    'evidence_mode': 'local_chain',
+    'eligible_calls': 120,
+    'complete_verified': 118,
+    'integrity_only': 2,
+    'missing_list': 0,
+    'integrity_failures': 0,
+    'records_unreadable': 0,
+}
+V1_25_PROVENANCE_VERIFICATION_FIXTURE_HASH = "62ce71dcee7b45b9929b14f6a72cf28915d7a94b4c2d5a9afe84d6c231f0b0d5"
+
 # Tool-call digest fixture. Paired with
 # meilynx-proxy/src/audit_capture.rs::tool_call_digests_are_pinned_for_the_verifier:
 # the record's `tool_calls` exactly as the proxy serializes them, and the
@@ -7589,6 +8382,7 @@ def recompute_event_hash(event, seq, previous_hash):
         compliance_record=event.get('compliance_record'),
         judgment_verdict=event.get('judgment_verdict'),
         control_probe_run=event.get('control_probe_run'),
+        provenance_verification=event.get('provenance_verification'),
     )
 
 
@@ -8673,6 +9467,16 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             report(f"FAIL seq={seq}: {problem}")
             all_passed = False
             content_ok = False
+        # A v1.25 record's hash covers the digest of its context provenance
+        # list; this checks the stored list still matches it and, where the
+        # messages are retained as captured, every entry against them.
+        provenance_problems, provenance_notes = check_context_provenance(event, stripped)
+        for problem in provenance_problems:
+            report(f"FAIL seq={seq}: {problem}")
+            all_passed = False
+            content_ok = False
+        for note in provenance_notes:
+            report(f"NOTE seq={seq}: {note}")
         # A v1.12 record's hash covers the digest of its asserted
         # labels; this checks the stored labels still match it.
         for problem in check_sealed_identity(event, stripped):
@@ -8710,6 +9514,11 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             content_ok = False
         for note in probe_notes:
             report(f"NOTE seq={seq}: {note}")
+        # A v1.25 provenance.verification record: its window and counts.
+        for problem in check_provenance_verification(event):
+            report(f"FAIL seq={seq}: {problem}")
+            all_passed = False
+            content_ok = False
         # A v1.16 record's hash covers the digest of its evaluation
         # outcomes; this checks the stored outcomes still match it.
         for problem in check_evaluation_trace(event):
@@ -11424,6 +12233,559 @@ def required_coverage_status(manifest, require_through):
     print(f"COVERAGE NOT ESTABLISHED through seq={require_through}: the pack's last record is seq={hi}, "
           f"before the sequence you required (--require-through)")
     return COVERAGE_NOT_ESTABLISHED
+
+
+# ── Witness files and verification receipts ────────────────────────────────
+# A gateway with no write-once store holds its own record: whoever controls it
+# can rewrite or remove records before a pack is built. Its control plane
+# keeps, append-only, the chain heads the gateway reported (on its heartbeat)
+# and the anchor statements and timestamp tokens it uploaded. A compliance
+# member downloads them as a witness file (SPEC §6.9), and --witness FILE
+# judges the pack against it with the rules of §6.7: a pack that contradicts a
+# witnessed head inside it fails (exit 1); a pack that ends before a witnessed
+# head is coverage not established (exit 4), whatever its manifest claims.
+#
+# Which heads count. A `timestamp` head counts on the timestamp authority's
+# signature alone: a token that verifies over a canonical statement naming
+# this chain at this sequence with this event_hash, whose run_id names the
+# file's gateway (`<proxy_id>/<boot id>`). A `reported` head, and a timestamp
+# head whose statement names no gateway, counts only when the witness
+# manifest's signature verifies under the project's evidence attestation key
+# the reader pins (--attestation-key). An unsigned file therefore counts only
+# timestamp-backed heads, and the verifier says so.
+#
+# --receipt FILE writes what the run concluded as a content-free JSON
+# receipt (`meilynx.verification_receipt.v1`, RFC 8785 bytes).
+
+VERIFIER_VERSION = "0.16.0"
+WITNESS_MANIFEST_FORMAT = "meilynx.witness_manifest.v1"
+WITNESS_MANIFEST_NAME = "witness-manifest.json"
+WITNESS_SIGNATURE_DOMAIN = WITNESS_MANIFEST_FORMAT.encode("ascii") + b"\x00"
+WITNESS_BASIS_TIMESTAMP = "timestamp"
+WITNESS_BASIS_REPORTED = "reported"
+WITNESS_MAX_MEMBER_BYTES = 32 * 1024 * 1024
+RECEIPT_FORMAT = "meilynx.verification_receipt.v1"
+_WITNESS_TIME_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
+_WITNESS_PROXY_RE = re.compile(r"[!-.0-~]{1,127}")
+_WITNESS_TOP_KEYS = {"format", "generated_at", "org_id", "project_id", "proxy_id", "chains", "omitted_chains",
+                     "contradictions", "signing", "disclosure"}
+_WITNESS_CONTRADICTION_KINDS = ("fork", "rewind", "witness_conflict")
+
+
+class WitnessFile:
+    """Read access to a witness file: a ZIP archive or the same tree as a
+    directory. Members are read by name only; nothing is extracted."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.zip = None
+        self.file_sha256 = None
+        if self.path.is_dir():
+            return
+        raw = self.path.read_bytes()
+        self.file_sha256 = hashlib.sha256(raw).hexdigest()
+        import io
+        import zipfile
+        try:
+            self.zip = zipfile.ZipFile(io.BytesIO(raw))
+        except zipfile.BadZipFile as exc:
+            raise ValueError(f"not a ZIP archive or a directory ({exc})")
+        names = self.zip.namelist()
+        if len(set(names)) != len(names):
+            raise ValueError("the archive holds a member name twice")
+
+    def names(self):
+        if self.zip is not None:
+            return sorted(n for n in self.zip.namelist() if not n.endswith("/"))
+        return sorted(p.relative_to(self.path).as_posix() for p in self.path.rglob("*") if p.is_file())
+
+    def read(self, name):
+        """The member's bytes, or None when absent."""
+        if not isinstance(name, str) or name.startswith("/") or ".." in name.split("/") or "\\" in name:
+            return None
+        if self.zip is not None:
+            try:
+                info = self.zip.getinfo(name)
+            except KeyError:
+                return None
+            if info.file_size > WITNESS_MAX_MEMBER_BYTES:
+                raise ValueError(f"{name} is larger than {WITNESS_MAX_MEMBER_BYTES} bytes")
+            return self.zip.read(info)
+        path = self.path / name
+        return path.read_bytes() if path.is_file() else None
+
+
+def witness_statement_path(chain, seq):
+    return f"anchors/{chain}/{seq:020d}.json"
+
+
+def witness_token_path(chain, seq, tsa_id):
+    return f"anchors/{chain}/{seq:020d}.{tsa_id}.tsr"
+
+
+def witness_signed_head_path(chain, seq):
+    return f"head-signatures/{chain}/{seq:020d}.json"
+
+
+def witness_manifest_message(manifest):
+    """The bytes a witness manifest signature covers: the domain tag, then the
+    manifest's RFC 8785 bytes without `signature`."""
+    body = {k: v for k, v in manifest.items() if k != "signature"}
+    return WITNESS_SIGNATURE_DOMAIN + jcs_dumps(body).encode("utf-8")
+
+
+def check_witness_shape(m):
+    """Raise ValueError unless `m` is a meilynx.witness_manifest.v1 document
+    this verifier reads (an unknown format is cannot evaluate)."""
+    if not isinstance(m, dict):
+        raise ValueError("the witness manifest is not a JSON object")
+    if m.get("format") != WITNESS_MANIFEST_FORMAT:
+        raise ValueError(f"witness manifest format {m.get('format')!r} is not one this verifier reads "
+                         f"({WITNESS_MANIFEST_FORMAT}). Re-run with an updated verifier.")
+    keys = set(m)
+    if not _WITNESS_TOP_KEYS <= keys or keys - _WITNESS_TOP_KEYS - {"signature"}:
+        raise ValueError(f"the witness manifest's members are {sorted(keys)}, not those of {WITNESS_MANIFEST_FORMAT}")
+
+    def is_seq(v):
+        return isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= _JSON_SAFE_MAX
+
+    def is_hash(v):
+        return isinstance(v, str) and _EVENT_HASH_RE.fullmatch(v) is not None
+
+    def is_time(v):
+        return isinstance(v, str) and _WITNESS_TIME_RE.fullmatch(v) is not None
+
+    def is_object_ref(v):
+        return isinstance(v, dict) and set(v) == {"path", "sha256"} and isinstance(v["path"], str) and is_hash(v["sha256"])
+
+    if not isinstance(m["proxy_id"], str) or not _WITNESS_PROXY_RE.fullmatch(m["proxy_id"]):
+        raise ValueError("proxy_id")
+    for field in ("org_id", "project_id", "disclosure"):
+        if not isinstance(m[field], str) or not m[field]:
+            raise ValueError(field)
+    if not is_time(m["generated_at"]):
+        raise ValueError("generated_at")
+    if not is_seq(m["omitted_chains"]):
+        raise ValueError("omitted_chains")
+    signing = m["signing"]
+    if (not isinstance(signing, dict) or set(signing) != {"state", "key_id", "reason"}
+            or signing["state"] not in ("signed", "unsigned")
+            or signing["reason"] not in ("attestation_key", "no_attestation_key")
+            or not (signing["key_id"] is None or isinstance(signing["key_id"], str))):
+        raise ValueError("signing")
+    if "signature" in m:
+        sig = m["signature"]
+        if (not isinstance(sig, dict) or set(sig) != {"scheme", "alg", "key_id", "value"}
+                or sig["scheme"] != WITNESS_MANIFEST_FORMAT or sig["alg"] != "ES256"
+                or not isinstance(sig["key_id"], str) or not isinstance(sig["value"], str)):
+            raise ValueError("signature")
+    if not isinstance(m["chains"], list) or not isinstance(m["contradictions"], list):
+        raise ValueError("chains or contradictions")
+    names = []
+    for chain in m["chains"]:
+        if not isinstance(chain, dict) or set(chain) != {"chain", "heads", "omitted_earlier_heads"}:
+            raise ValueError("chain entry")
+        name = chain["chain"]
+        if not isinstance(name, str) or not _CHAIN_RE.fullmatch(name) or name in (".", ".."):
+            raise ValueError("chain name")
+        names.append(name.encode("utf-8"))
+        if not is_seq(chain["omitted_earlier_heads"]) or not isinstance(chain["heads"], list):
+            raise ValueError(f"chain {name}")
+        for h in chain["heads"]:
+            if not isinstance(h, dict) or h.get("basis") not in (WITNESS_BASIS_TIMESTAMP, WITNESS_BASIS_REPORTED):
+                raise ValueError(f"chain {name}: head basis")
+            if not is_seq(h.get("seq")) or not is_hash(h.get("event_hash")) or not is_time(h.get("received_at")):
+                raise ValueError(f"chain {name}: head seq, event_hash or received_at")
+            if h["basis"] == WITNESS_BASIS_TIMESTAMP:
+                if set(h) != {"basis", "seq", "event_hash", "received_at", "statement", "tokens"}:
+                    raise ValueError(f"chain {name} seq={h['seq']}: timestamp head members")
+                if not is_object_ref(h["statement"]) or not isinstance(h["tokens"], dict) or not h["tokens"]:
+                    raise ValueError(f"chain {name} seq={h['seq']}: statement or tokens")
+                for tsa_id, token in h["tokens"].items():
+                    if (not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,31}", tsa_id) or not isinstance(token, dict)
+                            or set(token) != {"path", "sha256", "gen_time"} or not isinstance(token["path"], str)
+                            or not is_hash(token["sha256"]) or not is_time(token["gen_time"])):
+                        raise ValueError(f"chain {name} seq={h['seq']}: token {tsa_id!r}")
+            else:
+                if set(h) != {"basis", "seq", "event_hash", "observed_at", "received_at", "signed_head"}:
+                    raise ValueError(f"chain {name} seq={h['seq']}: reported head members")
+                if not is_time(h["observed_at"]) or not (h["signed_head"] is None or is_object_ref(h["signed_head"])):
+                    raise ValueError(f"chain {name} seq={h['seq']}: observed_at or signed_head")
+    if names != sorted(names) or len(set(names)) != len(names):
+        raise ValueError("chains are not sorted by name, or a chain repeats")
+    for c in m["contradictions"]:
+        if (not isinstance(c, dict) or set(c) != {"kind", "chain", "seq", "event_hash", "earlier_seq",
+                                                  "earlier_event_hash", "source", "detected_at"}
+                or c["kind"] not in _WITNESS_CONTRADICTION_KINDS or not isinstance(c["chain"], str)
+                or not is_seq(c["seq"]) or not is_hash(c["event_hash"])
+                or not (c["earlier_seq"] is None or is_seq(c["earlier_seq"]))
+                or not (c["earlier_event_hash"] is None or is_hash(c["earlier_event_hash"]))
+                or c["source"] not in ("heartbeat", "witness") or not is_time(c["detected_at"])):
+            raise ValueError("contradiction entry")
+
+
+def witness_signature_status(m, pins):
+    """(status, line) for the witness manifest's signature: `verified`,
+    `unsigned`, `not_checked` (signed, no pin given) or `failed`."""
+    signing = m["signing"]
+    sig = m.get("signature")
+    if sig is None:
+        if signing["state"] != "unsigned":
+            return "failed", ("FAIL witness file: signing.state says signed, but the manifest carries no signature "
+                              "(the file was altered)")
+        return "unsigned", ("WITNESS FILE UNSIGNED: the control plane that built it has no evidence attestation key; "
+                            "only heads backed by a timestamp token count, reported heads are listed for information")
+    if signing["state"] != "signed" or signing["key_id"] != sig["key_id"]:
+        return "failed", "FAIL witness file: signing does not name the key the signature names"
+    if not pins:
+        return "not_checked", (f"NOTICE witness file: signed by attestation key {sig['key_id']}, not checked: pass "
+                               f"--witness-key or --attestation-key (the project's attestation key) to count "
+                               f"reported heads")
+    pin = next((p for p in pins if p[1] == sig["key_id"]), None)
+    if pin is None:
+        return "failed", (f"FAIL witness file: signed by attestation key {sig['key_id']!r}, not the project key you "
+                          f"pinned ({', '.join(p[1] for p in pins)})")
+    try:
+        raw = base64.b64decode(sig["value"], validate=True)
+        digest = hashlib.sha256(witness_manifest_message(m)).digest()
+    except (binascii.Error, ValueError) as exc:
+        return "failed", f"FAIL witness file: the signature cannot be read ({exc})"
+    if len(raw) != 64 or not ecdsa_verify(P256, pin[0], digest, int.from_bytes(raw[:32], "big"),
+                                          int.from_bytes(raw[32:], "big")):
+        return "failed", (f"FAIL witness file: the signature does not verify under the project key you pinned "
+                          f"({pin[1]}); the file changed after it was signed")
+    return "verified", f"WITNESS FILE SIGNED: by the project attestation key you pinned ({pin[1]})"
+
+
+def pack_gateway(manifest):
+    """(gateway id, source) the pack is labelled with: its manifest's proxy_id,
+    else the gateway in a `local-chain:<gateway>` bucket label."""
+    proxy = manifest.get("proxy_id")
+    if isinstance(proxy, str) and proxy:
+        return proxy, "pack_label"
+    bucket = manifest.get("bucket")
+    if isinstance(bucket, str) and bucket.startswith("local-chain:") and len(bucket) > len("local-chain:"):
+        return bucket[len("local-chain:"):], "pack_label"
+    return None, "none"
+
+
+class WitnessOutcome:
+    """What --witness concluded; `summary` feeds the receipt."""
+
+    def __init__(self):
+        self.status = PASSED
+        self.file_sha256 = None
+        self.manifest_sha256 = None
+        self.proxy_id = None
+        self.generated_at = None
+        self.signature = "not_checked"
+        self.key_id = None
+        self.counted = 0
+        self.matched = 0
+        self.after = 0
+        self.not_counted = 0
+        self.through = None
+        self.bound = False
+
+    def receipt(self):
+        return {"file_sha256": self.file_sha256, "manifest_sha256": self.manifest_sha256, "proxy_id": self.proxy_id,
+                "generated_at": self.generated_at, "signature": self.signature, "key_id": self.key_id,
+                "heads_counted": self.counted, "heads_matched": self.matched, "heads_after_pack": self.after,
+                "heads_not_counted": self.not_counted}
+
+
+def _witness_timestamp_head(wf, m, chain, h, roots_for, signed):
+    """Judge one timestamp head's objects. Returns (verdict, detail, at):
+    `counted`, `not_counted`, `failed` or `cannot`."""
+    seq = h["seq"]
+    if h["statement"]["path"] != witness_statement_path(chain, seq):
+        return "failed", "the statement path does not match the witness layout", None
+    raw = wf.read(h["statement"]["path"])
+    if raw is None:
+        return "failed", "the statement object is missing", None
+    if hashlib.sha256(raw).hexdigest() != h["statement"]["sha256"]:
+        return "failed", "the statement does not match the manifest's digest", None
+    try:
+        statement = parse_anchor_statement(raw)
+    except AnchorFailure as exc:
+        return "failed", f"the statement is not a canonical anchor statement ({exc})", None
+    named = next((x for x in statement["heads"] if x["chain"] == chain and x["seq"] == seq), None)
+    if named is None:
+        return "failed", f"the statement does not name chain {chain} at this sequence", None
+    if named["event_hash"] != h["event_hash"]:
+        return "failed", "the statement names another event_hash than the manifest", None
+    run_id = statement["run_id"]
+    gateway = run_id.rsplit("/", 1)[0] if "/" in run_id else None
+    if gateway is not None and gateway != m["proxy_id"]:
+        return "failed", f"the statement names gateway {gateway!r}, not {m['proxy_id']!r}", None
+    imprint = anchor_imprint(raw)
+    verified, cannot = [], []
+    for tsa_id in sorted(h["tokens"]):
+        listed = h["tokens"][tsa_id]
+        if listed["path"] != witness_token_path(chain, seq, tsa_id):
+            return "failed", f"token {tsa_id}: the path does not match the witness layout", None
+        token = wf.read(listed["path"])
+        if token is None:
+            return "failed", f"token {tsa_id}: the object is missing", None
+        if hashlib.sha256(token).hexdigest() != listed["sha256"]:
+            return "failed", f"token {tsa_id}: the object does not match the manifest's digest", None
+        roots = roots_for(tsa_id)
+        if roots is None:
+            cannot.append(f"no trust root for witness {tsa_id}; pass --tsa-root {tsa_id}=FILE")
+            continue
+        try:
+            result = verify_tsa_token(token, imprint, roots)
+        except AnchorFailure as exc:
+            if exc.code == "malformed":
+                cannot.append(f"token {tsa_id} cannot be parsed ({exc.detail})")
+                continue
+            return "failed", f"token {tsa_id} does not verify ({exc})", None
+        if _iso(result["gen_time"]) != listed["gen_time"]:
+            return "failed", f"token {tsa_id}: the manifest's gen_time does not match the token", None
+        verified.append((result["gen_time"], f"{tsa_id} {_iso(result['gen_time'])}"))
+    if not verified:
+        if signed:
+            return "counted", "no token could be checked here; counted under the signed witness file", h["received_at"]
+        return "cannot", "; ".join(cannot), None
+    at = _iso(min(t for t, _ in verified))
+    detail = "; ".join(d for _, d in verified)
+    if gateway is None and not signed:
+        return "not_counted", (f"{detail}; its statement names no gateway (run_id {run_id!r}), so it is bound to "
+                               f"{m['proxy_id']} only by a signed witness file"), at
+    return "counted", detail, at
+
+
+def _witness_signed_head(wf, m, chain, h, keys):
+    """Check a reported head's gateway-signed head (SPEC §12). Returns
+    (failure line or None, note or None)."""
+    ref = h["signed_head"]
+    seq = h["seq"]
+    if ref["path"] != witness_signed_head_path(chain, seq):
+        return f"FAIL witness seq={seq}: the signed head path does not match the witness layout", None
+    raw = wf.read(ref["path"])
+    if raw is None:
+        return f"FAIL witness seq={seq}: the signed head object is missing", None
+    if hashlib.sha256(raw).hexdigest() != ref["sha256"]:
+        return f"FAIL witness seq={seq}: the signed head does not match the manifest's digest", None
+    try:
+        doc = json.loads(raw)
+    except ValueError as exc:
+        return f"FAIL witness seq={seq}: the signed head is not JSON ({exc})", None
+    statement, signature, problem = chain_head_parts(doc, f"{seq:020d}.json")
+    if problem:
+        return f"FAIL witness seq={seq}: the signed head {problem}", None
+    if (statement["proxy_id"] != m["proxy_id"] or statement["chain_id"] != chain
+            or statement["head_event_hash"] != h["event_hash"]):
+        return f"FAIL witness seq={seq}: the signed head names another gateway, chain or head than the manifest", None
+    if keys is None or keys.mode == "none":
+        return None, "its gateway signature was not checked (no --attestation-key or --gateway-key)"
+    key, problem = keys.resolve(statement["key_fingerprint"], statement["key_seq"])
+    if problem:
+        return None, f"its gateway signature was not checked ({problem})"
+    try:
+        message = CHAIN_HEAD_DOMAIN + jcs_dumps(statement).encode("utf-8")
+    except ValueError as exc:
+        return f"FAIL witness seq={seq}: the signed head has no RFC 8785 form ({exc})", None
+    if not ed25519_verify(key, message, signature):
+        return f"FAIL witness seq={seq}: the gateway signature on the head does not verify", None
+    return None, f"signed by gateway key {statement['key_fingerprint']}"
+
+
+def judge_witness(witness_path, manifest, records, pins, roots_for, keys, report=print):
+    """Judge the pack against a witness file. Returns a WitnessOutcome whose
+    status is PASSED, FAILED, CANNOT_EVALUATE or COVERAGE_NOT_ESTABLISHED.
+    `records` is seq -> record as the chain walk read it."""
+    out = WitnessOutcome()
+    try:
+        wf = WitnessFile(witness_path)
+        out.file_sha256 = wf.file_sha256
+        raw = wf.read(WITNESS_MANIFEST_NAME)
+        if raw is None:
+            raise ValueError(f"it holds no {WITNESS_MANIFEST_NAME}")
+        out.manifest_sha256 = hashlib.sha256(raw).hexdigest()
+        m = json.loads(raw)
+        check_witness_shape(m)
+    except (OSError, ValueError) as exc:
+        report(f"ERROR: --witness {witness_path}: cannot read the witness file ({exc})")
+        out.status = CANNOT_EVALUATE
+        return out
+    out.proxy_id, out.generated_at = m["proxy_id"], m["generated_at"]
+    out.key_id = (m.get("signature") or {}).get("key_id")
+    out.signature, line = witness_signature_status(m, pins)
+    report(f"WITNESS FILE: gateway {m['proxy_id']}, {len(m['chains'])} chain(s), built {m['generated_at']}")
+    report(line)
+    if out.signature == "failed":
+        out.status = FAILED
+        return out
+    signed = out.signature == "verified"
+
+    gateway, _ = pack_gateway(manifest)
+    if gateway is None:
+        report(f"ERROR: --witness: the pack names no gateway (no proxy_id and no local-chain bucket label), so the "
+               f"witness file of {m['proxy_id']} cannot be bound to it")
+        out.status = CANNOT_EVALUATE
+        return out
+    if gateway != m["proxy_id"]:
+        report(f"ERROR: --witness: the witness file is for gateway {m['proxy_id']}; the pack is labelled with gateway "
+               f"{gateway}. Download the witness file of the pack's gateway.")
+        out.status = CANNOT_EVALUATE
+        return out
+    out.bound = True
+    chain = chain_for_prefix(manifest.get("prefix", ""))
+    lo, hi = manifest.get("from_sequence"), manifest.get("to_sequence")
+    if chain is None or not _is_count(lo) or not _is_count(hi):
+        report("ERROR: --witness: the pack's chain or sequence bounds cannot be read")
+        out.status = CANNOT_EVALUATE
+        return out
+    for c in m["contradictions"]:
+        earlier = f", after seq={c['earlier_seq']}" if c["earlier_seq"] is not None else ""
+        report(f"NOTICE witness: the control plane recorded a {c['kind']} on chain {c['chain']} at seq={c['seq']}"
+               f"{earlier} ({c['source']}, {c['detected_at']})")
+    others = [c["chain"] for c in m["chains"] if c["chain"] != chain]
+    if others:
+        report(f"NOTICE witness: {len(others)} other chain(s) of gateway {m['proxy_id']} in the file were not judged")
+    entry = next((c for c in m["chains"] if c["chain"] == chain), None)
+    heads = entry["heads"] if entry else []
+    if entry and entry["omitted_earlier_heads"]:
+        report(f"NOTICE witness: {entry['omitted_earlier_heads']} earlier head(s) of chain {chain} are not in the file")
+
+    failures, cannot, counted = [], [], []
+    for h in heads:
+        seq, basis = h["seq"], h["basis"]
+        if basis == WITNESS_BASIS_TIMESTAMP:
+            verdict, detail, at = _witness_timestamp_head(wf, m, chain, h, roots_for, signed)
+        else:
+            verdict, detail, at = ("counted", f"received {h['received_at']}", h["received_at"]) if signed else (
+                "not_counted", "the witness file is not signed under a key you pinned", None)
+            if h["signed_head"] is not None:
+                failure, note = _witness_signed_head(wf, m, chain, h, keys)
+                if failure:
+                    verdict, detail = "failed", failure
+                elif note:
+                    detail = f"{detail}; {note}"
+        if verdict == "failed":
+            failures.append(detail if detail.startswith("FAIL") else f"FAIL witness seq={seq} ({basis}): {detail}")
+            continue
+        if verdict == "cannot":
+            cannot.append(f"ERROR: witness seq={seq} ({basis}) could not be evaluated: {detail}")
+            continue
+        record = records.get(seq) if lo <= seq <= hi else None
+        if verdict == "not_counted":
+            out.not_counted += 1
+            disagrees = record is not None and record.get("event_hash") != h["event_hash"]
+            report(f"NOTICE witness seq={seq} ({basis}): not counted: {detail}"
+                   + ("; it names another event_hash than the pack's record" if disagrees else ""))
+            continue
+        out.counted += 1
+        counted.append((seq, h["event_hash"], basis, at))
+        if seq > hi:
+            out.after += 1
+            report(f"COVERAGE witness seq={seq} ({basis}, {detail}): names chain {chain} at seq={seq}, after this "
+                   f"pack's last record seq={hi}")
+        elif seq < lo:
+            report(f"NOTICE witness seq={seq} ({basis}): before this pack's first record seq={lo}; not judged")
+        elif record is None:
+            report(f"NOTICE witness seq={seq} ({basis}): the record at that sequence was not read; not compared")
+        elif record.get("event_hash") != h["event_hash"]:
+            witness = "a timestamp authority saw" if basis == WITNESS_BASIS_TIMESTAMP else "the gateway reported"
+            failures.append(f"FAIL witness seq={seq} ({basis}, {detail}): {witness} head "
+                            f"{h['event_hash'][:16]}... at seq={seq}, but the pack's record there has "
+                            f"{str(record.get('event_hash'))[:16]}...; the pack contradicts a witnessed head")
+        else:
+            out.matched += 1
+            report(f"WITNESS seq={seq} ({basis}, {detail}): matches the pack's record")
+    if counted:
+        top = max(counted, key=lambda x: (x[0], x[2] == WITNESS_BASIS_TIMESTAMP))
+        out.through = {"seq": top[0], "event_hash": top[1], "basis": top[2], "at": top[3]}
+    for line in cannot + failures:
+        report(line)
+    if failures:
+        out.status = FAILED
+    elif cannot:
+        out.status = CANNOT_EVALUATE
+    elif not counted:
+        report(f"WITNESS COVERAGE NOT ESTABLISHED: no witnessed head of chain {chain} counts"
+               + ("" if signed or not heads else "; pass --witness-key to count reported heads in a signed file"))
+        out.status = COVERAGE_NOT_ESTABLISHED
+    elif out.after:
+        top = out.through
+        report(f"WITNESS COVERAGE NOT ESTABLISHED through seq={top['seq']}: the control plane witnessed chain {chain} "
+               f"at seq={top['seq']} ({top['basis']}, {top['at']}), and the pack ends at seq={hi}. The pack was built "
+               f"before that head, or records after seq={hi} were removed. Get a pack that runs through "
+               f"seq={top['seq']}.")
+        out.status = COVERAGE_NOT_ESTABLISHED
+    else:
+        top = out.through
+        report(f"WITNESS OK: chain {chain} matches {out.matched} witnessed head(s) inside the pack, witnessed through "
+               f"seq={top['seq']} ({top['basis']}, {top['at']}); the pack is tamper-evident against the witnessed "
+               f"heads, not proven complete")
+    return out
+
+
+def verification_receipt(code, manifest, manifest_bytes, records, signature_status, witness, require_through,
+                         args_allow_unsigned, pins, tsa_root_ids, verifier_bytes, now=None):
+    """The `meilynx.verification_receipt.v1` document of one run."""
+    verdicts = {EXIT_OK: "pass", EXIT_FAIL: "fail", EXIT_CANNOT_EVALUATE: "cannot_evaluate",
+                EXIT_UNSIGNED: "unsigned", EXIT_COVERAGE_NOT_ESTABLISHED: "coverage_not_established"}
+    gateway, source = pack_gateway(manifest)
+    if witness is not None and witness.bound:
+        gateway, source = witness.proxy_id, "witness_file"
+    lo, hi = manifest.get("from_sequence"), manifest.get("to_sequence")
+    lo, hi = (lo if _is_count(lo) else None), (hi if _is_count(hi) else None)
+    head = None
+    if hi is not None:
+        record = records.get(hi)
+        head = record.get("event_hash") if isinstance(record, dict) else None
+        if head is None:
+            head = next((e.get("stored_event_hash") for e in manifest.get("events", [])
+                         if isinstance(e, dict) and e.get("sequence") == hi), None)
+    if not (isinstance(head, str) and _EVENT_HASH_RE.fullmatch(head)):
+        head = None
+    try:
+        scope = manifest_claim(manifest)[0]
+    except (ValueError, ClaimContradiction):
+        scope = None
+    if witness is None and require_through is None:
+        coverage = "not_checked"
+    else:
+        reached = witness is None or (witness.bound and witness.status == PASSED)
+        if require_through is not None:
+            reached = reached and hi is not None and hi >= require_through
+        coverage = "established" if reached else "not_established"
+    events = manifest.get("events")
+    return {
+        "format": RECEIPT_FORMAT,
+        "verified_at": (now or datetime.datetime.now(datetime.timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "verifier": {"name": "meilynx-verify", "version": VERIFIER_VERSION,
+                     "sha256": hashlib.sha256(verifier_bytes).hexdigest()},
+        "result": {"exit_code": code, "verdict": verdicts[code]},
+        "gateway": {"proxy_id": gateway, "source": source},
+        "pack": {
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "pack_id": manifest.get("pack_id") if isinstance(manifest.get("pack_id"), str) else None,
+            "evidence_class": (manifest.get("evidence_class") if isinstance(manifest.get("evidence_class"), str)
+                               else None),
+            "signed": signature_status == PASSED,
+            "claim_scope": scope,
+            "records": len(events) if isinstance(events, list) else 0,
+        },
+        "chains": [{
+            "chain": chain_for_prefix(manifest.get("prefix", "")),
+            "from_sequence": lo,
+            "to_sequence": hi,
+            "head_event_hash": head,
+            "required_through": require_through,
+            "witnessed_through": witness.through if witness is not None else None,
+            "coverage": coverage,
+        }],
+        "witness_file": witness.receipt() if witness is not None else None,
+        "options": {"allow_unsigned": bool(args_allow_unsigned), "attestation_key_ids": sorted(p[1] for p in pins),
+                    "tsa_root_ids": sorted(tsa_root_ids)},
+    }
+
+
+def write_receipt(path, receipt):
+    Path(path).write_bytes(jcs_dumps(receipt).encode("utf-8"))
 
 
 def evidence_mode_findings(manifest, records):
@@ -17180,6 +18542,75 @@ def gateway_evidence_key_self_test():
     return ok
 
 
+def witness_self_test():
+    """Witness files and receipts (SPEC §6.9, §6.10): the signature over the
+    domain-tagged RFC 8785 bytes verifies under the pinned key and fails when
+    the manifest changes or another key is pinned (41a), an unsigned file and
+    an unpinned signed one are reported as such (41b), the closed shape
+    refuses an unknown member and an unsorted chain list (41c), the pack's
+    gateway label is read from proxy_id or a local-chain bucket (41d), and the
+    capabilities (41e). fixtures/run-witness-cases.py runs the command line
+    over the fixture witness files."""
+    ok = True
+
+    def check(label, passed, what, detail=''):
+        nonlocal ok
+        if passed:
+            print(f'SELF-TEST assertion {label} PASS: {what}')
+        else:
+            print(f'SELF-TEST assertion {label} FAIL: {what} {detail}', file=sys.stderr)
+            ok = False
+
+    d = 0x5A1F3C7E9B2D4F6A8C0E1B3D5F7A9C2E4B6D8F0A1C3E5B7D9F2A4C6E8B0D1F3A
+    pin = load_attestation_pin(json.dumps(_p256_self_test_jwk(d)))
+    other = load_attestation_pin(json.dumps(_p256_self_test_jwk(d + 1)))
+    m = {'chains': [], 'contradictions': [], 'disclosure': 'self-test', 'format': WITNESS_MANIFEST_FORMAT,
+         'generated_at': '2026-11-24T00:00:00Z', 'omitted_chains': 0, 'org_id': 'org', 'project_id': 'prj',
+         'proxy_id': 'pxy_self_test', 'signing': {'key_id': pin[1], 'reason': 'attestation_key', 'state': 'signed'}}
+    m['signature'] = {'alg': 'ES256', 'key_id': pin[1], 'scheme': WITNESS_MANIFEST_FORMAT,
+                      'value': base64.b64encode(_p256_self_test_sign(d, witness_manifest_message(m))).decode()}
+    edited = dict(m, generated_at='2026-11-24T00:00:01Z')
+    check('41a', witness_manifest_message(m).startswith(b'meilynx.witness_manifest.v1\x00{"chains":[]')
+          and witness_signature_status(m, [pin])[0] == 'verified'
+          and witness_signature_status(edited, [pin])[0] == 'failed'
+          and witness_signature_status(m, [other])[0] == 'failed',
+          'a witness manifest signature verifies under the pinned key over the domain-tagged RFC 8785 bytes, and '
+          'fails when the manifest changes or another key is pinned')
+    unsigned = {k: v for k, v in m.items() if k != 'signature'}
+    unsigned['signing'] = {'key_id': None, 'reason': 'no_attestation_key', 'state': 'unsigned'}
+    stripped = {k: v for k, v in m.items() if k != 'signature'}
+    check('41b', witness_signature_status(unsigned, [pin])[0] == 'unsigned'
+          and witness_signature_status(m, [])[0] == 'not_checked'
+          and witness_signature_status(stripped, [pin])[0] == 'failed',
+          'an unsigned file is unsigned, a signed file with no pin is not checked, and a file that says it is '
+          'signed but carries no signature fails')
+    refused = []
+    for bad in (dict(m, extra=1), dict(m, chains=[{'chain': 'b', 'heads': [], 'omitted_earlier_heads': 0},
+                                                  {'chain': 'a', 'heads': [], 'omitted_earlier_heads': 0}]),
+                dict(m, proxy_id='a/b'), dict(m, format='meilynx.witness_manifest.v2')):
+        try:
+            check_witness_shape(bad)
+        except ValueError:
+            refused.append(True)
+    try:
+        check_witness_shape(m)
+        accepted = True
+    except ValueError:
+        accepted = False
+    check('41c', accepted and len(refused) == 4,
+          'the witness manifest shape is closed: an unknown member, unsorted chains, a proxy_id with a slash and '
+          'an unknown format are refused')
+    check('41d', pack_gateway({'proxy_id': 'pxy_a', 'bucket': 'local-chain:pxy_b'}) == ('pxy_a', 'pack_label')
+          and pack_gateway({'bucket': 'local-chain:pxy_b'}) == ('pxy_b', 'pack_label')
+          and pack_gateway({'bucket': 'audit-bucket'}) == (None, 'none'),
+          "the pack's gateway is its manifest proxy_id, else the gateway of a local-chain bucket label")
+    check('41e', {'witness-file-v1', 'verification-receipt-v1'} <= VERIFIER_CAPABILITIES
+          and re.fullmatch(r'\d+\.\d+\.\d+', VERIFIER_VERSION) is not None,
+          'VERIFIER_CAPABILITIES advertises witness-file-v1 and verification-receipt-v1, and the version is '
+          'stated')
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Meilynx Integrity Pack reproducer — independently verifies GCS WORM audit chain.'
@@ -17329,6 +18760,37 @@ def main():
         ),
     )
     parser.add_argument(
+        '--witness',
+        metavar='FILE',
+        help=(
+            "A witness file (anchor file) downloaded from the gateway's control plane: a ZIP archive, or the same "
+            "tree as a directory, with witness-manifest.json. The pack must be labelled with the file's gateway. "
+            "A pack that contradicts a counted witnessed head fails (exit 1); one that ends before a counted "
+            f"witnessed head exits {EXIT_COVERAGE_NOT_ESTABLISHED} (coverage not established), whatever its manifest "
+            "claims. Heads backed by a timestamp token count on their own; heads the gateway reported between "
+            "anchors count only when the file's signature verifies under --attestation-key."
+        ),
+    )
+    parser.add_argument(
+        '--witness-key',
+        action='append',
+        default=[],
+        metavar='JWK',
+        help=(
+            "The project's evidence attestation key (the --attestation-key file) for the witness file's signature "
+            "only, for a pack that carries no evidence keys. --attestation-key also pins the witness file."
+        ),
+    )
+    parser.add_argument(
+        '--receipt',
+        metavar='FILE',
+        help=(
+            "Also write what this run concluded to FILE as a content-free JSON receipt "
+            "(meilynx.verification_receipt.v1, RFC 8785 bytes): the gateway, the chain, the pack's manifest digest, "
+            "the witness file's digests, the coverage bounds, the verifier version and digest, and the exit code."
+        ),
+    )
+    parser.add_argument(
         '--allow-unsigned',
         action='store_true',
         help=(
@@ -17356,6 +18818,7 @@ def main():
         ok = ocsf_export_self_test() and ok
         ok = record_signature_self_test() and ok
         ok = gateway_evidence_key_self_test() and ok
+        ok = witness_self_test() and ok
         sys.exit(0 if ok else 1)
 
     if not (args.bucket or args.records) or not args.manifest:
@@ -17375,6 +18838,15 @@ def main():
         parser.error("--conditions-acceptance needs --conditions-sha256")
     if args.require_through is not None and args.require_through < 0:
         parser.error("--require-through must be a sequence number (0 or more)")
+    if args.witness and not Path(args.witness).exists():
+        parser.error(f"--witness {args.witness}: no such file or directory")
+    if args.witness_key and not args.witness:
+        parser.error("--witness-key needs --witness")
+    try:
+        witness_pins = [load_attestation_pin(Path(k).read_text(encoding='utf-8')) for k in args.witness_key]
+    except (OSError, ValueError, KeyError, TypeError, binascii.Error) as exc:
+        parser.error(f"--witness-key must be a file holding the project's P-256 attestation key as a JWK ({exc})")
+    witness_pins += [p for p in attestation_pins if p[1] not in {w[1] for w in witness_pins}]
     supplied_acceptance = None
     if args.conditions_acceptance:
         try:
@@ -17402,11 +18874,35 @@ def main():
         print(f"ERROR: manifest is not valid JSON: {exc}", file=sys.stderr)
         sys.exit(EXIT_FAIL)
 
+    witness_outcome = None
+
+    def finish(code, records=None, signature_status=None):
+        """Exit with `code`, first writing the receipt when --receipt asks."""
+        if args.receipt:
+            if args.witness and witness_outcome is None:
+                outcome = WitnessOutcome()
+                outcome.status = CANNOT_EVALUATE
+            else:
+                outcome = witness_outcome
+            receipt = verification_receipt(
+                code, manifest, manifest_bytes, records or {}, signature_status, outcome, args.require_through,
+                args.allow_unsigned, witness_pins, [s.partition('=')[0] for s in args.tsa_root],
+                Path(__file__).read_bytes())
+            try:
+                write_receipt(args.receipt, receipt)
+                print(f"RECEIPT: {RECEIPT_FORMAT} written to {args.receipt}")
+            except OSError as exc:
+                print(f"ERROR: cannot write the receipt to {args.receipt} ({exc})", file=sys.stderr)
+        sys.exit(code)
+
+    if not isinstance(manifest, dict):
+        print("ERROR: manifest is not a JSON object", file=sys.stderr)
+        sys.exit(EXIT_FAIL)
     version_error = (manifest_schema_version_error(manifest) or manifest_storage_layout_error(manifest)
                      or manifest_evidence_class_error(manifest) or manifest_content_error(manifest))
     if version_error:
         print(f"ERROR: {version_error}", file=sys.stderr)
-        sys.exit(EXIT_CANNOT_EVALUATE)
+        finish(EXIT_CANNOT_EVALUATE)
     if evidence_class_suffix(manifest):
         print(f"EVIDENCE CLASS: {manifest['evidence_class']} ({EVIDENCE_CLASSES[manifest['evidence_class']]}).")
     # What the pack claims to hold; anchors are judged against it.
@@ -17422,12 +18918,12 @@ def main():
         print("ERROR: this pack's records are content-stripped (manifest 1.5); --bucket would read the holder's "
               "full records, which are not what the manifest describes. Verify the pack's own records with "
               "--records.", file=sys.stderr)
-        sys.exit(EXIT_CANNOT_EVALUATE)
+        finish(EXIT_CANNOT_EVALUATE)
     try:
         tsa_roots = load_tsa_roots(args.tsa_root)
     except (OSError, ValueError, DerError) as exc:
         print(f"ERROR: unusable --tsa-root ({exc})", file=sys.stderr)
-        sys.exit(EXIT_CANNOT_EVALUATE)
+        finish(EXIT_CANNOT_EVALUATE)
 
     signed = pack_is_signed(manifest)
     # A manifest signed by the gateway evidence key is judged
@@ -17532,15 +19028,25 @@ def main():
             chain_status = CANNOT_EVALUATE
         print()
         anchor_status = verify_anchors(manifest, fetch, anchor_source, tsa_roots.get, record_times)
+        # The pack against the heads its gateway's control plane witnessed.
+        if args.witness:
+            print()
+            if chain_status == CANNOT_EVALUATE:
+                print("NOTICE: --witness was not judged: the pack's records could not be evaluated")
+            else:
+                witness_outcome = judge_witness(args.witness, manifest, pack_full_records, witness_pins,
+                                                tsa_roots.get, evidence_keys)
     count = len(manifest.get('events', []))
     # The verdict counts the hash-only stubs it linked through.
     stub_count = len(manifest_stubs(manifest))
     stubbed = (f", {stub_count} of them as hash-only stubs (linked, hash not recomputed)" if stub_count else "")
     # The gateway evidence-key verdict (attestations, seals, signed heads)
     # combines with the chain's by the same precedence.
-    code = final_exit_code(combine_with_anchor_status(
+    witness_status = witness_outcome.status if witness_outcome is not None else (
+        CANNOT_EVALUATE if args.witness else PASSED)
+    code = final_exit_code(combine_with_anchor_status(combine_with_anchor_status(
         combine_with_anchor_status(combine_with_anchor_status(chain_status, claim_status), anchor_status),
-        evidence_status or PASSED), signature_status, bool(args.allow_unsigned))
+        evidence_status or PASSED), witness_status), signature_status, bool(args.allow_unsigned))
     # The OCSF export beside the pack. Its verdict
     # combines with the pack's by the same precedence (1 > 2 > 4 > 3 > 0).
     if args.ocsf_export:
@@ -17605,12 +19111,18 @@ def main():
             print(f"\nFAIL: the manifest signature did not verify (see above).{label}", file=sys.stderr)
         if evidence_status == FAILED:
             print(f"\nFAIL: the gateway evidence-key check failed (see above).{label}", file=sys.stderr)
+        if witness_status == FAILED:
+            print(f"\nFAIL: the pack contradicts a witnessed head, or the witness file is inconsistent "
+                  f"(see above).{label}", file=sys.stderr)
     elif code == EXIT_CANNOT_EVALUATE and gateway_signed and signature_status == CANNOT_EVALUATE:
         print(f"\nCANNOT EVALUATE: {NO_PINNED_KEY}. This pack is signed by a gateway evidence key; nothing in it "
               f"can say whose key that is. Pass --attestation-key (the project's attestation key) or "
               f"--gateway-key (the gateway's own key).{label}", file=sys.stderr)
     elif code == EXIT_CANNOT_EVALUATE and evidence_status == CANNOT_EVALUATE and chain_status != CANNOT_EVALUATE:
         print(f"\nCANNOT EVALUATE: the gateway evidence-key check could not be evaluated (see above).{label}",
+              file=sys.stderr)
+    elif code == EXIT_CANNOT_EVALUATE and witness_status == CANNOT_EVALUATE and chain_status != CANNOT_EVALUATE:
+        print(f"\nCANNOT EVALUATE: the pack could not be judged against the witness file (see above).{label}",
               file=sys.stderr)
     elif code == EXIT_CANNOT_EVALUATE and conditions_status == CANNOT_EVALUATE and chain_status != CANNOT_EVALUATE:
         print(f"\nCANNOT EVALUATE: the customer-conditions verdict cannot be evaluated from this pack "
@@ -17621,7 +19133,8 @@ def main():
     elif code == EXIT_COVERAGE_NOT_ESTABLISHED:
         if signature_status != PASSED:
             print(f"\n{UNSIGNED_NOTICE}")
-        witness = ("a chain head the gateway signed" if evidence_status == COVERAGE_NOT_ESTABLISHED
+        witness = ("a head the control plane witnessed" if witness_status == COVERAGE_NOT_ESTABLISHED
+                   else "a chain head the gateway signed" if evidence_status == COVERAGE_NOT_ESTABLISHED
                    else "a verified anchor")
         print(f"\nINTEGRITY OK, COVERAGE NOT ESTABLISHED: all {count} events verified{stubbed}, but {witness} "
               f"shows the chain went on past the head this pack claims (see above). This is not a "
@@ -17641,7 +19154,7 @@ def main():
                 f"is unsigned. Pass --allow-unsigned to accept an unsigned pack.{label}",
                 file=sys.stderr,
             )
-    sys.exit(code)
+    finish(code, pack_full_records, signature_status)
 
 
 if __name__ == '__main__':

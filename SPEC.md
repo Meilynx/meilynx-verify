@@ -5,14 +5,14 @@ enough that a verifier can be written from it without reading Meilynx code.
 `verify-pack.py` in this repository is one such verifier; its `--self-test`
 pins the values below against fixture hashes.
 
-Status: describes chain records with `schema_version` v1 through v1.24, the
+Status: describes chain records with `schema_version` v1 through v1.25, the
 per-record and segment storage layouts, pack manifest `schema_version` 1.0
 through 1.5, the control-plane chain a 1.3 manifest carries, the per-tenant
 pack signature, the local-chain evidence class (§6.5), the manifest's
 coverage claim (§6.7) and list of evidence modes (§6.8), the export copy a
 pack can be checked against (§9), the customer-conditions verdict (§10),
 record signatures (§11) and the gateway evidence key (§12), as read by
-`verify-pack.py` from meilynx-proxy commit `f80356e` (2026-11-20). A chain written before the
+`verify-pack.py` from meilynx-proxy commit `e786536` (2026-11-24). A chain written before the
 segment rollout is per-record, and its packs carry manifest 1.0 or 1.1.
 
 ## 1. Records
@@ -100,8 +100,8 @@ Every record carries at least these fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.24"`). Absent means `"v1"`. |
-| `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`, `decision_receipt`, `compliance_record`, `judgment_verdict`). Absent means `llm_request`. |
+| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.25"`). Absent means `"v1"`. |
+| `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`, `decision_receipt`, `compliance_record`, `judgment_verdict`, `control_probe_run`, `provenance_verification`). Absent means `llm_request`. |
 | `sequence_number` | integer | Position in the chain, starting at 0. |
 | `timestamp_utc` | string | RFC 3339 UTC timestamp, nanosecond precision, `Z` suffix. |
 | `event_id` | string | Unique id of this record. |
@@ -117,7 +117,8 @@ Every record carries at least these fields:
 
 Kind-specific payloads live under `admin_action`, `auth_session`,
 `mcp_event`, `coverage`, `coverage_key_inventory`, `decision_receipt`,
-`compliance_record`, `judgment_verdict`, `join_context`, `content`,
+`compliance_record`, `judgment_verdict`, `control_probe_run`,
+`provenance_verification`, `join_context`, `content`,
 `identity`, `evaluation_trace` and `customer`.
 LLM records also carry
 `messages`, `response_text`, `findings`, `policy_version`,
@@ -222,6 +223,8 @@ wire names differ from the serde `event_kind` values stored in the JSON:
 | `decision_receipt` | `decision.receipt` |
 | `compliance_record` | `compliance.record` |
 | `judgment_verdict` | `judgment.verdict` |
+| `control_probe_run` | `control_probe.run` |
+| `provenance_verification` | `provenance.verification` |
 
 ### 4.3 Per-version suffixes
 
@@ -402,7 +405,7 @@ record with both is v1.18): the per-rule
 outcomes of the governance evaluation and the request's delivery outcome,
 stored as an object under `evaluation_trace.outcomes` and bound by that
 digest, which the verifier recomputes (RFC 8785). The trace's timing fields
-are stored but not hashed. A trace on any version other than v1.16, v1.18 or v1.19,
+are stored but not hashed. A trace on any version other than v1.16, v1.18, v1.19 or v1.25,
 a v1.16 record without one, a trace whose `outcomes_sha256_jcs` is not a
 string, or v1.16 on any kind other than `llm_request`, is invalid and fails
 verification. A v1.16 record's `content` block, when present, is checked as
@@ -444,7 +447,7 @@ is invalid and fails verification: the MCP preimage never reads one.
 
 An MCP record is v1.18 exactly when it carries a `customer` block, and so
 is an `llm_request` sealed before v1.19. A `customer` block on any version
-other than v1.18 or v1.19, a v1.18 record without one, a block whose shape
+other than v1.18, v1.19 or v1.25, a v1.18 record without one, a block whose shape
 is not as §4.6 gives, or v1.18 on any kind other than `llm_request` and the
 MCP kinds, is invalid and fails verification.
 
@@ -716,6 +719,139 @@ configured rate was the one in force; only that the gateway recorded the
 judgment as left unanswered for that reason, and that the record has not
 changed since.
 
+**v1.25 `llm_request`**: the v1.19 `llm_request` layout, then the context
+provenance digest: `0x00` when the `content` block carries no
+`provenance_sha256_jcs`, else `0x01` followed by `provenance_sha256_jcs`
+(length-prefixed string, §3). Two entries more than v1.19 when the digest is
+present, one when it is absent. `provenance_sha256_jcs` is the hex SHA-256
+of the JCS form (RFC 8785) of `content.provenance`, the record's context
+provenance list. The list is stored beside the hash in the `content` block
+and bound only through the digest. It holds no content, so it stays in a
+content-stripped pack (§6.6). A gateway stamps v1.25 only on an
+`llm_request` that carries a provenance list; one without a list stays in
+its earlier bucket. Like
+v1.19, v1.25 requires a `policy_version`, and the trace, content, identity
+and customer, when present, are checked as for v1.19.
+
+The list is a closed object:
+
+- `entries`: a list of closed objects, one per block, each with
+  - `locator`: `{ "message_index": n }` for a whole message of the record's
+    `messages`, or `{ "message_index": n, "block_index": m }` for one block
+    of that message's `content_blocks`; `n` and `m` are non-negative
+    integers, and no other member is allowed;
+  - `kind`: `tool_result` or `declared_context`;
+  - `label`: a string or `null`: the tool name of the call a tool result
+    answers, or the source id the caller declared for the block, as asserted
+    by the caller;
+  - `asserted_by`: `caller`, the one value this version defines;
+  - `sha256`: 64 lowercase hex, the SHA-256 of the block's canonical bytes
+    as captured;
+  - `bytes`: a non-negative integer, the length of those bytes.
+- `declarations`: a list of closed objects `{ "locator", "source_id":
+  string }`, each a block the caller declared as context and the source id
+  it gave.
+- `complete`: a boolean, true when every tool-result block and every
+  declared block of the captured message list has an entry.
+
+The canonical bytes of what a locator names: for a whole message, the JCS
+form of its `content_blocks` when it has that list, else the UTF-8 bytes of
+its `content` (empty when absent); for a block, the UTF-8 bytes of its
+`text` when it is a `text` block with a string `text`, else the JCS form of
+the block. The tool-result blocks of a message list are each message whose
+`role` is `tool`, as a whole, and each block of type `tool_result` in any
+other message's `content_blocks`.
+
+The verifier checks the list's integrity on every v1.25 `llm_request` that
+carries a digest or a list:
+
+1. A record that seals `provenance_sha256_jcs` stores the list, and one that
+   stores a list seals its digest.
+2. SHA-256(JCS(`content.provenance`)) equals `provenance_sha256_jcs`.
+3. The list, each entry and each declaration have the closed shapes above,
+   and no two entries and no two declarations name the same locator.
+4. Every declaration has an entry at its locator whose `label` is the
+   declaration's `source_id`.
+
+Where the record retains its messages as captured (`capture_policy` `full`,
+`stored_prompt_sha256_jcs` present and equal to `prompt_sha256_jcs`, in a
+pack that kept `messages`), it also checks the entries against the blocks:
+
+5. Every tool-result block and every declared block has an entry at its
+   locator. The entry's `kind` is `tool_result` for a tool-result block and
+   `declared_context` for a declared one, and its `sha256` and `bytes` are
+   those of the block's canonical bytes.
+6. No entry names a locator that is neither a tool-result block nor a
+   declared block, or one that names no block.
+7. `complete` is true.
+
+A failed check fails the record. Where the messages are not retained as
+captured (under `redacted` or `hash_only` capture, for example, or in a
+content-stripped pack), the verifier makes checks 1 to 4 only and prints `NOTE seq=N: content not retained: list integrity only`; that is
+never a failure and never a content pass. A provenance digest or list on
+any version other than v1.25 or on any kind other than `llm_request`, a
+list with no digest, and a v1.25 `llm_request` without a `policy_version`
+leave the record with no defined preimage and fail verification.
+
+What a v1.25 record does not show: that a label names the source it claims
+to, or that the label of a tool result is the name of the tool that
+produced it. Labels are as asserted by the caller and are never checked
+against a source; they record what the caller said, and a label never
+authorizes anything. It does not show that the caller gave the model no
+context outside the blocks it declared: only tool results and declared
+blocks have entries. Where the content was not retained, it does not show
+that the entries match what the model was given; only that the stated list
+was recorded and has not changed since.
+
+**v1.25 `provenance.verification`**: the bucket's second kind, with a
+preimage of its own. From `provenance_verification`, after the kind
+attestation: `verification_id`, `window_start`, `cutoff`,
+`verifier_version`, `evidence_mode` (length-prefixed strings, §3),
+`eligible_calls`, `complete_verified`, `integrity_only`, `missing_list`,
+`integrity_failures`, `records_unreadable` (u64). 27 fields. Every member is
+hashed and nothing rides beside it; a field that is absent or of another
+type leaves the record with no defined preimage and fails verification. A
+`provenance_verification` payload on any other version or kind, a v1.25
+`provenance.verification` record without one, and one that also carries
+another kind's payload or an LLM field (`content`, `join_context`,
+`identity`, `customer`, `evaluation_trace`, `policy_version`,
+`model_executed`) fail.
+
+The record is one run of the v1.25 provenance checks by a gateway over its
+own sealed `llm_request` records of a window that starts at `window_start`
+and ends at `cutoff`. Each record in the window counts as one outcome:
+
+- not eligible, and not counted: a kind other than `llm_request`; no
+  `content` block (sealed with no capture policy, so the record says nothing
+  about provenance); or neither a provenance list nor its digest, and no
+  tool-result block in its messages (in a content-stripped pack the messages
+  are not read);
+- `missing_list`: a tool-result block in its messages, and neither a list
+  nor its digest;
+- `integrity_failures`: a list on a record that is not v1.25, or a list
+  that fails a check above;
+- `integrity_only`: checks 1 to 4 pass and the content was not retained;
+- `complete_verified`: every check passes, the content checks included.
+
+`eligible_calls` is the sum of those four counts. `records_unreadable`
+counts records the run could not read, and is not part of the sum.
+`verify-pack.py` exposes the classification as `provenance_check_outcome`,
+so a window can be recounted from the records of a pack that holds it; the
+verifier does not recount a window on its own.
+
+The verifier checks that the payload has exactly these eleven members, that
+`verification_id` is a UUID, that `window_start` and `cutoff` are RFC 3339
+timestamps in UTC (`Z` or a zero offset) and `cutoff` is after
+`window_start`, that `verifier_version` is `provenance-check.v1` and
+`evidence_mode` is `write_once` or `local_chain`, that every count is an
+unsigned integer, and that `eligible_calls` is `complete_verified` +
+`integrity_only` + `missing_list` + `integrity_failures`.
+
+What a provenance verification does not show: that the gateway ran the
+checks over every record of the window, or that its counts are right; only
+that the stated counts were recorded, have not changed since and add up. It
+holds no label, tool name or digest of a list.
+
 MCP kinds are: `mcp.tool_call`, `mcp.policy_decision`, `mcp.tool_result`,
 `mcp.tools_list.served`, `mcp.error`, `mcp.catalog_drift`. Any MCP hasher
 called with a non-MCP kind is an error.
@@ -725,17 +861,17 @@ Scheme (RFC 8785) serialization of the payload in question. For MCP records
 the verifier checks that the digest string is what the record hashed; it does
 not recompute the digest from a payload, because the payload is not part of
 the record. For LLM records with a `content` block (v1.10, v1.11, v1.12,
-v1.16, v1.18, v1.19) it also recomputes the stored-content digests (§4.4),
-for v1.12, v1.14, v1.17, v1.18 and v1.19 records with an identity the
-asserted-claims digest (§4.5), for v1.16, v1.18 and v1.19 records the
+v1.16, v1.18, v1.19, v1.25) it also recomputes the stored-content digests (§4.4),
+for v1.12, v1.14, v1.17, v1.18, v1.19 and v1.25 records with an identity the
+asserted-claims digest (§4.5), for v1.16, v1.18, v1.19 and v1.25 records the
 evaluation outcome digest, for v1.15 records the evidence-set digest (§4.3),
-for v1.18 and v1.19 records the customer label digest (§4.6), for v1.20
+for v1.18, v1.19 and v1.25 records the customer label digest (§4.6), for v1.20
 records the stored-record, file-content and findings digests (§4.3), and for
 v1.21, v1.22 and v1.24 records the digests of the uploaded form and the local
-part, and for v1.23 records the digests of the probe sets and the case results
-(§4.3).
+part, for v1.23 records the digests of the probe sets and the case results, and
+for v1.25 `llm_request` records the context provenance digest (§4.3).
 
-### 4.4 LLM content attestation (v1.10, v1.11, v1.12, v1.16, v1.18, v1.19)
+### 4.4 LLM content attestation (v1.10, v1.11, v1.12, v1.16, v1.18, v1.19, v1.25)
 
 `capture_policy` names what the record retains:
 
@@ -757,10 +893,11 @@ The six `content` fields:
 | `findings_sha256_jcs` | JCS of the record's own `findings` |
 | `tool_calls_sha256_jcs` (v1.11) | JCS of the response's tool calls as captured |
 | `stored_tool_calls_sha256_jcs` (v1.11) | JCS of the record's own `tool_calls`; absent when none were retained |
+| `provenance_sha256_jcs` (v1.25) | JCS of the record's own `content.provenance`, its context provenance list (§4.3); absent when the record has none |
 
 Because the digests are in the preimage and the content they describe is in
 the record, a verifier checks, for every v1.10 and v1.11 record and every
-v1.12, v1.16, v1.18 or v1.19 record that carries a `content` block:
+v1.12, v1.16, v1.18, v1.19 or v1.25 record that carries a `content` block:
 
 1. `stored_prompt_sha256_jcs`, when present, equals SHA-256(JCS(`messages`));
    when absent, `messages` is empty.
@@ -776,7 +913,7 @@ content is outside the preimage) and fails these checks. `prompt_sha256_jcs`
 and `response_sha256` cover content the record may no longer hold: whoever
 holds the original can show it is what the record was sealed over.
 
-A v1.12, v1.16, v1.18 or v1.19 record with no `content` block was sealed with no
+A v1.12, v1.16, v1.18, v1.19 or v1.25 record with no `content` block was sealed with no
 capture policy. Its prompt and response are stored but not bound, as before
 v1.10, and are not checked.
 
@@ -784,17 +921,19 @@ In a content-stripped pack (§6.6) `messages`, `response_text` and
 `tool_calls` are removed from every record. Checks 1, 2 and 4 are then not
 made: the sealed digests are inside the hash, which the chain walk
 recomputes, and that is all a stripped pack can show of them. Check 3 is
-still made, because `findings` are kept.
+still made, because `findings` are kept. A v1.25 record's provenance
+list is kept too: its integrity is checked and its content checks are not
+made (§4.3).
 
 JCS follows RFC 8785: object keys sorted by UTF-16 code units, no
 whitespace, strings escaped as in RFC 8785 §3.2.2.2, numbers in ECMAScript
 form (`1.0` → `1`, `1e-7` → `1e-7`, `1e21` → `1e+21`). A plain sorted-keys
 JSON dump differs on numbers and must not be used.
 
-### 4.5 Sealed identity (v1.12, v1.14, v1.16, v1.17, v1.18, v1.19)
+### 4.5 Sealed identity (v1.12, v1.14, v1.16, v1.17, v1.18, v1.19, v1.25)
 
 A v1.12 record carries an `identity` block naming who called the proxy (a
-v1.14, v1.16, v1.17, v1.18 or v1.19 record carries it too, when the proxy resolved
+v1.14, v1.16, v1.17, v1.18, v1.19 or v1.25 record carries it too, when the proxy resolved
 one):
 
 | Field | Hashed | Meaning |
@@ -810,7 +949,7 @@ one):
 The asserted labels are stored beside their digest rather than hashed, so a
 reader sees the values and the digest proves they are the ones the proxy
 saw. A verifier therefore checks, for every v1.12 record and every v1.14,
-v1.17, v1.18 or v1.19 record that carries an identity, that
+v1.17, v1.18, v1.19 or v1.25 record that carries an identity, that
 `asserted_digest` equals SHA-256(JCS(`asserted`)). A label rewritten after
 sealing leaves the chain hash intact and fails this check. The labels are
 claims a caller made, never evidence of who it was; only the hashed fields
@@ -821,10 +960,10 @@ asserted-label digest is not re-derived by this release; a v1.16 label
 rewritten after sealing is not caught until the record is checked by a
 release that does.
 
-### 4.6 Sealed customer (v1.18, v1.19)
+### 4.6 Sealed customer (v1.18, v1.19, v1.25)
 
 A v1.18 record carries a `customer` block naming which of the proxy
-operator's customers the call was made for. A v1.19 record carries one when
+operator's customers the call was made for. A v1.19 or v1.25 record carries one when
 the proxy resolved a customer:
 
 | Field | Hashed | Meaning |
@@ -839,7 +978,7 @@ nor a kid; `asserted` carries a digest and no kid; `credential` carries a
 digest and a non-blank kid. A block of any other shape, or a `source` not
 listed, is invalid and fails verification.
 
-A verifier checks, for every v1.18 or v1.19 record whose `source` is `asserted` and
+A verifier checks, for every v1.18, v1.19 or v1.25 record whose `source` is `asserted` and
 which stores a non-empty `customer_id`, that `label_sha256` equals
 SHA-256(UTF-8(`customer_id`)). A label rewritten after sealing leaves the
 chain hash intact and fails this check. A missing `customer_id` is not a
@@ -1377,6 +1516,139 @@ seq=N: <old> -> <new> (<source>)` where the mode differs from the seal before
 it. A pack with no seal prints `EVIDENCE MODE: no evidence-mode seal among
 this pack's records`.
 
+### 6.9 Witness files
+
+A gateway with no write-once store holds its own record (§6.5): whoever
+controls it can rewrite or remove records before a pack is built, and the
+anchors inside the pack come from the same gateway. A gateway enrolled with
+a control plane reports its chain heads there: on each heartbeat the head of
+every chain (sequence and `event_hash`, with the head its evidence key
+signed, §12), and, on an upload of their own, each anchor statement (§6.1)
+with every timestamp token over it. The control plane verifies each token on
+arrival and keeps all of it append-only. The organization's compliance
+members download it as a **witness file**, and `--witness FILE` judges a
+pack against it.
+
+**Layout.** A ZIP archive, or the same tree as a directory:
+
+| Member | Content |
+|---|---|
+| `witness-manifest.json` | The index below, as RFC 8785 bytes |
+| `anchors/{chain}/{seq:020d}.json` | An anchor statement, the exact bytes the tokens are over |
+| `anchors/{chain}/{seq:020d}.{tsa_id}.tsr` | One `TimeStampResp` per witness, each verified by the control plane on arrival |
+| `head-signatures/{chain}/{head_sequence:020d}.json` | `{statement, signature}`: a chain head the gateway signed (§12), as it reported it |
+
+**Manifest** (`meilynx.witness_manifest.v1`; the JSON schema and an example
+are `fixtures/witness/witness-manifest.v1.schema.json` and
+`fixtures/witness/witness-manifest.v1.example.json`):
+
+```json
+{
+  "format": "meilynx.witness_manifest.v1",
+  "generated_at": "2026-11-24T00:00:00Z",
+  "org_id": "…", "project_id": "…", "proxy_id": "<gateway>",
+  "chains": [{
+    "chain": "<chain name>",
+    "heads": [
+      {"basis": "reported", "seq": 3, "event_hash": "<hex>", "observed_at": "…", "received_at": "…",
+       "signed_head": {"path": "head-signatures/<chain>/00000000000000000003.json", "sha256": "<hex>"} | null},
+      {"basis": "timestamp", "seq": 4, "event_hash": "<hex>", "received_at": "…",
+       "statement": {"path": "anchors/<chain>/00000000000000000004.json", "sha256": "<hex>"},
+       "tokens": {"<tsa_id>": {"path": "anchors/<chain>/00000000000000000004.<tsa_id>.tsr", "sha256": "<hex>",
+                               "gen_time": "…"}}}
+    ],
+    "omitted_earlier_heads": 0
+  }],
+  "omitted_chains": 0,
+  "contradictions": [{"kind": "fork" | "rewind" | "witness_conflict", "chain": "…", "seq": 4, "event_hash": "<hex>",
+                      "earlier_seq": 6, "earlier_event_hash": "<hex>", "source": "heartbeat" | "witness",
+                      "detected_at": "…"}],
+  "signing": {"state": "signed" | "unsigned", "key_id": "<thumbprint>" | null,
+              "reason": "attestation_key" | "no_attestation_key"},
+  "disclosure": "<fixed text>",
+  "signature": {"scheme": "meilynx.witness_manifest.v1", "alg": "ES256", "key_id": "<thumbprint>",
+                "value": "<base64>"}
+}
+```
+
+Times are UTC to the second. `chains` is sorted by name and `heads` by
+sequence. `signature` is present exactly when `signing.state` is `signed`:
+ECDSA P-256 with SHA-256 over `"meilynx.witness_manifest.v1" 0x00` followed
+by the RFC 8785 bytes of the manifest without `signature`; `value` is the
+64-byte `r || s` in standard base64 and `key_id` the RFC 7638 thumbprint of
+the project's evidence attestation key (the key of §12's attestations).
+`contradictions` lists what the control plane recorded as an integrity
+finding: another hash at a sequence already reported (a fork), a lower
+sequence after a higher one (a rewind), or another payload under a held
+key. The heads on both sides are in `heads`, so a pack can match at most one
+of them.
+
+**Which heads count.** A `timestamp` head counts on the timestamp
+authority's signature alone: at least one of its tokens verifies (§6.1, with
+the roots of §6.1 and `--tsa-root`) over a canonical statement that names
+this chain at this sequence with this `event_hash`, and whose `run_id` is
+`<proxy_id>/<boot id>` for the file's gateway. A `reported` head, and a
+timestamp head whose statement names no gateway, counts only when the
+manifest's signature verifies under the attestation key the reader pins
+(`--witness-key`, or `--attestation-key`). A file without a signature counts
+only timestamp-backed heads; the verifier says so, and lists the others as
+not counted. A head's `signed_head` is checked when the reader pins the
+gateway's key (`--gateway-key`) or the pack carries attestations
+(`--attestation-key`); it never makes a head count on its own.
+
+**What a verifier checks** (`verify-pack.py --witness FILE` does all of these):
+
+| Finding | Verdict |
+|---|---|
+| The file cannot be read, has no `witness-manifest.json`, or its manifest is outside the format | Cannot evaluate (exit 2) |
+| The pack names no gateway (no `proxy_id`, no `local-chain:<gateway>` bucket label), or another gateway than the file | Cannot evaluate (exit 2) |
+| A signature that does not verify under the pinned key, a key that is not pinned, or a `signing` member that disagrees with the signature | Fail (exit 1) |
+| A listed object that is missing, does not match its digest or path, a statement that is not canonical or names another head, gateway or chain, a token that does not verify, a `gen_time` that is not the token's, or a signed head that names another gateway, chain or head | Fail (exit 1) |
+| A counted head inside the pack whose record carries another `event_hash` | Fail (exit 1): the pack contradicts a witnessed head |
+| A counted head after the pack's last record, whatever the pack claims | Coverage not established (exit 4) |
+| No counted head for the pack's chain | Coverage not established (exit 4) |
+| A head that does not count, a head before the pack's first record, another chain of the gateway, a recorded contradiction | NOTICE |
+| A token whose witness has no trust root, or that cannot be parsed, on a head that does not otherwise count | Cannot evaluate (exit 2) |
+
+A pass prints `WITNESS OK: chain <chain> matches <n> witnessed head(s)
+inside the pack, witnessed through seq=<seq> (<basis>, <time>)`. A witnessed
+head shows that the gateway reported that head, or that a timestamp
+authority saw it, at that time; it does not show that the records behind it
+were kept. A pack that passes is tamper-evident against the witnessed heads,
+not proven complete: records written after the last witnessed head are
+shown only to be consistent with each other.
+
+### 6.10 Verification receipts
+
+`--receipt FILE` writes what the run concluded as a content-free JSON
+document, `meilynx.verification_receipt.v1`, in RFC 8785 bytes (schema and
+example: `fixtures/witness/verification-receipt.v1.schema.json` and
+`fixtures/witness/verification-receipt.v1.example.json`). It binds:
+
+- the result: `exit_code` and its name (`pass`, `fail`, `cannot_evaluate`,
+  `unsigned`, `coverage_not_established`);
+- the verifier: `version` and the SHA-256 of the `verify-pack.py` that ran;
+- the gateway: the witness file's `proxy_id` when it was bound to the pack,
+  else the pack's own label;
+- the pack: the SHA-256 of its `manifest.json` (which lists every record's
+  hash), its id, evidence class, claim scope, record count and whether its
+  signature verified;
+- each chain: its sequence bounds, the `event_hash` it ends at, the
+  `--require-through` value, the highest counted witnessed head, and whether
+  coverage was established;
+- the witness file: the SHA-256 of the file and of its manifest, its
+  gateway, signature result and key, and the heads counted, matched, after
+  the pack and not counted;
+- the options that change the verdict: `--allow-unsigned`, the pinned
+  attestation keys and the witnesses given roots.
+
+`verified_at` is the clock of the host that ran the verifier, and nothing in
+the receipt vouches for it. The receipt is unsigned: re-running the same
+verifier on the same pack and witness file gives the same receipt apart from
+`verified_at`. A receipt is written for every run that read the pack's
+manifest (not for a usage error or an unreadable manifest or records
+directory). Only exit 0 is a pass.
+
 ## 7. Signed packs (window B)
 
 ### 7.1 Descriptor and bundle
@@ -1534,16 +1806,17 @@ since; the chain hashes attest the records.
   `on_behalf_of_attestation` marker is stored but not hashed; the hashed
   `delegated_human` must agree with it. On v1.15 records the `evidence`
   list is stored but not hashed; `evidence_set_sha256` binds it (§4.3). On
-  v1.16, v1.18 and v1.19 records the evaluation trace's timing is stored
+  v1.16, v1.18, v1.19 and v1.25 records the evaluation trace's timing is stored
   but not hashed; its outcomes are bound by `outcomes_sha256_jcs` (§4.3). On
-  v1.18 and v1.19 records the plain `customer_id` is stored but not hashed;
+  v1.18, v1.19 and v1.25 records the plain `customer_id` is stored but not hashed;
   `label_sha256` binds it only when `source` is `asserted` (§4.6). On v1.20
   records the stored item, its file bytes and its findings are bound through
   `record_sha256`, `content_sha256` and `findings_sha256` (§4.3). On v1.21,
   v1.22 and v1.24 records the uploaded form and the local part are bound through
   `uploaded_sha256` and `local_sha256` (§4.3). On v1.23 records the probe
   sets and case results are bound through `sets_sha256` and
-  `results_sha256` (§4.3). On LLM
+  `results_sha256` (§4.3). On v1.25 `llm_request` records the context
+  provenance list is bound through `provenance_sha256_jcs` (§4.3). On LLM
   records before v1.19 `policy_version` and `model_executed` are stored but
   not hashed (v1.19 binds both, §4.3), and on every MCP record
   `mcp_event.finding_summary` is; the customer-conditions verdict (§10) says
@@ -1660,7 +1933,7 @@ the same relationship), before that record's `occurred_at`. A hash-only stub
 
 **Sealed under the set.** A record counts only by sealed evidence: an MCP
 record whose hashed `mcp_event.mcp_bundle_sha256` equals
-`compiled_mcp_sha256`, or an `llm_request` (v1.16, v1.18 or v1.19) whose
+`compiled_mcp_sha256`, or an `llm_request` (v1.16, v1.18, v1.19 or v1.25) whose
 digest-bound `evaluation_trace.outcomes.rules[].rule_id` includes one ending
 in `@cust_<12 hex>` for this relationship. Every other record in the window
 is a `GAP` line with its sequence and hash. An `llm_request` whose

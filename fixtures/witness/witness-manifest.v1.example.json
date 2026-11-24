@@ -1,0 +1,62 @@
+{
+  "chains": [
+    {
+      "chain": "chain_tnt_fixture_run_a",
+      "heads": [
+        {
+          "basis": "reported",
+          "event_hash": "ce4ff33b11b0c8190dcd8709f76bfbae351be90c45a8de573a50e77831a48fc8",
+          "observed_at": "2026-05-01T00:11:00Z",
+          "received_at": "2026-05-01T00:11:02Z",
+          "seq": 3,
+          "signed_head": {
+            "path": "head-signatures/chain_tnt_fixture_run_a/00000000000000000003.json",
+            "sha256": "5d6654be582d2d3cb5acc2013af1e548e3ccd963f06ddd77f7dc35e02b829905"
+          }
+        },
+        {
+          "basis": "timestamp",
+          "event_hash": "528c8f5d0117b04e1941a42a0b895b900c79980bd334ea38b1c3b6d6218672a2",
+          "received_at": "2026-11-23T23:52:00Z",
+          "seq": 4,
+          "statement": {
+            "path": "anchors/chain_tnt_fixture_run_a/00000000000000000004.json",
+            "sha256": "e1a9c65f5d2410c5ab5c98863ec1ec578d64c2cae924e36ab8fe77cc8a3492b7"
+          },
+          "tokens": {
+            "test-ec": {
+              "gen_time": "2026-11-23T23:50:59Z",
+              "path": "anchors/chain_tnt_fixture_run_a/00000000000000000004.test-ec.tsr",
+              "sha256": "837603f3b408d02e961482b60eb583fa57c6c797c10b0186471ba980d0909f64"
+            },
+            "test-rsa": {
+              "gen_time": "2026-11-23T23:50:59Z",
+              "path": "anchors/chain_tnt_fixture_run_a/00000000000000000004.test-rsa.tsr",
+              "sha256": "f93de0d0afaebd8dcf1bbf0202a1e8a938f55a04c01c8f6bf06a26b82104a3cb"
+            }
+          }
+        }
+      ],
+      "omitted_earlier_heads": 0
+    }
+  ],
+  "contradictions": [],
+  "disclosure": "The chain heads this gateway reported to its control plane, kept append-only. A pack is tamper-evident against the witnessed heads: one that contradicts a witnessed head inside it fails, one that ends before a witnessed head does not establish coverage. A witnessed head shows that the head was reported at that time, not that the records behind it were kept. Heads backed by a timestamp token count on the timestamp authority's signature; heads reported between anchors count because this file is signed with the project's evidence attestation key.",
+  "format": "meilynx.witness_manifest.v1",
+  "generated_at": "2026-11-24T00:00:00Z",
+  "omitted_chains": 0,
+  "org_id": "0f1e2d3c-4b5a-4968-8776-655443322110",
+  "project_id": "1a2b3c4d-5e6f-4071-8293-a4b5c6d7e8f9",
+  "proxy_id": "fixture-gateway",
+  "signature": {
+    "alg": "ES256",
+    "key_id": "ZeoJWtpvlHI9cznA4RZLpHcE5qFB5Kcb94UbIndvWEU",
+    "scheme": "meilynx.witness_manifest.v1",
+    "value": "2jGbqLaN92RL7jqmf/NuNkbqx8C+FMgmgmPMeKvDcByjQUAu5yYzQeLQUk9h4fDT+nRGHSyspF33EHH6RP7Vww=="
+  },
+  "signing": {
+    "key_id": "ZeoJWtpvlHI9cznA4RZLpHcE5qFB5Kcb94UbIndvWEU",
+    "reason": "attestation_key",
+    "state": "signed"
+  }
+}

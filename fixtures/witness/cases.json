@@ -1,0 +1,269 @@
+{
+  "runs": [
+    {
+      "absent": [
+        "FAIL",
+        "COVERAGE NOT ESTABLISHED"
+      ],
+      "args": [
+        "--witness-key",
+        "attestation-key.jwk"
+      ],
+      "contains": [
+        "WITNESS FILE SIGNED: by the project attestation key you pinned",
+        "WITNESS seq=3 (reported",
+        "WITNESS seq=4 (timestamp",
+        "WITNESS OK: chain chain_tnt_fixture_run_a matches 2 witnessed head(s) inside the pack, witnessed through seq=4"
+      ],
+      "exit": 0,
+      "file": "signed",
+      "name": "signed, pinned: both heads count",
+      "pack": "clean",
+      "receipt": "verification-receipt.v1.example.json"
+    },
+    {
+      "args": [
+        "--attestation-key",
+        "attestation-key.jwk"
+      ],
+      "contains": [
+        "WITNESS OK",
+        "CANNOT EVALUATE gateway evidence key"
+      ],
+      "exit": 2,
+      "file": "signed",
+      "name": "signed, pinned through --attestation-key on a pack without evidence keys",
+      "pack": "clean"
+    },
+    {
+      "args": [
+        "--witness-key",
+        "attestation-key.jwk",
+        "--gateway-key",
+        "248839a035d66be60aa0933e486e73f9f720abc4bf8c2067bb60c0d2f91f333e"
+      ],
+      "contains": [
+        "signed by gateway key sha256:91eb42f218182618ccbccb2c4c6b221a1d813342aa1497456c8b15c075d0d47a",
+        "WITNESS OK"
+      ],
+      "exit": 0,
+      "file": "signed",
+      "name": "signed, the gateway's signed head checked under its pinned key",
+      "pack": "clean"
+    },
+    {
+      "args": [],
+      "contains": [
+        "not checked: pass --witness-key",
+        "NOTICE witness seq=3 (reported): not counted",
+        "WITNESS OK: chain chain_tnt_fixture_run_a matches 1 witnessed head(s)"
+      ],
+      "exit": 0,
+      "file": "signed",
+      "name": "signed, not pinned: the reported head does not count",
+      "pack": "clean"
+    },
+    {
+      "absent": [
+        "FAIL"
+      ],
+      "args": [
+        "--witness-key",
+        "attestation-key.jwk"
+      ],
+      "contains": [
+        "WITNESS COVERAGE NOT ESTABLISHED through seq=4",
+        "INTEGRITY OK, COVERAGE NOT ESTABLISHED",
+        "a head the control plane witnessed"
+      ],
+      "exit": 4,
+      "file": "signed",
+      "name": "signed, an earlier pack",
+      "pack": "earlier-pack"
+    },
+    {
+      "args": [
+        "--witness-key",
+        "wrong-attestation-key.jwk"
+      ],
+      "contains": [
+        "not the project key you pinned"
+      ],
+      "exit": 1,
+      "file": "signed",
+      "name": "signed, another project's key",
+      "pack": "clean"
+    },
+    {
+      "args": [],
+      "contains": [
+        "WITNESS FILE UNSIGNED",
+        "NOTICE witness seq=3 (reported): not counted",
+        "WITNESS OK: chain chain_tnt_fixture_run_a matches 1 witnessed head(s)"
+      ],
+      "exit": 0,
+      "file": "unsigned",
+      "name": "unsigned: the timestamp head counts on its own",
+      "pack": "clean"
+    },
+    {
+      "absent": [
+        "FAIL"
+      ],
+      "args": [],
+      "contains": [
+        "WITNESS COVERAGE NOT ESTABLISHED through seq=4"
+      ],
+      "exit": 4,
+      "file": "unsigned",
+      "name": "unsigned, an earlier pack",
+      "pack": "earlier-pack"
+    },
+    {
+      "args": [],
+      "contains": [
+        "no trust root for witness test-ec"
+      ],
+      "exit": 2,
+      "file": "unsigned",
+      "name": "unsigned, without the witnesses' roots",
+      "pack": "clean",
+      "roots": false
+    },
+    {
+      "absent": [
+        "FAIL"
+      ],
+      "args": [
+        "--witness-key",
+        "attestation-key.jwk"
+      ],
+      "contains": [
+        "NOTICE witness: the control plane recorded a rewind on chain chain_tnt_fixture_run_a at seq=4, after seq=6",
+        "WITNESS COVERAGE NOT ESTABLISHED through seq=6"
+      ],
+      "exit": 4,
+      "file": "reported-ahead",
+      "name": "a reported head after the pack",
+      "pack": "clean"
+    },
+    {
+      "args": [],
+      "contains": [
+        "NOTICE witness seq=6 (reported): not counted",
+        "WITNESS OK"
+      ],
+      "exit": 0,
+      "file": "reported-ahead",
+      "name": "a reported head after the pack, not pinned",
+      "pack": "clean"
+    },
+    {
+      "args": [
+        "--witness-key",
+        "attestation-key.jwk"
+      ],
+      "contains": [
+        "FAIL witness seq=3 (reported",
+        "the pack contradicts a witnessed head"
+      ],
+      "exit": 1,
+      "file": "reported-contradicts",
+      "name": "a reported head that contradicts the pack",
+      "pack": "clean"
+    },
+    {
+      "args": [],
+      "contains": [
+        "NOTICE witness seq=3 (reported): not counted",
+        "it names another event_hash than the pack's record"
+      ],
+      "exit": 0,
+      "file": "reported-contradicts",
+      "name": "a reported head that contradicts the pack, not pinned",
+      "pack": "clean"
+    },
+    {
+      "args": [],
+      "contains": [
+        "FAIL witness seq=4 (timestamp",
+        "a timestamp authority saw head c37d1c0336275b7d"
+      ],
+      "exit": 1,
+      "file": "timestamp-contradicts",
+      "name": "a timestamp head that contradicts the pack",
+      "pack": "clean"
+    },
+    {
+      "args": [],
+      "contains": [
+        "the witness file is for gateway other-gateway; the pack is labelled with gateway fixture-gateway"
+      ],
+      "exit": 2,
+      "file": "other-gateway",
+      "name": "another gateway's witness file",
+      "pack": "clean"
+    },
+    {
+      "args": [
+        "--witness-key",
+        "attestation-key.jwk"
+      ],
+      "contains": [
+        "WITNESS OK"
+      ],
+      "exit": 0,
+      "file": "unbound-statement",
+      "name": "a statement that names no gateway, signed and pinned",
+      "pack": "clean"
+    },
+    {
+      "args": [],
+      "contains": [
+        "its statement names no gateway",
+        "WITNESS COVERAGE NOT ESTABLISHED: no witnessed head of chain chain_tnt_fixture_run_a counts"
+      ],
+      "exit": 4,
+      "file": "unbound-statement",
+      "name": "a statement that names no gateway, not pinned",
+      "pack": "clean"
+    },
+    {
+      "args": [
+        "--witness-key",
+        "attestation-key.jwk"
+      ],
+      "contains": [
+        "the file changed after it was signed"
+      ],
+      "exit": 1,
+      "file": "tampered",
+      "name": "a signed file edited after signing",
+      "pack": "clean"
+    },
+    {
+      "args": [],
+      "contains": [
+        "token test-rsa: the object does not match the manifest's digest"
+      ],
+      "exit": 1,
+      "file": "object-mismatch",
+      "name": "a token that is not the one listed",
+      "pack": "clean"
+    },
+    {
+      "args": [
+        "--witness-key",
+        "attestation-key.jwk"
+      ],
+      "contains": [
+        "WITNESS OK: chain chain_tnt_fixture_run_a matches 2 witnessed head(s)"
+      ],
+      "directory": true,
+      "exit": 0,
+      "file": "signed",
+      "name": "the signed file as an extracted directory",
+      "pack": "clean"
+    }
+  ]
+}
