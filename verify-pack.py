@@ -327,8 +327,13 @@ SUPPORTED_HASH_VERSIONS = {"v1"}
 # bytes; `storage_layout`, `object` and `control_plane` are as in 1.3, each
 # present only when the pack has them. 1.5 is a content-stripped Exchange
 # pack: `content: stripped`, `removed_fields`, and an optional
-# `stubs` list; the 1.4 fields as in 1.4, `evidence_class` optional.
-SUPPORTED_MANIFEST_SCHEMA_VERSIONS = ("1.0", "1.1", "1.2", "1.3", "1.4", "1.5")
+# `stubs` list; the 1.4 fields as in 1.4, `evidence_class` optional. 1.6 adds
+# the required `retirements` ledger: one entry per
+# retention.retirement record of the pack's chain, each restating that
+# record's sealed span; the 1.4 fields as in 1.4, `evidence_class` optional.
+# A gap in a 1.6 pack is retired only when its ledger receipts cover it
+# exactly; every other gap fails.
+SUPPORTED_MANIFEST_SCHEMA_VERSIONS = ("1.0", "1.1", "1.2", "1.3", "1.4", "1.5", "1.6")
 # The manifest 1.4 evidence classes this verifier reads, with the sentence it
 # prints beside every verdict. A class not listed here cannot be evaluated
 # (exit 2): a label this verifier does not know is never ignored.
@@ -361,6 +366,39 @@ LOCAL_CHAIN_EVIDENCE_CLASS = "local-chain-not-write-once"
 CLAIM_CHAIN_TO_HEAD = "chain_to_head"
 CLAIM_INTERVAL = "interval"
 CLAIM_SCOPES = (CLAIM_CHAIN_TO_HEAD, CLAIM_INTERVAL)
+# A manifest's `source`: the store the pack's records were read from (the
+# identity the store stamps on its own integrity report) and what the
+# generator observed, when it built the pack, about whether that store lets a
+# record change. Each basis belongs to exactly one store; the sentence is the
+# one printed beside it. A store or basis not listed here cannot be evaluated
+# (exit 2); a section that contradicts the manifest fails the pack. A
+# manifest without the section predates it and is read as before.
+SOURCE_STORE_GCS = "gcs_worm"
+SOURCE_STORE_S3 = "s3_worm"
+SOURCE_STORE_LOCAL_CHAIN = "local_chain"
+SOURCE_STORES = (SOURCE_STORE_GCS, SOURCE_STORE_S3, SOURCE_STORE_LOCAL_CHAIN)
+SOURCE_BASES = {
+    "not_read_by_generator": (
+        SOURCE_STORE_GCS,
+        "write-once bucket; its retention policy was not read when the pack was built",
+    ),
+    "object_lock_compliant": (
+        SOURCE_STORE_S3,
+        "immutable: S3 Object Lock in compliance mode, read when the pack was built",
+    ),
+    "object_lock_not_confirmed": (
+        SOURCE_STORE_S3,
+        "NOT CONFIRMED IMMUTABLE: the bucket's Object Lock configuration is not compliant",
+    ),
+    "not_write_once": (
+        SOURCE_STORE_LOCAL_CHAIN,
+        "mutable: a gateway's local chain, not confirmed by a write-once store",
+    ),
+}
+SOURCE_OBJECT_LOCK_FIELDS = ("verdict", "mode", "default_retention_days", "floor_days", "refusals")
+# What a version-aware read of an S3 chain key can find besides the key's
+# first version, which is the record.
+S3_VERSION_FINDING_CODES = ("s3_extra_version", "s3_delete_marker", "s3_key_without_version")
 # The admin action a gateway seals at every boot with the evidence mode it
 # resolved (`mode`, `source`). A manifest's `evidence_modes` lists them.
 ACTION_EVIDENCE_MODE_RESOLVED = "evidence_mode_resolved"
@@ -431,6 +469,12 @@ EVIDENCE_MODE_INDEX_FIELDS = ("sequence", "mode", "source")
 # `judgment_verdict_local.v3`, whose spans carry the passage each quotes as
 # the judge read it (or null): each passage is exactly its span's bytes, and
 # none is kept where the reason text is withheld.
+# `judgment-verdicts-v5` reads v1.28 judgment.verdict records: the v1.22
+# record and checks again with the eighteen codes, the stored uploaded form
+# held to the closed `judgment_verdict.v3` key set (v2 and `agent_id`, the
+# registered agent the judged turn's verified credential resolved to, or
+# null), and the local part held to `judgment_verdict_local.v2` or `.v3` by
+# its own schema name.
 # `coverage-claim-v1` reads a manifest's `claim`, fails a claim that
 # contradicts the manifest, and reports a verified anchor after a
 # chain_to_head claim as coverage not established (exit 4), never as a
@@ -467,6 +511,23 @@ EVIDENCE_MODE_INDEX_FIELDS = ("sequence", "mode", "source")
 # llm_request records): recomputes its hash and checks its window and that
 # its counts add up. `provenance_check_outcome` is the classification such a
 # run counts, so anyone can recount a window from the records in a pack.
+# `retention-retirement-v1` reads v1.27 retention.retirement records and the
+# manifest 1.6 `retirements` ledger: a gap covered exactly by
+# consecutive receipts of the pack's own store, each hash-verified, signed by
+# the chain's key and restated by the ledger, verifies as retired; an
+# uncovered gap, a receipt of another store, an unsigned receipt or a ledger
+# that differs from its receipt fails; a receipt whose signature could not be
+# checked, or a retention rule this verifier does not know, is exit 2. A
+# chain_to_head pack may start right after its retired prefix. The retention
+# policy itself is not checked by this capability.
+# `pack-source-v1` reads a manifest's `source` section (SOURCE_STORES,
+# SOURCE_BASES): prints the store and the generator's immutability
+# observation on every verdict, refuses an unknown store or basis (exit 2),
+# fails a section that contradicts the manifest (a basis of another store, an
+# Object Lock verdict that disagrees with its basis or its refusals, a local
+# chain without the local-chain evidence class or that class on another
+# store), and reads an S3 pack online with --s3-bucket, each key's first
+# version. An S3 bucket whose lock was not confirmed is labelled, never failed.
 VERIFIER_CAPABILITIES = frozenset(
     {"chain-anchors-v1", "segmented-records-v1", "decision-receipts-v1", "evaluation-trace-v1",
      "data-reach-evidence-v1", "control-plane-chain-v1", "ocsf-export-v1", "customer-scope-v1",
@@ -475,7 +536,7 @@ VERIFIER_CAPABILITIES = frozenset(
      "evidence-modes-v1", "gateway-evidence-key-v1", "judgment-verdicts-v1",
      "judgment-verdicts-v2", "control-probe-runs-v1", "judgment-verdicts-v3", "witness-file-v1",
      "verification-receipt-v1", "context-provenance-v1", "provenance-verifications-v1",
-     "judgment-verdicts-v4"}
+     "judgment-verdicts-v4", "retention-retirement-v1", "judgment-verdicts-v5", "pack-source-v1"}
 )
 # The stripped profile of a manifest 1.5 Exchange pack. Mirror of
 # `exchange::STRIPPED_FIELDS` / `WITHHELD_FIELDS` / `STUB_FIELDS` /
@@ -664,6 +725,8 @@ EVENT_KIND_JUDGMENT_VERDICT = 'judgment.verdict'
 EVENT_KIND_CONTROL_PROBE_RUN = 'control_probe.run'
 # The provenance verification kind (v1.25 bucket).
 EVENT_KIND_PROVENANCE_VERIFICATION = 'provenance.verification'
+# v1.27: a span of one chain retired under a signed retention policy.
+EVENT_KIND_RETENTION_RETIREMENT = 'retention.retirement'
 
 MCP_EVENT_KINDS = {
     EVENT_KIND_MCP_TOOL_CALL,
@@ -700,6 +763,8 @@ SERDE_EVENT_KIND_TO_WIRE = {
     'control_probe_run': EVENT_KIND_CONTROL_PROBE_RUN,
     # Serde snake_case form of the v1.25 verification kind.
     'provenance_verification': EVENT_KIND_PROVENANCE_VERIFICATION,
+    # Serde snake_case form of the v1.27 kind.
+    'retention_retirement': EVENT_KIND_RETENTION_RETIREMENT,
 }
 
 
@@ -1435,13 +1500,23 @@ JUDGMENT_VERDICT_LOCAL_FIELDS = ('schema', 'reason_text', 'reason_text_withheld'
 # (`pacing_limited` included). The same feed and the same closed v2 uploaded
 # form; the local part is `judgment_verdict_local.v3`, whose spans carry the
 # passage each quotes as the judge read it, still bound by local_sha256. A v2
-# local part on v1.26, or a v3 one on any other version, is refused.
-JUDGMENT_VERDICT_SCHEMA_VERSIONS = ('v1.21', 'v1.22', 'v1.24', 'v1.26')
+# local part on v1.26, or a v3 one on any other version but v1.28, is refused.
+#
+# The v1.28 bucket: the v1.22 record again, stamped v1.28 on every receipt
+# of a gateway that names the judged turn's verified agent, with the eighteen
+# codes. The same feed; the uploaded form is the closed `judgment_verdict.v3`
+# (the v2 keys and `agent_id`: the registered agent a verified credential
+# resolved to, or null), bound by uploaded_sha256. The local part is
+# `judgment_verdict_local.v2` or `.v3`, each held to its own rule. A v3 form
+# on any other version, or a v2 form on v1.28, is refused.
+JUDGMENT_VERDICT_SCHEMA_VERSIONS = ('v1.21', 'v1.22', 'v1.24', 'v1.26', 'v1.28')
 JUDGMENT_VERDICT_V2_SCHEMA_VERSION = 'v1.22'
-JUDGMENT_VERDICT_V2_SCHEMA_VERSIONS = ('v1.22', 'v1.24', 'v1.26')
+JUDGMENT_VERDICT_V2_SCHEMA_VERSIONS = ('v1.22', 'v1.24', 'v1.26', 'v1.28')
 JUDGMENT_VERDICT_PACING_SCHEMA_VERSION = 'v1.24'
 JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION = 'v1.26'
+JUDGMENT_VERDICT_AGENT_SCHEMA_VERSION = 'v1.28'
 JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2 = 'judgment_verdict.v2'
+JUDGMENT_VERDICT_UPLOADED_SCHEMA_V3 = 'judgment_verdict.v3'
 JUDGMENT_VERDICT_LOCAL_SCHEMA_V2 = 'judgment_verdict_local.v2'
 JUDGMENT_VERDICT_LOCAL_SCHEMA_V3 = 'judgment_verdict_local.v3'
 # Every key of the v2 uploaded form. `raw_input_grant` is the one optional
@@ -1454,6 +1529,12 @@ JUDGMENT_VERDICT_V2_FIELDS = (
     'raw_input_grant', 'latency_ms', 'evaluated_at',
 )
 JUDGMENT_VERDICT_V2_OPTIONAL_FIELDS = ('raw_input_grant',)
+# Every key of the v3 uploaded form: the v2 keys and `agent_id`, always
+# present (null when the judged turn had no verified agent).
+JUDGMENT_VERDICT_V3_FIELDS = (
+    JUDGMENT_VERDICT_V2_FIELDS[:JUDGMENT_VERDICT_V2_FIELDS.index('snapshot') + 1] + ('agent_id',)
+    + JUDGMENT_VERDICT_V2_FIELDS[JUDGMENT_VERDICT_V2_FIELDS.index('snapshot') + 1:]
+)
 # `pool_verdict_id` links a receipt to the shared pool's own record
 # of the same verdict. Always present: `jv_` and 32 lowercase hex digits
 # exactly when `execution` is `pool`, null otherwise.
@@ -1584,21 +1665,28 @@ def _jv_closed_keys(obj, allowed, optional=()):
     return problems
 
 
-def judgment_verdict_v2_form_problems(uploaded):
+def judgment_verdict_v2_form_problems(uploaded, schema=JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2):
     """The problems of a stored `judgment_verdict.v2` uploaded form on its
     own: its closed key set, each value's type, enum, nullability and format,
     the closed nested objects (`pack`, `questions[]`, `backend`), and the
-    cross-field rules that read only the form. Empty means it checks out."""
+    cross-field rules that read only the form. Empty means it checks out.
+
+    With `schema` `judgment_verdict.v3`, the same rules over the v3 key set,
+    and `agent_id` is null or a code."""
     problems = []
 
     def bad(path, what):
         problems.append(f"`{path}` is not {what}")
 
+    v3 = schema == JUDGMENT_VERDICT_UPLOADED_SCHEMA_V3
     problems.extend(f"the form {p}" for p in _jv_closed_keys(
-        uploaded, JUDGMENT_VERDICT_V2_FIELDS, JUDGMENT_VERDICT_V2_OPTIONAL_FIELDS))
+        uploaded, JUDGMENT_VERDICT_V3_FIELDS if v3 else JUDGMENT_VERDICT_V2_FIELDS,
+        JUDGMENT_VERDICT_V2_OPTIONAL_FIELDS))
     get = uploaded.get
-    if 'schema' in uploaded and get('schema') != JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2:
-        bad('schema', JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2)
+    if 'schema' in uploaded and get('schema') != schema:
+        bad('schema', schema)
+    if v3 and 'agent_id' in uploaded and get('agent_id') is not None and not _jv_is_code(get('agent_id')):
+        bad('agent_id', 'a code or null')
     for name in ('verdict_id', 'judged_event_id', 'rule_id'):
         if name in uploaded and not _jv_is_code(get(name)):
             bad(name, 'a code')
@@ -2131,6 +2219,164 @@ def check_provenance_verification(event):
     return problems
 
 
+# The v1.27 retention.retirement record: one contiguous span
+# of one chain that the gateway retired under a signed retention policy,
+# sealed and signed before any record of the span is deleted. Content free:
+# sequences, times, hashes, the policy's digest and revision, the rule and
+# the hold ids that ended the prefix.
+RETENTION_RETIREMENT_SCHEMA_VERSION = 'v1.27'
+# The payload feed, in `RetentionRetirementFields` order. `str` feeds
+# length-prefixed (the v1.19 feed), `u64` 8 little-endian bytes, `strs` a u64
+# little-endian count then each member length-prefixed, `gcs` a presence byte
+# (0 absent, 1 present) then RETENTION_RETIREMENT_GCS_FEED. Every member is
+# fed; nothing rides beside it. The known-answer vector is
+# tests/fixtures/retention-retirement/v1_27_vector.json, which the proxy's
+# preimage must reproduce.
+RETENTION_RETIREMENT_FEED = (
+    ('run_id', 'str'), ('run_started_at', 'str'), ('chain_id', 'str'), ('store', 'str'),
+    ('first_sequence', 'u64'), ('last_sequence', 'u64'), ('count', 'u64'),
+    ('oldest_occurred_at', 'str'), ('newest_occurred_at', 'str'),
+    ('first_previous_hash', 'str'), ('last_event_hash', 'str'),
+    ('policy_sha256', 'str'), ('policy_revision', 'u64'),
+    ('retention_rule', 'str'), ('retention_applied_days', 'u64'),
+    ('hold_ids', 'strs'), ('gcs', 'gcs'),
+)
+# On a `gcs_worm` receipt only: the anchors and captures retired with the
+# span and the digest of the capture list.
+RETENTION_RETIREMENT_GCS_FEED = (
+    ('anchors_retired', 'u64'), ('captures_retired', 'u64'), ('capture_list_sha256', 'str'),
+)
+# Which store a receipt pruned. A `local_buffer` receipt is the
+# buffer of a write-once gateway and never covers a gap in a pack.
+RETENTION_RETIREMENT_STORES = ('local_chain', 'local_buffer', 'gcs_worm')
+# The retention rules this verifier reads. Any other rule is
+# cannot evaluate (exit 2), never a pass.
+RETENTION_RULES = ('monotone',)
+_RR_HEX64 = re.compile(r'\A[0-9a-f]{64}\Z')
+_RR_HOLD_ID = re.compile(r'\A[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z')
+
+
+def compute_event_hash_v1_27_retention_retirement(
+    sequence_number, timestamp_utc, event_id, request_id,
+    model_requested, action, input_tokens, output_tokens,
+    total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+    cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    retirement,
+):
+    """v1.27 retention.retirement hash. `retirement` is a dict matching
+    `RetentionRetirementFields`: the v1.2 prefix, then the event_kind
+    wire-name, then the members in RETENTION_RETIREMENT_FEED order. Its own
+    function, not shared with any other kind's."""
+    h = _v1_2_prefix_hash(
+        sequence_number, timestamp_utc, event_id, request_id,
+        model_requested, action, input_tokens, output_tokens,
+        total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+        cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+    )
+    h.update(EVENT_KIND_RETENTION_RETIREMENT.encode('utf-8'))
+
+    def feed(obj, name, kind, where):
+        value = obj.get(name)
+        if kind == 'str':
+            if not isinstance(value, str):
+                raise ValueError(f"{where}.{name} is not a string, so the record has no defined preimage.")
+            h.update(encode_len_prefixed_str(value))
+        elif kind == 'u64':
+            if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2 ** 64:
+                raise ValueError(f"{where}.{name} is not an unsigned integer, so the record has no defined preimage.")
+            h.update(struct.pack('<Q', value))
+        elif kind == 'strs':
+            if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+                raise ValueError(f"{where}.{name} is not a list of strings, so the record has no defined preimage.")
+            h.update(struct.pack('<Q', len(value)))
+            for v in value:
+                h.update(encode_len_prefixed_str(v))
+        else:
+            if value is None:
+                h.update(b'\x00')
+            elif isinstance(value, dict):
+                h.update(b'\x01')
+                for sub, sub_kind in RETENTION_RETIREMENT_GCS_FEED:
+                    feed(value, sub, sub_kind, f'{where}.{name}')
+            else:
+                raise ValueError(f"{where}.{name} is neither null nor an object, so the record has no defined preimage.")
+
+    for name, kind in RETENTION_RETIREMENT_FEED:
+        feed(retirement, name, kind, 'retention_retirement')
+    return h.hexdigest()
+
+
+def check_retention_retirement(event):
+    """The checks of a v1.27 retention.retirement record that its hash does
+    not cover. Returns (problems, unknown): `problems` fail the record, each
+    naming a member, never a value; `unknown` lists what this verifier cannot
+    evaluate (a retention rule it does not know), which is exit 2. Mirror of
+    `check_retention_retirement_fields` in meilynx-core."""
+    fields = event.get('retention_retirement')
+    if fields is None:
+        return [], []
+    version = event.get('schema_version') or 'v1'
+    if version != RETENTION_RETIREMENT_SCHEMA_VERSION:
+        return [f'{version} record carries a retention_retirement payload; it is hashed only in the v1.27 bucket'], []
+    if not isinstance(fields, dict) or set(fields) != {name for name, _ in RETENTION_RETIREMENT_FEED}:
+        return ['the retention_retirement payload is not exactly the v1.27 members'], []
+    problems, unknown = [], []
+    if not (isinstance(fields['run_id'], str) and _UUID.match(fields['run_id'])):
+        problems.append('retention_retirement.run_id is not a UUID')
+    started = _utc_instant(fields['run_started_at'])
+    oldest = _utc_instant(fields['oldest_occurred_at'])
+    newest = _utc_instant(fields['newest_occurred_at'])
+    sealed = _utc_instant(normalize_timestamp(event.get('timestamp_utc') or ''))
+    for name, value in (('run_started_at', started), ('oldest_occurred_at', oldest),
+                        ('newest_occurred_at', newest)):
+        if value is None:
+            problems.append(f'retention_retirement.{name} is not an RFC 3339 UTC timestamp')
+    if oldest is not None and newest is not None and newest < oldest:
+        problems.append('retention_retirement.newest_occurred_at is before oldest_occurred_at')
+    if started is not None and sealed is not None and sealed < started:
+        problems.append('the retention_retirement record is sealed before its run_started_at')
+    if record_chain_id(event) != fields['chain_id']:
+        problems.append("retention_retirement.chain_id is not the chain the record is sealed on")
+    if fields['store'] not in RETENTION_RETIREMENT_STORES:
+        problems.append(f"retention_retirement.store is not one of {', '.join(RETENTION_RETIREMENT_STORES)}")
+    first, last, count = fields['first_sequence'], fields['last_sequence'], fields['count']
+    if not all(_is_count(v) for v in (first, last, count)):
+        problems.append('retention_retirement carries a sequence or count that is not an unsigned integer')
+    elif last < first or count != last - first + 1:
+        problems.append('retention_retirement.count is not last_sequence - first_sequence + 1 '
+                        '(a retired span is one contiguous prefix)')
+    elif isinstance(event.get('sequence_number'), int) and event['sequence_number'] <= last:
+        problems.append('the retention_retirement record is not sealed after the span it retires')
+    for name in ('first_previous_hash', 'last_event_hash', 'policy_sha256'):
+        if not (isinstance(fields[name], str) and _RR_HEX64.match(fields[name])):
+            problems.append(f'retention_retirement.{name} is not 64 lowercase hex characters')
+    if not (_is_count(fields['policy_revision']) and fields['policy_revision'] >= 1):
+        problems.append('retention_retirement.policy_revision is not a revision of 1 or more')
+    days = fields['retention_applied_days']
+    if not (_is_count(days) and days >= 1):
+        problems.append('retention_retirement.retention_applied_days is not a number of days of 1 or more')
+    elif newest is not None and started is not None and newest + datetime.timedelta(days=days) > started:
+        problems.append('retention_retirement retires a record younger than the retention it states '
+                        '(newest_occurred_at + retention_applied_days is after run_started_at)')
+    holds = fields['hold_ids']
+    if (not isinstance(holds, list) or not all(isinstance(h, str) and _RR_HOLD_ID.match(h) for h in holds)
+            or holds != sorted(set(holds))):
+        problems.append('retention_retirement.hold_ids is not a sorted list of distinct hold ids')
+    gcs = fields['gcs']
+    if (gcs is not None) != (fields['store'] == 'gcs_worm'):
+        problems.append('retention_retirement.gcs is present exactly on a gcs_worm receipt')
+    elif gcs is not None:
+        if not (isinstance(gcs, dict) and set(gcs) == {n for n, _ in RETENTION_RETIREMENT_GCS_FEED}
+                and _is_count(gcs['anchors_retired']) and _is_count(gcs['captures_retired'])
+                and isinstance(gcs['capture_list_sha256'], str) and _RR_HEX64.match(gcs['capture_list_sha256'])):
+            problems.append('retention_retirement.gcs is not exactly anchors_retired, captures_retired and '
+                            'capture_list_sha256')
+    if fields['retention_rule'] not in RETENTION_RULES:
+        unknown.append(f"retention_retirement.retention_rule {fields['retention_rule']!r} is not a rule this "
+                       f"verifier reads ({', '.join(RETENTION_RULES)}). Re-run with an updated verifier.")
+    return problems, unknown
+
+
 def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=None):
     """For a v1.21 record, check what the hash alone cannot.
 
@@ -2171,7 +2417,14 @@ def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=N
     A v1.26 record is a v1.22 record whose stored local part is a closed
     `judgment_verdict_local.v3` object (`judgment_verdict_local_v3_problems`:
     each span carries the passage it quotes, or null), with the eighteen
-    codes. A v2 local part on v1.26, or a v3 one on any other version, fails.
+    codes. A v2 local part on v1.26, or a v3 one on any other version but
+    v1.28, fails.
+
+    A v1.28 record is a v1.22 record whose stored uploaded form is a closed
+    `judgment_verdict.v3` object (the v2 form and `agent_id`, a code or null),
+    with the eighteen codes; its local part is checked by its own schema name
+    (`judgment_verdict_local.v2` or `.v3`). A v3 form on any other version, or
+    a v2 form on v1.28, fails.
 
     Returns a list of problems; empty means the record checks out. Records on
     any other schema version return no problems."""
@@ -2186,12 +2439,16 @@ def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=N
     vid = fields.get('verdict_id', '?')
     pacing_limited = fields.get('reason_code') == JUDGMENT_VERDICT_PACING_LIMITED
     stamped_pacing = version == JUDGMENT_VERDICT_PACING_SCHEMA_VERSION
-    passages = version == JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION
-    if pacing_limited and not stamped_pacing and not passages:
+    agent = version == JUDGMENT_VERDICT_AGENT_SCHEMA_VERSION
+    stored_local = event.get('raw_response')
+    local_v3 = isinstance(stored_local, dict) and stored_local.get('schema') == JUDGMENT_VERDICT_LOCAL_SCHEMA_V3
+    passages = version == JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION or (agent and local_v3)
+    reads_eighteen = stamped_pacing or version == JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION or agent
+    if pacing_limited and not reads_eighteen:
         problems.append(
             f"verdict receipt {vid}: a {version} record carries {JUDGMENT_VERDICT_PACING_LIMITED}, "
-            f"which only a {JUDGMENT_VERDICT_PACING_SCHEMA_VERSION} or "
-            f"{JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION} record carries"
+            f"which only a {JUDGMENT_VERDICT_PACING_SCHEMA_VERSION}, "
+            f"{JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION} or {JUDGMENT_VERDICT_AGENT_SCHEMA_VERSION} record carries"
         )
     if stamped_pacing and not pacing_limited:
         problems.append(
@@ -2245,15 +2502,16 @@ def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=N
                 f"{JUDGMENT_VERDICT_NO_PACK_VERSION_REASON} verdict, or none on another verdict"
             )
         if v2:
-            for problem in judgment_verdict_v2_form_problems(uploaded):
+            expected = JUDGMENT_VERDICT_UPLOADED_SCHEMA_V3 if agent else JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2
+            for problem in judgment_verdict_v2_form_problems(uploaded, expected):
                 problems.append(
                     f"verdict receipt {vid}: the stored uploaded form is not a "
-                    f"{JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2} form: {problem}"
+                    f"{expected} form: {problem}"
                 )
-        elif uploaded.get('schema') == JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2:
+        elif uploaded.get('schema') in (JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2, JUDGMENT_VERDICT_UPLOADED_SCHEMA_V3):
             problems.append(
-                f"verdict receipt {vid}: a v1.21 record stores a {JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2} "
-                f"form, which only a v1.22 record carries"
+                f"verdict receipt {vid}: a v1.21 record stores a {uploaded.get('schema')} "
+                f"form, which only a later record carries"
             )
     if 'raw_response' not in stripped:
         stored = event.get('raw_response')
@@ -2707,11 +2965,11 @@ def control_plane_manifest_problem(manifest):
     problem (a verification failure)."""
     version = manifest.get('schema_version', '1.0')
     section = manifest.get('control_plane')
-    if version not in ('1.3', '1.4', '1.5'):
+    if version not in ('1.3', '1.4', '1.5', '1.6'):
         if section is not None:
-            return f"manifest {version} carries a control_plane section, which only 1.3, 1.4 and 1.5 define"
+            return f"manifest {version} carries a control_plane section, which only 1.3 to 1.6 define"
         return None
-    if version in ('1.4', '1.5') and section is None:
+    if version in ('1.4', '1.5', '1.6') and section is None:
         return None
     if section is None:
         return f"manifest {version} has no control_plane section"
@@ -4532,7 +4790,7 @@ def compute_event_hash_dispatch(
     identity=None, coverage_key_inventory=None, decision_receipt=None,
     evaluation_trace=None, customer=None, policy_version=None, model_executed=None,
     compliance_record=None, judgment_verdict=None, control_probe_run=None,
-    provenance_verification=None,
+    provenance_verification=None, retention_retirement=None,
 ):
     """Python mirror of compute_event_hash_dispatch in sqlite.rs.
 
@@ -4580,6 +4838,16 @@ def compute_event_hash_dispatch(
     # Fail closed. The provenance verification payload is hashed only by the
     # v1.25 provenance.verification hasher; anywhere else it would sit on the
     # record unhashed.
+    # Fail closed. The retirement payload is hashed only by the v1.27
+    # retention.retirement hasher; anywhere else it would sit on the record
+    # unhashed.
+    if retention_retirement is not None and (
+        schema_version != RETENTION_RETIREMENT_SCHEMA_VERSION or event_kind != EVENT_KIND_RETENTION_RETIREMENT
+    ):
+        raise ValueError(
+            f"retention_retirement payload present on a {schema_version!r} "
+            f"{event_kind!r} event — it is hashed only in the v1.27 retention.retirement bucket."
+        )
     if provenance_verification is not None and (
         schema_version != PROVENANCE_VERIFICATION_SCHEMA_VERSION or event_kind != EVENT_KIND_PROVENANCE_VERIFICATION
     ):
@@ -4598,14 +4866,14 @@ def compute_event_hash_dispatch(
             f"{event_kind!r} event — it is hashed only in the v1.23 control_probe.run bucket."
         )
     # Fail closed. The verdict receipt payload is hashed only by the v1.21
-    # judgment.verdict hasher (the v1.21, v1.22, v1.24 and v1.26 buckets);
+    # judgment.verdict hasher (the v1.21, v1.22, v1.24, v1.26 and v1.28 buckets);
     # anywhere else it would sit on the record unhashed.
     if judgment_verdict is not None and (
         schema_version not in JUDGMENT_VERDICT_SCHEMA_VERSIONS or event_kind != EVENT_KIND_JUDGMENT_VERDICT
     ):
         raise ValueError(
             f"judgment_verdict payload present on a {schema_version!r} "
-            f"{event_kind!r} event — it is hashed only in the v1.21, v1.22, v1.24 and v1.26 judgment.verdict buckets."
+            f"{event_kind!r} event — it is hashed only in the v1.21, v1.22, v1.24, v1.26 and v1.28 judgment.verdict buckets."
         )
     # Fail closed. The compliance-record payload is hashed only by the v1.20
     # compliance.record hasher; anywhere else it would sit on the record
@@ -4931,8 +5199,9 @@ def compute_event_hash_dispatch(
         # v1.22 is the same record and the same feed; only
         # the stamp differs, and it obliges the closed checks of the stored
         # forms in check_judgment_verdict. v1.24 is v1.22 again on
-        # the receipt of a `pacing_limited` verdict, and v1.26 on a receipt
-        # whose local part keeps the quoted passages.
+        # the receipt of a `pacing_limited` verdict, v1.26 on a receipt
+        # whose local part keeps the quoted passages, and v1.28 on a receipt
+        # whose uploaded form names the verified agent.
         if event_kind != EVENT_KIND_JUDGMENT_VERDICT:
             raise ValueError(
                 f"schema_version {schema_version} is defined only for "
@@ -5262,6 +5531,29 @@ def compute_event_hash_dispatch(
             cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
             join_context, content, identity, evaluation_trace, customer,
             policy_version, model_executed,
+        )
+    if schema_version == RETENTION_RETIREMENT_SCHEMA_VERSION:
+        # Defined only for retention.retirement: one span of one chain
+        # retired under a signed retention policy. Another
+        # kind's payload or an LLM field has no place in this preimage.
+        if event_kind != EVENT_KIND_RETENTION_RETIREMENT:
+            raise ValueError(
+                f"schema_version v1.27 is defined only for retention.retirement events; got event_kind {event_kind!r}"
+            )
+        if not isinstance(retention_retirement, dict):
+            raise ValueError("RetentionRetirement event missing retention_retirement payload")
+        if any(p is not None for p in (auth_session, admin_action, mcp_event, coverage, content, join_context,
+                                       identity, policy_version, model_executed)):
+            raise ValueError(
+                "a v1.27 retention.retirement event carries another kind's payload; "
+                "it would ride the record unhashed."
+            )
+        return compute_event_hash_v1_27_retention_retirement(
+            sequence_number, timestamp_utc, event_id, request_id,
+            model_requested, action, input_tokens, output_tokens,
+            total_tokens, cache_creation_input_tokens, cache_read_input_tokens,
+            cached_input_tokens, reasoning_tokens, estimated_cost_usd, previous_hash,
+            retention_retirement,
         )
     raise ValueError(
         f"unknown schema_version {schema_version!r} — "
@@ -6498,6 +6790,90 @@ def run_self_test():
         print(f'SELF-TEST assertion 39h FAIL: refused {[(n, p) for n, p in v126_accepted.items() if p]}, '
               f'not caught {[n for n, c in v126_caught.items() if not c]}, '
               f'dispatched {dispatched_v126 == got_v126}, refused {rejected} of {len(v126_refusals)}',
+              file=sys.stderr)
+        ok = False
+
+    # Assertion 39i — v1.28 judgment.verdict: a receipt whose uploaded form
+    # names the judged turn's verified agent (`judgment_verdict.v3`). The feed
+    # is the v1.21 one, so the dispatcher routes the v1.28 stamp to the same
+    # hasher; the record checks out with an agent, with none (null), with a v3
+    # local part and on `pacing_limited`; a v3 form relabelled v1.21, v1.22,
+    # v1.24 or v1.26, a v2 form on v1.28, a v3 form without `agent_id`, a v2
+    # form carrying one, an agent that is not a code (a name, a number, empty,
+    # too long) all fail; an edited agent breaks uploaded_sha256; and the
+    # dispatcher's fail-closed guards hold for the stamp.
+    v127_agent = 'agt_01J9ZK3Q7R8S9T0V1W2X3Y4Z5A'
+    v127_form = dict(schema=JUDGMENT_VERDICT_UPLOADED_SCHEMA_V3, agent_id=v127_agent)
+    v127_event = v122_with(stamp=JUDGMENT_VERDICT_AGENT_SCHEMA_VERSION, form=v127_form)
+    v127_payload = v127_event['judgment_verdict']
+    got_v127 = compute_event_hash_v1_21_judgment_verdict(receipt=v127_payload, **v121_args)
+    dispatched_v127 = compute_event_hash_dispatch(
+        JUDGMENT_VERDICT_AGENT_SCHEMA_VERSION, *(v121_args[k] for k in (
+            'sequence_number', 'timestamp_utc', 'event_id', 'request_id', 'model_requested', 'action',
+            'input_tokens', 'output_tokens', 'total_tokens', 'cache_creation_input_tokens',
+            'cache_read_input_tokens', 'cached_input_tokens', 'reasoning_tokens', 'estimated_cost_usd',
+            'previous_hash')),
+        event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=v127_payload)
+
+    def agented(stamp=JUDGMENT_VERDICT_AGENT_SCHEMA_VERSION, paced_form=False, **form):
+        base = dict(pacing, form=dict(pacing['form'], **v127_form)) if paced_form else dict(form=dict(v127_form))
+        base['form'].update(form)
+        return v122_with(stamp=stamp, **base)
+
+    v127_accepted = {
+        'a FLAG of a verified agent': check_judgment_verdict(v127_event, frozenset(), 7, llm_pack),
+        'a turn with no verified agent': check_judgment_verdict(agented(agent_id=None), frozenset(), 7, llm_pack),
+        'a v3 local part with its passage': check_judgment_verdict(
+            v122_with(stamp=JUDGMENT_VERDICT_AGENT_SCHEMA_VERSION, form=v127_form, local=v126_local),
+            frozenset(), 7, llm_pack),
+        'a pacing_limited verdict': check_judgment_verdict(agented(paced_form=True), frozenset(), 7, llm_pack),
+        'a stripped pack without the local part': check_judgment_verdict(
+            dict(v127_event, raw_response=None), frozenset({'raw_response'}), 7, llm_pack),
+    }
+    without_agent = {k: v for k, v in v127_form.items() if k != 'agent_id'}
+    edited_agent = dict(v127_event, judgment_verdict=dict(
+        v127_payload, uploaded_json=v127_payload['uploaded_json'].replace(v127_agent, 'agt_other')))
+    v127_edits = {
+        'a v3 form relabelled v1.21': agented(stamp='v1.21'),
+        'a v3 form relabelled v1.22': agented(stamp='v1.22'),
+        'a v3 form relabelled v1.24 on pacing_limited': agented(
+            stamp=JUDGMENT_VERDICT_PACING_SCHEMA_VERSION, paced_form=True),
+        'a v3 form relabelled v1.26': v122_with(
+            stamp=JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION, form=v127_form, local=v126_local),
+        'a v2 form on v1.28': v122_with(stamp=JUDGMENT_VERDICT_AGENT_SCHEMA_VERSION),
+        'a v3 form without agent_id': v122_with(stamp=JUDGMENT_VERDICT_AGENT_SCHEMA_VERSION, form=without_agent),
+        'a v2 form carrying an agent': v122_with(form=dict(agent_id=v127_agent)),
+        'an agent that is a name': agented(agent_id='billing agent'),
+        'an agent that is a number': agented(agent_id=7),
+        'an empty agent': agented(agent_id=''),
+        'an agent of 129 characters': agented(agent_id='a' * 129),
+        'an edited agent': edited_agent,
+    }
+    v127_caught = {name: bool(check_judgment_verdict(e, frozenset(), 7, llm_pack)) for name, e in v127_edits.items()}
+    rejected = 0
+    v127_refusals = (
+        dict(event_kind=EVENT_KIND_LLM_REQUEST, judgment_verdict=v127_payload),
+        dict(event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=None),
+    )
+    for refusal in v127_refusals:
+        try:
+            compute_event_hash_dispatch(JUDGMENT_VERDICT_AGENT_SCHEMA_VERSION, *base_args, **refusal)
+        except ValueError:
+            rejected += 1
+    v3_keys_ok = (JUDGMENT_VERDICT_V3_FIELDS[JUDGMENT_VERDICT_V3_FIELDS.index('snapshot') + 1] == 'agent_id'
+                  and set(JUDGMENT_VERDICT_V3_FIELDS) == set(JUDGMENT_VERDICT_V2_FIELDS) | {'agent_id'})
+    if (got_v127 == dispatched_v127 and recompute_event_hash(v127_event, 7, 'b' * 64) == got_v127
+            and not any(v127_accepted.values()) and v3_keys_ok
+            and all(v127_caught.values()) and len(v127_caught) == 12
+            and rejected == len(v127_refusals)
+            and JUDGMENT_VERDICT_AGENT_SCHEMA_VERSION in JUDGMENT_VERDICT_SCHEMA_VERSIONS
+            and 'judgment-verdicts-v5' in VERIFIER_CAPABILITIES):
+        print('SELF-TEST assertion 39i PASS: a v1.28 judgment.verdict naming the verified agent recomputes through '
+              f'the v1.21 feed and checks out; {len(v127_caught)} relabels and wrong agents are caught')
+    else:
+        print(f'SELF-TEST assertion 39i FAIL: refused {[(n, p) for n, p in v127_accepted.items() if p]}, '
+              f'not caught {[n for n, c in v127_caught.items() if not c]}, keys {v3_keys_ok}, '
+              f'dispatched {dispatched_v127 == got_v127}, refused {rejected} of {len(v127_refusals)}',
               file=sys.stderr)
         ok = False
 
@@ -8565,6 +8941,7 @@ def recompute_event_hash(event, seq, previous_hash):
         judgment_verdict=event.get('judgment_verdict'),
         control_probe_run=event.get('control_probe_run'),
         provenance_verification=event.get('provenance_verification'),
+        retention_retirement=event.get('retention_retirement'),
     )
 
 
@@ -8757,6 +9134,123 @@ def gcs_fetcher(bucket_name, prefix, storage_client, report=print):
     return ChainRecords(list_names, read, report)
 
 
+class S3FirstVersions:
+    """Version-aware reads of an S3 bucket with Object Lock: a key's record
+    is its first version, the earliest LastModified and, among equal times,
+    the one listed last (S3 lists newer versions first). A later version, a
+    delete marker, or a key that holds delete markers and no version is
+    reported once as a WARN and never read as the record. `client` is a boto3
+    S3 client (list_object_versions, get_object)."""
+
+    def __init__(self, client, bucket, report=print):
+        self.client = client
+        self.bucket = bucket
+        self.report = report
+        self._first = {}  # key -> first version id
+        self._warned = set()
+
+    def _warn(self, key, code, detail):
+        if (key, code) not in self._warned:
+            self._warned.add((key, code))
+            self.report(f"WARN: s3://{self.bucket}/{key}: {code}: {detail}")
+
+    def _settle(self, key, versions, markers):
+        """Record the key's first version and report what else it holds;
+        False when it holds no version."""
+        if markers and versions:
+            self._warn(key, "s3_delete_marker", f"{len(markers)} delete marker(s); the first version is still read")
+        if not versions:
+            self._warn(key, "s3_key_without_version", "delete markers and no version: no record is read here")
+            return False
+        first = min(versions, key=lambda v: (v[0], -v[1]))
+        self._first[key] = first[2]
+        if len(versions) > 1:
+            self._warn(key, "s3_extra_version", f"{len(versions) - 1} version(s) written after the first, "
+                                                f"which is the one read")
+        return True
+
+    def list_keys(self, prefix, after=None, end=None):
+        """The keys directly under `prefix`, after `after` and before `end`
+        (both exclusive key bounds), that hold a version, in key order."""
+        entries = {}
+        position = 0
+        params = {"Bucket": self.bucket, "Prefix": prefix, "Delimiter": "/"}
+        if after:
+            params["KeyMarker"] = after
+        while True:
+            page = self.client.list_object_versions(**params)
+            past_end = False
+            for kind in ("Versions", "DeleteMarkers"):
+                for item in page.get(kind, []):
+                    key = item["Key"]
+                    if end is not None and key >= end:
+                        past_end = True
+                        continue
+                    rest = key[len(prefix):]
+                    if not key.startswith(prefix) or not rest or "/" in rest or (after and key <= after):
+                        continue
+                    versions, markers = entries.setdefault(key, ([], []))
+                    if kind == "Versions":
+                        versions.append((item["LastModified"], position, item["VersionId"]))
+                    else:
+                        markers.append(item.get("VersionId"))
+                    position += 1
+            if past_end or not page.get("IsTruncated"):
+                break
+            params["KeyMarker"] = page.get("NextKeyMarker")
+            params["VersionIdMarker"] = page.get("NextVersionIdMarker")
+            if not params["KeyMarker"]:
+                raise OSError(f"s3://{self.bucket}/{prefix}: a truncated version listing named no next marker")
+        return [key for key in sorted(entries) if self._settle(key, *entries[key])]
+
+    def read(self, key):
+        """The bytes of the key's first version. FileNotFoundError when it
+        holds no version."""
+        if key not in self._first:
+            versions, markers, position = [], [], 0
+            params = {"Bucket": self.bucket, "Prefix": key}
+            while True:
+                page = self.client.list_object_versions(**params)
+                for item in page.get("Versions", []):
+                    if item["Key"] == key:
+                        versions.append((item["LastModified"], position, item["VersionId"]))
+                        position += 1
+                markers += [d.get("VersionId") for d in page.get("DeleteMarkers", []) if d["Key"] == key]
+                if not page.get("IsTruncated") or not page.get("NextKeyMarker"):
+                    break
+                params["KeyMarker"] = page["NextKeyMarker"]
+                params["VersionIdMarker"] = page.get("NextVersionIdMarker")
+            if not self._settle(key, versions, markers):
+                raise FileNotFoundError(f"s3://{self.bucket}/{key} holds no version")
+        body = self.client.get_object(Bucket=self.bucket, Key=key, VersionId=self._first[key])["Body"]
+        return body.read()
+
+
+def s3_fetcher(versions, prefix, report=print):
+    """Return a ChainRecords over `<prefix>` read through an S3FirstVersions.
+    The listing is bounded by name as gcs_fetcher's is; a zero-padded
+    sequence with no extension is never an object's name, so it is an
+    exclusive marker that keeps every record at or after it."""
+
+    def list_names(lo, hi):
+        after = f"{prefix}{max(0, lo - (SEGMENT_MAX_RECORDS - 1)):020d}"
+        return [k[len(prefix):] for k in versions.list_keys(prefix, after, f"{prefix}{hi + 1:020d}")]
+
+    def read(name):
+        return versions.read(f"{prefix}{name}")
+
+    return ChainRecords(list_names, read, report)
+
+
+def parse_s3_location(value):
+    """(bucket, root) of an S3 pack's manifest `bucket`, written as
+    s3://<bucket>/<root>; None for any other value."""
+    m = re.fullmatch(r"s3://([a-z0-9][a-z0-9.\-]{1,61}[a-z0-9])/(.*)", value or "")
+    if not m or (m.group(2) and not m.group(2).endswith("/")):
+        return None
+    return m.group(1), m.group(2)
+
+
 def local_fetcher(records_path, report=print):
     """Return `fetch(seq) -> bytes` that reads chain records from disk, with
     no network and no Google client library — the path an examiner or a
@@ -8866,7 +9360,7 @@ def manifest_storage_layout_error(manifest):
     one only when its chain is segmented), else the message to print
     before exiting 2."""
     version = manifest.get("schema_version")
-    if version != "1.2" and not (version in ("1.3", "1.4", "1.5") and "storage_layout" in manifest):
+    if version != "1.2" and not (version in ("1.3", "1.4", "1.5", "1.6") and "storage_layout" in manifest):
         return None
     layout = manifest.get("storage_layout")
     if layout in STORAGE_LAYOUTS:
@@ -8898,9 +9392,9 @@ def object_reference_problem(entry, holders=None):
 
 def manifest_references_objects(manifest):
     """Whether each manifest entry names the object holding its record: every
-    1.2 manifest, and a 1.3, 1.4 or 1.5 manifest that has a storage_layout."""
+    1.2 manifest, and a 1.3 to 1.6 manifest that has a storage_layout."""
     version = manifest.get('schema_version')
-    return version == '1.2' or (version in ('1.3', '1.4', '1.5') and 'storage_layout' in manifest)
+    return version == '1.2' or (version in ('1.3', '1.4', '1.5', '1.6') and 'storage_layout' in manifest)
 
 
 # The event_id a hash-only stub stands in with, for the decision
@@ -9446,7 +9940,8 @@ class RecordSignatureWalk:
 
 def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=False, holders=None,
                          receipts_out=None, records_out=None, stripped=frozenset(), cannot_evaluate_out=None,
-                         stubs=None, chain_keys=(), signatures_out=None, chain_keys_label=None):
+                         stubs=None, chain_keys=(), signatures_out=None, chain_keys_label=None,
+                         retired_out=None):
     """Walk each event in the manifest, fetch its record through `fetch(seq)`,
     recompute the hash and check the chain linkage. Source-agnostic: `fetch`
     is the only thing that differs between the GCS and the offline path, so
@@ -9484,7 +9979,18 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
     the walk's verdict (`state`: true / false / partial) and the walk itself
     (`walk`), which the gateway evidence-key check reads after the walk.
     `chain_keys_label` names the pinned keys in the SIGNATURES line when they
-    are not the reader's own (the attested keys of --attestation-key)."""
+    are not the reader's own (the attested keys of --attestation-key).
+
+    A manifest 1.6 carries the `retirements` ledger. A gap
+    between two records, or before the first, is then retired when the
+    ledger's receipts of the pack's own store cover it exactly and link from
+    the record before it; the next record links to the last receipt's
+    last_event_hash. Every receipt the ledger names must be a record of this
+    pack that verifies, carries a record_sig checked under the chain's key
+    while that key was in force, and seals exactly what its ledger entry
+    restates; otherwise the pack fails, and a receipt whose signature no key
+    could check is appended to `cannot_evaluate_out` (exit 2). Any other gap
+    fails. `retired_out`, when given, receives the retired spans' summary."""
     stubs = stubs or {}
     sig_walk = RecordSignatureWalk(chain_keys, chain_keys_label)
     hash_version = manifest.get('hash_version', '')
@@ -9518,6 +10024,11 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
     # not checked, never as passed.
     next_link = {genesis}
     prev_seq = None
+    # The manifest 1.6 retirements ledger and the receipts the walk meets.
+    ledger, ledger_problems = retirement_ledger(manifest)
+    store = pack_store(manifest)
+    retired_spans = []
+    receipt_records = {}
 
     def committed_hashes(entry, event_hash=''):
         return {
@@ -9536,6 +10047,10 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
         if not quiet:
             print(line)
 
+    for problem in ledger_problems:
+        report(f"FAIL retirements: {problem}")
+        all_passed = False
+
     # What the decision-receipt checks after the walk read: each
     # record's (event_id, event_hash, event kind) by sequence, and each
     # receipt's payload.
@@ -9549,6 +10064,20 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
         # pack commits to for it.
         link_targets, link_seq = next_link, prev_seq
         next_link, prev_seq = committed_hashes(entry), seq
+        # A gap before this record: retired only under the 1.6 ledger.
+        gap_lo = 0 if link_seq is None else link_seq + 1
+        if ledger is not None and isinstance(seq, int) and seq > gap_lo:
+            spans, link, problem = retired_gap(gap_lo, seq - 1, ledger, store, link_targets)
+            if problem:
+                report(f"FAIL seq={gap_lo}..{seq - 1}: {problem}")
+                all_passed = False
+            else:
+                retired_spans.append((gap_lo, seq - 1, spans))
+                revisions = ', '.join(str(r) for r in sorted({e['policy_revision'] for e in spans}))
+                report(f"RETIRED seq={gap_lo}..{seq - 1}: {seq - gap_lo} record(s) under {len(spans)} sealed "
+                       f"retirement(s) (receipt {', '.join('seq=%d' % e['sequence'] for e in spans)}), policy "
+                       f"revision {revisions}; the receipts are checked after the walk")
+                link_targets = {link}
 
         try:
             raw = fetch(seq)
@@ -9714,13 +10243,32 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             report(f"FAIL seq={seq}: {problem}")
             all_passed = False
             content_ok = False
+        # A v1.27 record's hash covers its retired span; this checks the
+        # members the hash cannot. A rule this verifier does
+        # not know is cannot evaluate, never a pass.
+        retirement_problems, retirement_unknown = check_retention_retirement(event)
+        for problem in retirement_problems:
+            report(f"FAIL seq={seq}: {problem}")
+            all_passed = False
+            content_ok = False
+        for problem in retirement_unknown:
+            report(f"CANNOT EVALUATE seq={seq}: {problem}")
+            if cannot_evaluate_out is not None:
+                cannot_evaluate_out.append((seq, problem))
+        if isinstance(event.get('retention_retirement'), dict):
+            receipt_records[seq] = {'payload': event['retention_retirement'], 'hash': recomputed, 'ok': False,
+                                    'mode': None}
         # The record signature, over the hash just recomputed. A record
         # whose hash or link failed already has its FAIL line.
+        sig_ok = True
         if hash_ok and chain_ok:
             for problem in sig_walk.check(seq, event):
                 report(f"FAIL seq={seq}: {problem}")
                 sig_walk.note_failure(seq, event.get('event_id'), problem)
                 all_passed = False
+                sig_ok = False
+            if seq in receipt_records:
+                receipt_records[seq]['mode'] = sig_walk.mode
         # A manifest 1.2 entry names the object holding its record.
         if references_objects:
             problem = object_reference_problem(entry, holders)
@@ -9768,6 +10316,8 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             all_passed = False
         elif content_ok:
             next_link = {stored_hash}
+            if seq in receipt_records and sig_ok:
+                receipt_records[seq]['ok'] = True
 
     # The signature verdict over the walk.
     sig_problems, sig_lines = sig_walk.finish()
@@ -9776,6 +10326,55 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
     for problem in sig_problems:
         report(f"FAIL signatures: {problem}")
         all_passed = False
+
+    # The retirement receipts the ledger names, now that every signature
+    # is known.
+    if ledger is not None:
+        signed_facts = {f[0]: f for f in sig_walk.facts}
+        named = {e['sequence'] for e in ledger}
+        for seq in sorted(set(receipt_records) - named):
+            report(f"FAIL seq={seq}: the retention.retirement record is not in the manifest's retirements ledger")
+            all_passed = False
+        unchecked = set()
+        for e in ledger:
+            seq, rec = e['sequence'], receipt_records.get(e['sequence'])
+            problem = None
+            if rec is None:
+                problem = ("the pack does not carry the retention.retirement record its ledger names; every pack "
+                           "carries every retirement record of its chain")
+            elif rec['hash'] != e['recomputed_event_hash']:
+                problem = "the ledger's recomputed_event_hash is not the retirement record's hash"
+            elif any(rec['payload'].get(k) != e[k] for k in RETIREMENT_LEDGER_SEALED):
+                differ = [k for k in RETIREMENT_LEDGER_SEALED if rec['payload'].get(k) != e[k]]
+                problem = f"the ledger entry differs from the sealed receipt in {', '.join(differ)}"
+            elif not rec['ok']:
+                problem = "the retirement record did not verify (see above)"
+            elif seq not in signed_facts:
+                problem = ("the retirement record carries no record_sig; a receipt is signed by the gateway "
+                           "evidence key before anything is deleted")
+            elif signed_facts[seq][3] or rec['mode'] not in (None, 'signing'):
+                problem = ("the retirement record was signed while the evidence key was not in force or not "
+                           "attested; such a gateway retires nothing")
+            elif signed_facts[seq][2] is None:
+                unchecked.add(seq)
+                note = ("its record_sig was not checked: no chain_signing_started in this pack and no "
+                        "--chain-signing-key or --attestation-key, so nothing says the gateway sealed it")
+                report(f"CANNOT EVALUATE retirement seq={seq}: {note}")
+                if cannot_evaluate_out is not None:
+                    cannot_evaluate_out.append((seq, f"retirement receipt {note}"))
+            if problem:
+                report(f"FAIL retirement seq={seq}: {problem}")
+                all_passed = False
+        if retired_spans:
+            total = sum(hi - lo + 1 for lo, hi, _ in retired_spans)
+            receipts_used = sum(len(spans) for _, _, spans in retired_spans)
+            revisions = sorted({e['policy_revision'] for _, _, spans in retired_spans for e in spans})
+            report(f"RETIREMENTS: {total} record(s) retired under {receipts_used} sealed retirement(s), policy "
+                   f"revision {', '.join(map(str, revisions))}; the retention policy was not checked")
+            if retired_out is not None:
+                retired_out.update(records=total, receipts=receipts_used, revisions=revisions,
+                                   spans=[(lo, hi) for lo, hi, _ in retired_spans],
+                                   unchecked=sorted(unchecked))
     if signatures_out is not None:
         signatures_out['state'] = sig_walk.state()
         signatures_out['walk'] = sig_walk
@@ -11852,7 +12451,7 @@ class BucketAnchorSource(AnchorSource):
         try:
             blobs = self.client.list_blobs(self.bucket_name, prefix=self.prefix)
             return [b.name[len(self.prefix):] for b in blobs]
-        except Exception as exc:  # Propagate loud — an unlistable bucket cannot be evaluated
+        except Exception as exc:  # Propagate loud: an unlistable bucket cannot be evaluated
             raise AnchorSourceError(f"cannot list gs://{self.bucket_name}/{self.prefix}: {exc}") from exc
 
     def get(self, name):
@@ -11862,6 +12461,28 @@ class BucketAnchorSource(AnchorSource):
             if type(exc).__name__ == "NotFound":
                 return None
             raise AnchorSourceError(f"cannot read gs://{self.bucket_name}/{self.prefix}{name}: {exc}") from exc
+
+
+class S3AnchorSource(AnchorSource):
+    """anchors/{chain}/ under an S3 pack's root, each key's first version."""
+
+    def __init__(self, versions, root, chain):
+        self.versions = versions
+        self.prefix = f"{root}anchors/{chain}/"
+
+    def list_names(self):
+        try:
+            return [k[len(self.prefix):] for k in self.versions.list_keys(self.prefix)]
+        except Exception as exc:  # Propagate loud: an unlistable bucket cannot be evaluated
+            raise AnchorSourceError(f"cannot list s3://{self.versions.bucket}/{self.prefix}: {exc}") from exc
+
+    def get(self, name):
+        try:
+            return self.versions.read(self.prefix + name)
+        except FileNotFoundError:  # no version: "absent" (judged as missing)
+            return None
+        except Exception as exc:  # anything else propagates
+            raise AnchorSourceError(f"cannot read s3://{self.versions.bucket}/{self.prefix}{name}: {exc}") from exc
 
 
 class DirectoryAnchorSource(AnchorSource):
@@ -12357,7 +12978,13 @@ def manifest_claim(manifest):
     if (c_lo, c_hi) != (lo, hi):
         raise ClaimContradiction(f"the manifest claims seq={c_lo}..{c_hi} but covers seq={lo}..{hi}")
     if scope == CLAIM_CHAIN_TO_HEAD and c_lo != 0:
-        raise ClaimContradiction(f"the manifest claims the whole chain up to its head but starts at seq={c_lo}")
+        # A 1.6 pack may start right after the prefix its ledger says was
+        # retired from seq=0; the walk checks the receipts.
+        through = retired_through(manifest)
+        if through is None or c_lo != through + 1:
+            raise ClaimContradiction(f"the manifest claims the whole chain up to its head but starts at seq={c_lo}"
+                                     + ("" if through is None else
+                                        f", and its retirements ledger retired seq=0..{through}"))
     if scope != CLAIM_CHAIN_TO_HEAD and manifest.get("evidence_class") == LOCAL_CHAIN_EVIDENCE_CLASS:
         # A local-chain pack is only ever built from 0 to the head its
         # gateway held. Relabelling it a window would stop a later anchor
@@ -12394,12 +13021,157 @@ def check_claim(manifest):
         print(f"ERROR: {exc}", file=sys.stderr)
         return CANNOT_EVALUATE
     note = "" if stated else " (the manifest predates claims; read from its evidence class)"
-    if scope == CLAIM_CHAIN_TO_HEAD:
+    if scope == CLAIM_CHAIN_TO_HEAD and lo:
+        print(f"CLAIM: chain {chain} from seq={lo} up to its head at seq={hi}, every record before seq={lo} "
+              f"retired under the receipts its retirements ledger names{note}")
+    elif scope == CLAIM_CHAIN_TO_HEAD:
         print(f"CLAIM: the whole chain {chain} from seq=0 up to its head at seq={hi}{note}")
     else:
         print(f"CLAIM: chain {chain}, seq={lo}..{hi}, one window of the chain; records outside it are not "
               f"claimed{note}")
     return PASSED
+
+
+class SourceContradiction(Exception):
+    """A manifest source section that disagrees with the manifest itself."""
+
+
+def _source_object_lock(lock, basis):
+    """Check an S3 source's `object_lock` against its basis. Raises
+    ValueError for a shape this verifier cannot read and SourceContradiction
+    for an observation that disagrees with itself or with the basis."""
+    if (not isinstance(lock, dict) or not {"verdict", "floor_days"} <= set(lock)
+            or not set(lock) <= set(SOURCE_OBJECT_LOCK_FIELDS)):
+        raise ValueError("manifest source object_lock must carry verdict and floor_days, and only mode, "
+                         "default_retention_days and refusals besides")
+    verdict, floor = lock["verdict"], lock["floor_days"]
+    refusals = lock.get("refusals", [])
+    if verdict not in ("compliant", "refused"):
+        raise ValueError(f"manifest source object_lock verdict {verdict!r} is not one this verifier reads "
+                         f"(compliant, refused). Re-run with an updated verifier.")
+    if not _is_count(floor) or floor < 1:
+        raise ValueError("manifest source object_lock floor_days must be a positive integer")
+    if not isinstance(refusals, list) or not all(isinstance(r, str) and r for r in refusals):
+        raise ValueError("manifest source object_lock refusals must be a list of non-empty strings")
+    if (verdict == "compliant") != (basis == "object_lock_compliant"):
+        raise SourceContradiction(f"the Object Lock verdict {verdict} contradicts the immutability basis {basis}")
+    if verdict == "refused":
+        if not refusals:
+            raise SourceContradiction("the Object Lock verdict is refused but names no reason")
+        return
+    if refusals:
+        raise SourceContradiction("the Object Lock verdict is compliant but lists refusals")
+    mode, days = lock.get("mode"), lock.get("default_retention_days")
+    if not isinstance(mode, str) or not _is_count(days):
+        raise ValueError("a compliant manifest source object_lock must state its mode and default retention")
+    if mode != "COMPLIANCE" or days < floor:
+        raise SourceContradiction(f"the Object Lock verdict is compliant but the observation is mode {mode} with "
+                                  f"a default retention of {days} days against a floor of {floor} days")
+
+
+def _source_version_findings(findings):
+    """Check an S3 source's `version_findings`; raises as _source_object_lock."""
+    if not isinstance(findings, dict) or "count" not in findings or not set(findings) <= {"count", "codes"}:
+        raise ValueError("manifest source version_findings must carry count, and only codes besides")
+    count, codes = findings["count"], findings.get("codes", [])
+    if not _is_count(count):
+        raise ValueError("manifest source version_findings count must be a non-negative integer")
+    if not isinstance(codes, list) or len(set(map(str, codes))) != len(codes):
+        raise ValueError("manifest source version_findings codes must be a list of distinct codes")
+    unknown = [c for c in codes if c not in S3_VERSION_FINDING_CODES]
+    if unknown:
+        raise ValueError(f"manifest source version finding code(s) {', '.join(map(repr, unknown))} not read by "
+                         f"this verifier ({', '.join(S3_VERSION_FINDING_CODES)}). Re-run with an updated verifier.")
+    if (count == 0) != (not codes) or len(codes) > count:
+        raise SourceContradiction(f"the version findings count {count} disagrees with their codes {codes}")
+
+
+def manifest_source(manifest):
+    """(store, basis, object_lock, version_findings) of the manifest's
+    `source`, or None when the manifest predates it. Raises ValueError for a
+    section this verifier cannot read and SourceContradiction for one that
+    disagrees with the rest of the manifest."""
+    if "source" not in manifest:
+        return None
+    src = manifest["source"]
+    if not isinstance(src, dict) or set(src) != {"store", "immutability"}:
+        raise ValueError("manifest source must carry exactly store and immutability")
+    store, imm = src["store"], src["immutability"]
+    if store not in SOURCE_STORES:
+        raise ValueError(f"manifest source store {store!r} is not one this verifier reads "
+                         f"({', '.join(SOURCE_STORES)}). Re-run with an updated verifier.")
+    if not isinstance(imm, dict) or "basis" not in imm or not set(imm) <= {"basis", "object_lock", "version_findings"}:
+        raise ValueError("manifest source immutability must carry basis, and only object_lock and "
+                         "version_findings besides")
+    basis = imm["basis"]
+    if basis not in SOURCE_BASES:
+        raise ValueError(f"manifest source immutability basis {basis!r} is not one this verifier reads "
+                         f"({', '.join(SOURCE_BASES)}). Re-run with an updated verifier.")
+    if SOURCE_BASES[basis][0] != store:
+        raise SourceContradiction(f"the source store {store} cannot have the immutability basis {basis}, "
+                                  f"which is {SOURCE_BASES[basis][0]}'s")
+    lock, findings = imm.get("object_lock"), imm.get("version_findings")
+    if store == SOURCE_STORE_S3:
+        if lock is None or findings is None:
+            raise SourceContradiction("an s3_worm source states no Object Lock observation or no version findings")
+        _source_object_lock(lock, basis)
+        _source_version_findings(findings)
+    elif lock is not None or findings is not None:
+        raise SourceContradiction(f"a {store} source carries an S3 Object Lock observation or version findings")
+    local_class = manifest.get("evidence_class") == LOCAL_CHAIN_EVIDENCE_CLASS
+    if store == SOURCE_STORE_LOCAL_CHAIN and not local_class:
+        raise SourceContradiction(f"the records come from a gateway's local chain but the pack does not carry "
+                                  f"the {LOCAL_CHAIN_EVIDENCE_CLASS} evidence class")
+    if local_class and store != SOURCE_STORE_LOCAL_CHAIN:
+        raise SourceContradiction(f"the pack carries the {LOCAL_CHAIN_EVIDENCE_CLASS} evidence class but names "
+                                  f"{store} as its source")
+    return store, basis, lock, findings
+
+
+def check_source(manifest):
+    """Print where the pack's records come from and what its generator
+    observed about that store, and return PASSED, FAILED (the section
+    contradicts the manifest) or CANNOT_EVALUATE (a section this verifier
+    cannot read). A bucket whose lock was not confirmed is a label, not a
+    failure: the records may still be intact."""
+    try:
+        source = manifest_source(manifest)
+    except SourceContradiction as exc:
+        print(f"FAIL source: {exc}")
+        return FAILED
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return CANNOT_EVALUATE
+    if source is None:
+        return PASSED
+    store, basis, lock, findings = source
+    print(f"SOURCE: {store}; {SOURCE_BASES[basis][1]}.")
+    if lock is not None and lock["verdict"] == "compliant":
+        print(f"  Object Lock as the generator read it: mode {lock['mode']}, default retention "
+              f"{lock['default_retention_days']} days (floor {lock['floor_days']}), versioning enabled.")
+    elif lock is not None:
+        print("  The Object Lock configuration the generator read does not meet the requirement, so nothing "
+              "shows these records could not have been changed:")
+        for reason in lock["refusals"]:
+            print(f"    - {reason}")
+    if findings is not None and findings["count"]:
+        print(f"  WARN: {findings['count']} version finding(s) on the chain's keys when the pack was built "
+              f"({', '.join(findings.get('codes', []))}); each key's first version is the record read.")
+    return PASSED
+
+
+def source_suffix(manifest):
+    """The label every verdict line carries for a pack whose readable
+    `source` section names a store other than a GCS bucket, else ''. A GCS
+    pack's verdict reads as it always has: its basis restates what such a
+    pack always meant, and the SOURCE line still names it."""
+    try:
+        source = manifest_source(manifest)
+    except (ValueError, SourceContradiction):
+        return ""
+    if source is None or source[0] == "gcs_worm":
+        return ""
+    return f" [source: {source[0]}, {source[1]}]"
 
 
 def required_coverage_status(manifest, require_through):
@@ -12439,7 +13211,7 @@ def required_coverage_status(manifest, require_through):
 # --receipt FILE writes what the run concluded as a content-free JSON
 # receipt (`meilynx.verification_receipt.v1`, RFC 8785 bytes).
 
-VERIFIER_VERSION = "0.17.0"
+VERIFIER_VERSION = "0.18.0"
 WITNESS_MANIFEST_FORMAT = "meilynx.witness_manifest.v1"
 WITNESS_MANIFEST_NAME = "witness-manifest.json"
 WITNESS_SIGNATURE_DOMAIN = WITNESS_MANIFEST_FORMAT.encode("ascii") + b"\x00"
@@ -13039,12 +13811,13 @@ def manifest_evidence_class_error(manifest):
     evaluated."""
     version = manifest.get("schema_version", "1.0")
     label = manifest.get("evidence_class")
-    # A 1.5 (stripped) pack carries the label when it has one.
-    if version == "1.5" and "evidence_class" not in manifest:
+    # A 1.5 (stripped) or 1.6 (retirements) pack carries the label when it
+    # has one.
+    if version in ("1.5", "1.6") and "evidence_class" not in manifest:
         return None
-    if version not in ("1.4", "1.5"):
+    if version not in ("1.4", "1.5", "1.6"):
         if "evidence_class" in manifest:
-            return f"manifest {version} carries an evidence_class, which only 1.4 and 1.5 define"
+            return f"manifest {version} carries an evidence_class, which only 1.4 to 1.6 define"
         return None
     if label in EVIDENCE_CLASSES:
         return None
@@ -13108,6 +13881,138 @@ def manifest_content_error(manifest):
         return (f"manifest 1.5 removed_fields {removed!r} is not the stripped profile this verifier reads "
                 f"({', '.join(STRIPPED_FIELDS)}). Re-run with an updated verifier.")
     return stubs_problem(manifest)
+
+
+# A manifest 1.6 `retirements` entry: the receipt's own coordinates
+# (`sequence`, `recomputed_event_hash`), then the sealed fields it restates,
+# which must equal the receipt record's retention_retirement payload.
+RETIREMENT_LEDGER_SEALED = ('chain_id', 'store', 'first_sequence', 'last_sequence', 'count',
+                            'first_previous_hash', 'last_event_hash', 'policy_sha256', 'policy_revision')
+RETIREMENT_LEDGER_FIELDS = ('sequence', 'recomputed_event_hash') + RETIREMENT_LEDGER_SEALED
+
+
+def manifest_retirements_error(manifest):
+    """None when the manifest's retirements ledger is where its version says
+    (exactly in 1.6, where it is required), else the message to print before
+    exiting 2. A ledger is never ignored: one on an earlier version cannot be
+    evaluated."""
+    version = manifest.get("schema_version", "1.0")
+    if version != "1.6":
+        if "retirements" in manifest:
+            return f"manifest {version} carries retirements, which only 1.6 defines"
+        return None
+    if not isinstance(manifest.get("retirements"), list):
+        return "manifest 1.6 carries no retirements ledger (a list, empty when nothing was retired)"
+    return None
+
+
+def pack_store(manifest):
+    """The store a pack was read from, as a retirement receipt names it: the
+    manifest's `source` store when it names one, else the gateway's local
+    chain for a local-chain pack and the managed write-once bucket otherwise.
+    A source that contradicts the evidence class fails the pack (check_source)."""
+    source = manifest.get("source")
+    if isinstance(source, dict) and source.get("store") in SOURCE_STORES:
+        return source["store"]
+    return 'local_chain' if manifest.get("evidence_class") == LOCAL_CHAIN_EVIDENCE_CLASS else 'gcs_worm'
+
+
+def retirement_ledger(manifest):
+    """(entries sorted by receipt sequence, problems) for a 1.6 manifest,
+    (None, []) for any other. A problem is a ledger that contradicts itself,
+    which fails the pack: an entry that is not exactly
+    RETIREMENT_LEDGER_FIELDS, a receipt sequence named twice or not after its
+    span, overlapping spans, or a span that contains a retirement receipt (a
+    retirement record is never retired)."""
+    if manifest.get("schema_version") != "1.6" or not isinstance(manifest.get("retirements"), list):
+        return None, []
+    problems, entries = [], []
+    for i, entry in enumerate(manifest["retirements"]):
+        if not isinstance(entry, dict) or set(entry) != set(RETIREMENT_LEDGER_FIELDS):
+            problems.append(f"retirements[{i}] is not exactly {', '.join(RETIREMENT_LEDGER_FIELDS)}")
+            continue
+        counts = [entry[k] for k in ('sequence', 'first_sequence', 'last_sequence', 'count', 'policy_revision')]
+        if not all(_is_count(v) for v in counts):
+            problems.append(f"retirements[{i}] carries a sequence, count or revision that is not an unsigned integer")
+            continue
+        if not all(isinstance(entry[k], str) and _RR_HEX64.match(entry[k])
+                   for k in ('recomputed_event_hash', 'first_previous_hash', 'last_event_hash', 'policy_sha256')):
+            problems.append(f"retirements[{i}] carries a hash that is not 64 lowercase hex characters")
+            continue
+        if entry['store'] not in RETENTION_RETIREMENT_STORES or not isinstance(entry['chain_id'], str):
+            problems.append(f"retirements[{i}] names no chain or a store this verifier does not know")
+            continue
+        if entry['last_sequence'] < entry['first_sequence'] or \
+                entry['count'] != entry['last_sequence'] - entry['first_sequence'] + 1:
+            problems.append(f"retirements[{i}] count is not last_sequence - first_sequence + 1")
+            continue
+        if entry['sequence'] <= entry['last_sequence']:
+            problems.append(f"retirements[{i}] names a receipt at seq={entry['sequence']} that is not after its span")
+            continue
+        entries.append(entry)
+    entries.sort(key=lambda e: e['sequence'])
+    receipt_seqs = [e['sequence'] for e in entries]
+    if len(set(receipt_seqs)) != len(receipt_seqs):
+        problems.append("the retirements ledger names one receipt sequence twice")
+    spans = sorted((e['first_sequence'], e['last_sequence'], e['sequence']) for e in entries)
+    for (lo, hi, r), (lo2, hi2, r2) in zip(spans, spans[1:]):
+        if lo2 <= hi:
+            problems.append(f"the retired spans seq={lo}..{hi} (receipt seq={r}) and seq={lo2}..{hi2} "
+                            f"(receipt seq={r2}) overlap")
+    for lo, hi, r in spans:
+        inside = [s for s in receipt_seqs if lo <= s <= hi]
+        if inside:
+            problems.append(f"the retired span seq={lo}..{hi} (receipt seq={r}) contains the retirement receipt "
+                            f"at seq={inside[0]}; a retirement record is never retired")
+    return entries, problems
+
+
+def retired_through(manifest):
+    """The last sequence of the prefix a 1.6 manifest's ledger says was
+    retired from seq=0 in the pack's own store, by consecutive spans; None
+    when it names no such prefix. The walk checks that the receipts hold it."""
+    entries, _ = retirement_ledger(manifest)
+    if not entries:
+        return None
+    store = pack_store(manifest)
+    by_first = {e['first_sequence']: e for e in entries if e['store'] == store}
+    pos = 0
+    while pos in by_first:
+        pos = by_first[pos]['last_sequence'] + 1
+    return pos - 1 if pos > 0 else None
+
+
+def retired_gap(lo, hi, entries, store, link_targets):
+    """Whether the gap seq=lo..hi is covered exactly by consecutive ledger
+    receipts of `store` whose links chain from `link_targets`. Returns
+    (spans, link, problem): on success the ledger entries in order, the
+    link the next record must make (the last span's last_event_hash) and
+    None; else ([], None, the reason)."""
+    by_first = {e['first_sequence']: e for e in entries}
+    spans, pos = [], lo
+    while pos <= hi:
+        e = by_first.get(pos)
+        if e is None or e['last_sequence'] > hi:
+            break
+        spans.append(e)
+        pos = e['last_sequence'] + 1
+    count = hi - lo + 1
+    if pos != hi + 1 or not spans:
+        return [], None, (f"{count} record(s) missing and no sealed retirement covers them exactly "
+                          f"(the gap is not a retired span)")
+    foreign = [e for e in spans if e['store'] != store]
+    if foreign:
+        e = foreign[0]
+        return [], None, (f"{count} record(s) missing; the retirement receipt at seq={e['sequence']} retired the "
+                          f"{e['store']} store, and only a receipt of this pack's store ({store}) covers a gap")
+    if link_targets and spans[0]['first_previous_hash'] not in link_targets:
+        return [], None, (f"{count} record(s) missing; the retirement receipt at seq={spans[0]['sequence']} "
+                          f"links from {spans[0]['first_previous_hash'][:16]}..., not from the record before the gap")
+    for a, b in zip(spans, spans[1:]):
+        if b['first_previous_hash'] != a['last_event_hash']:
+            return [], None, (f"{count} record(s) missing; the retirement receipt at seq={b['sequence']} does not "
+                              f"link to the one at seq={a['sequence']}")
+    return spans, spans[-1]['last_event_hash'], None
 
 
 def pack_is_stripped(manifest):
@@ -17929,6 +18834,316 @@ def _ed25519_self_test_keypair(seed):
     return public, sign
 
 
+# The v1.27 retention.retirement known-answer vector. Paired with
+# tests/fixtures/retention-retirement/v1_27_vector.json, which the proxy's
+# preimage must reproduce once it seals the record;
+# neither side may drift on its own.
+RETENTION_RETIREMENT_VECTOR = dict(
+    schema_version='v1.27', event_kind='retention_retirement', source='proxy',
+    event_id='evt-retirement-fixture', request_id='', timestamp_utc='2026-06-01T00:00:05Z',
+    model_requested='', action='allow', input_tokens=0, output_tokens=0,
+    retention_retirement=dict(
+        run_id='3f1c2b7a-9d4e-4c1a-8b6f-2e5d7a9c0b13', run_started_at='2026-06-01T00:00:00Z',
+        chain_id='proxy', store='local_chain', first_sequence=0, last_sequence=4, count=5,
+        oldest_occurred_at='2026-01-01T00:00:00Z', newest_occurred_at='2026-01-01T00:00:04Z',
+        first_previous_hash='0' * 64, last_event_hash='ab' * 32,
+        policy_sha256='cd' * 32, policy_revision=1, retention_rule='monotone',
+        retention_applied_days=30, hold_ids=['hold-a', 'hold-b'], gcs=None,
+    ),
+)
+RETENTION_RETIREMENT_VECTOR_SEQUENCE = 10
+RETENTION_RETIREMENT_VECTOR_PREVIOUS_HASH = 'ef' * 32
+RETENTION_RETIREMENT_VECTOR_HASH = 'd039c2d7a2df11f3e078666611f77dfa09a3d9fa1f975c644d09675eb4160055'
+
+
+def retirement_self_test():
+    """Retirement receipts and the manifest 1.6 ledger:
+    the v1.27 preimage against its known-answer vector, then a signed local
+    chain whose prefix was retired, walked with one receipt, two, a split
+    around an earlier receipt, and records still present after sealing; and
+    each way a gap or a receipt must not pass: uncovered, another store,
+    unsigned, a ledger that differs, a tampered receipt, a signature no key
+    checks, an unknown rule, a receipt inside its own retention, and a
+    manifest an older verifier cannot read."""
+    import contextlib
+    import io
+    import subprocess
+    import tempfile
+    ok = True
+
+    def check(label, passed, what, detail=''):
+        nonlocal ok
+        if passed:
+            print(f'SELF-TEST assertion {label} PASS: {what}')
+        else:
+            print(f'SELF-TEST assertion {label} FAIL: {what} {detail}', file=sys.stderr)
+            ok = False
+
+    # 44a — the preimage against the pinned vector; every member is bound,
+    # and the payload is refused outside the v1.27 bucket.
+    vector = json.loads(json.dumps(RETENTION_RETIREMENT_VECTOR))
+    vseq, vprev = RETENTION_RETIREMENT_VECTOR_SEQUENCE, RETENTION_RETIREMENT_VECTOR_PREVIOUS_HASH
+    vhash = recompute_event_hash(vector, vseq, vprev)
+    bound = True
+    for name, kind in RETENTION_RETIREMENT_FEED:
+        edited = json.loads(json.dumps(vector))
+        value = edited['retention_retirement'][name]
+        if kind == 'u64':
+            value = value + 1
+        elif kind == 'strs':
+            value = value + ['hold-c']
+        elif kind == 'str':
+            value = value + 'x'
+        else:
+            value = {'anchors_retired': 0, 'captures_retired': 0, 'capture_list_sha256': '00' * 32}
+        edited['retention_retirement'][name] = value
+        try:
+            bound = bound and recompute_event_hash(edited, vseq, vprev) != vhash
+        except ValueError:
+            bound = False
+    misplaced = json.loads(json.dumps(vector))
+    misplaced['schema_version'] = 'v1.26'
+    try:
+        recompute_event_hash(misplaced, vseq, vprev)
+        refused = False
+    except ValueError:
+        refused = True
+    check('44a', vhash == RETENTION_RETIREMENT_VECTOR_HASH and bound and refused,
+          'the v1.27 retention.retirement preimage matches its known-answer vector, binds every member, and the '
+          'payload is refused outside the v1.27 bucket', vhash)
+
+    # The chain: a signing boundary at 0, records dated New Year 2026 before
+    # seq 10 and June after, every record signed by one key the reader pins.
+    public, sign = _ed25519_self_test_keypair(b'\x2a' * 32)
+
+    def boundary_meta(pub):
+        return json.dumps({'algorithm': 'ed25519', 'public_key': pub.hex(),
+                           'public_key_fingerprint': chain_key_fingerprint(pub)}, sort_keys=True)
+
+    def build(n, receipts, unsigned=()):
+        """`receipts` maps a sequence to (first, last, store, extra) for a
+        receipt sealed there; every other record is an llm_request."""
+        records, prev, hashes = [], genesis_hash(), {}
+        for seq in range(n):
+            if seq in receipts:
+                first, last, rstore, extra = receipts[seq]
+                payload = dict(
+                    run_id=f'3f1c2b7a-9d4e-4c1a-8b6f-2e5d7a9c0b{seq:02d}', run_started_at='2026-06-01T00:00:00Z',
+                    chain_id='proxy', store=rstore, first_sequence=first, last_sequence=last,
+                    count=last - first + 1, oldest_occurred_at=f'2026-01-01T00:00:{first:02d}Z',
+                    newest_occurred_at=f'2026-01-01T00:00:{last:02d}Z',
+                    first_previous_hash=hashes.get(first - 1, genesis_hash()), last_event_hash=hashes[last],
+                    policy_sha256='cd' * 32, policy_revision=1, retention_rule='monotone',
+                    retention_applied_days=30, hold_ids=[],
+                    gcs=({'anchors_retired': 0, 'captures_retired': 0, 'capture_list_sha256': '00' * 32}
+                         if rstore == 'gcs_worm' else None))
+                payload.update(extra)
+                r = {'schema_version': 'v1.27', 'event_kind': 'retention_retirement', 'source': 'proxy',
+                     'event_id': f'evt-{seq}', 'request_id': '', 'timestamp_utc': f'2026-06-01T00:00:{seq:02d}Z',
+                     'model_requested': '', 'action': 'allow', 'input_tokens': 0, 'output_tokens': 0,
+                     'retention_retirement': payload}
+            else:
+                when = f'2026-01-01T00:00:{seq:02d}Z' if seq < 10 else f'2026-06-01T00:00:{seq:02d}Z'
+                r = {'schema_version': 'v1.1', 'source': 'proxy', 'event_id': f'evt-{seq}', 'request_id': f'req-{seq}',
+                     'timestamp_utc': when, 'model_requested': 'gpt-6-luna', 'action': 'allow',
+                     'input_tokens': 1, 'output_tokens': 2}
+                if seq == 0:
+                    r.update(schema_version='v1.3', event_kind='admin_action', model_requested='',
+                             admin_action={'action_type': CHAIN_SIGNING_STARTED, 'actor': 'system:self-test',
+                                           'description': 'boundary', 'metadata_json': boundary_meta(public)})
+            r['sequence_number'], r['previous_hash'] = seq, prev
+            r['event_hash'] = recompute_event_hash(r, seq, prev)
+            if seq not in unsigned:
+                r['record_sig'] = sign(record_sig_message('proxy', seq, r['event_hash'])).hex()
+            prev = hashes[seq] = r['event_hash']
+            records.append(r)
+        return records
+
+    def ledger_of(records, overrides=None):
+        out = []
+        for r in records:
+            p = r.get('retention_retirement')
+            if isinstance(p, dict):
+                entry = {'sequence': r['sequence_number'], 'recomputed_event_hash': r['event_hash']}
+                entry.update({k: p[k] for k in RETIREMENT_LEDGER_SEALED})
+                entry.update((overrides or {}).get(r['sequence_number'], {}))
+                out.append(entry)
+        return out
+
+    def pack(records, present, ledger=None):
+        kept = [r for r in records if r['sequence_number'] in present]
+        lo, hi = kept[0]['sequence_number'], kept[-1]['sequence_number']
+        return kept, {
+            'schema_version': '1.6', 'window': 'A', 'signing_deferred': True, 'hash_version': 'v1',
+            'hash_algorithm': 'SHA-256', 'prefix': 'audit/proxy/',
+            'evidence_class': LOCAL_CHAIN_EVIDENCE_CLASS, 'from_sequence': lo, 'to_sequence': hi,
+            'anchoring': {'state': 'unanchored', 'chains': [{
+                'chain': chain_for_prefix('audit/proxy/'), 'reason': 'no_anchors_found', 'anchored_through_seq': None,
+                'unanchored_tail': {'from_seq': lo, 'to_seq': hi}, 'anchors': [], 'seals': []}]},
+            'claim': {'scope': CLAIM_CHAIN_TO_HEAD, 'from_sequence': lo, 'to_sequence': hi},
+            'retirements': ledger_of(records) if ledger is None else ledger,
+            'events': [{'sequence': r['sequence_number'], 'recomputed_event_hash': r['event_hash']} for r in kept]}
+
+    def write(tmp, kept):
+        d = Path(tmp) / 'records'
+        d.mkdir()
+        for r in kept:
+            (d / record_file_name(r['sequence_number'])).write_bytes(json.dumps(r).encode('utf-8'))
+        return d
+
+    def walk(kept, manifest, keys=(public,)):
+        out, cannot, retired = io.StringIO(), [], {}
+        with tempfile.TemporaryDirectory() as tmp:
+            d = write(tmp, kept)
+            with contextlib.redirect_stdout(out):
+                passed = verify_manifest_with(local_fetcher(d), manifest, chain_keys=list(keys),
+                                              cannot_evaluate_out=cannot, retired_out=retired)
+        return passed, out.getvalue().splitlines(), cannot, retired
+
+    def has(lines, text):
+        return any(text in line for line in lines)
+
+    # 44b — one receipt (seq 10) retired 0..9; the pack starts at 10.
+    one = build(13, {10: (0, 9, 'local_chain', {})})
+    kept, manifest = pack(one, range(10, 13))
+    passed, lines, cannot, retired = walk(kept, manifest)
+    claim = manifest_claim(manifest)
+    check('44b', passed and not cannot and retired.get('records') == 10 and retired.get('receipts') == 1
+          and has(lines, 'RETIRED seq=0..9: 10 record(s) under 1 sealed retirement(s) (receipt seq=10)')
+          and has(lines, 'RETIREMENTS: 10 record(s) retired under 1 sealed retirement(s), policy revision 1')
+          and claim[:3] == (CLAIM_CHAIN_TO_HEAD, 10, 12) and retired_through(manifest) == 9,
+          'a local-chain pack from retired_through+1 verifies, its prefix read as retired under one receipt and '
+          'its chain_to_head claim accepted', f'{passed} {cannot} {lines}')
+
+    # 44c — two receipts (11 and 12) retired 0..4 and 5..9: one gap, two spans.
+    two = build(14, {11: (0, 4, 'local_chain', {}), 12: (5, 9, 'local_chain', {})})
+    kept, manifest = pack(two, [10, 11, 12, 13])
+    passed, lines, cannot, retired = walk(kept, manifest)
+    check('44c', passed and not cannot and retired.get('receipts') == 2 and retired.get('spans') == [(0, 9)]
+          and has(lines, 'RETIRED seq=0..9: 10 record(s) under 2 sealed retirement(s) (receipt seq=11, seq=12)'),
+          'a gap covered exactly by two consecutive receipts verifies as retired', f'{passed} {lines}')
+
+    # 44d — a split: receipt 5 retired 0..4 and stays; receipt 10 retired
+    # 6..9 on the far side of it. Two gaps, one receipt each.
+    split = build(12, {5: (0, 4, 'local_chain', {}), 10: (6, 9, 'local_chain', {})})
+    kept, manifest = pack(split, [5, 10, 11])
+    passed, lines, cannot, retired = walk(kept, manifest)
+    check('44d', passed and not cannot and retired.get('spans') == [(0, 4), (6, 9)]
+          and has(lines, 'RETIRED seq=0..4') and has(lines, 'RETIRED seq=6..9'),
+          'a run that reaches an earlier receipt seals one receipt per side, and each gap verifies as retired',
+          f'{passed} {lines}')
+
+    # 44e — sealed before delete: every record is still in the pack.
+    kept, manifest = pack(one, range(0, 13))
+    passed, lines, cannot, retired = walk(kept, manifest)
+    check('44e', passed and not cannot and not retired and not has(lines, 'RETIRED'),
+          'a receipt whose span is still present (sealed, not yet deleted) verifies, and nothing reads as retired',
+          f'{passed} {lines}')
+
+    # 44f — an uncovered gap: an empty ledger, and one naming only part of it.
+    kept, manifest = pack(one, range(10, 13), ledger=[])
+    passed, lines, _, _ = walk(kept, manifest)
+    try:
+        manifest_claim(manifest)
+        contradicted = False
+    except ClaimContradiction:
+        contradicted = True
+    kept2, partial = pack(two, [10, 11, 12, 13], ledger=ledger_of(two)[1:])
+    passed2, lines2, _, _ = walk(kept2, partial)
+    check('44f', not passed and contradicted
+          and has(lines, 'FAIL seq=0..9: 10 record(s) missing and no sealed retirement covers them exactly')
+          and not passed2 and has(lines2, 'FAIL seq=0..9'),
+          'a gap no receipt covers exactly fails, and a chain_to_head claim cannot start after it',
+          f'{lines} {lines2}')
+
+    # 44g — a receipt of another store (the local buffer) never covers a gap.
+    foreign = build(13, {10: (0, 9, 'local_buffer', {})})
+    kept, manifest = pack(foreign, range(10, 13))
+    passed, lines, _, _ = walk(kept, manifest)
+    check('44g', not passed and has(lines, "retired the local_buffer store, and only a receipt of this pack's "
+                                           "store (local_chain) covers a gap"),
+          'a receipt of another store does not cover a gap', f'{lines}')
+
+    # 44h — an unsigned receipt, and a ledger entry that differs from its receipt.
+    unsigned = build(13, {10: (0, 9, 'local_chain', {})}, unsigned={10, 11, 12})
+    kept, manifest = pack(unsigned, range(10, 13))
+    passed, lines, _, _ = walk(kept, manifest)
+    kept2, differing = pack(one, range(10, 13), ledger=ledger_of(one, {10: {'policy_revision': 2}}))
+    passed2, lines2, _, _ = walk(kept2, differing)
+    check('44h', not passed and has(lines, 'FAIL retirement seq=10: the retirement record carries no record_sig')
+          and not passed2 and has(lines2, 'the ledger entry differs from the sealed receipt in policy_revision'),
+          'an unsigned receipt fails, and so does a ledger entry that differs from the receipt it restates',
+          f'{lines} {lines2}')
+
+    # 44i — a receipt edited after sealing (its span shrunk to 1..9).
+    tampered = build(13, {10: (0, 9, 'local_chain', {})})
+    payload = dict(tampered[10]['retention_retirement'], first_sequence=1, count=9)
+    tampered[10] = dict(tampered[10], retention_retirement=payload)
+    kept, manifest = pack(tampered, range(10, 13), ledger=ledger_of(one))
+    passed, lines, _, _ = walk(kept, manifest)
+    check('44i', not passed and has(lines, 'FAIL seq=10') and has(lines, 'FAIL retirement seq=10'),
+          'a receipt edited after sealing fails its hash, and the span it claimed is not credited', f'{lines}')
+
+    # 44j — no key checks the receipt: the boundary was retired and the
+    # reader pinned none. Cannot evaluate, never a pass.
+    kept, manifest = pack(one, range(10, 13))
+    passed, lines, cannot, retired = walk(kept, manifest, keys=())
+    check('44j', passed and cannot and retired.get('unchecked') == [10]
+          and has(lines, 'CANNOT EVALUATE retirement seq=10: its record_sig was not checked'),
+          'a receipt whose signature no key can check is cannot evaluate', f'{passed} {cannot} {lines}')
+
+    # 44k — a retention rule this verifier does not know is cannot
+    # evaluate; a receipt inside the retention it states fails.
+    unknown = build(13, {10: (0, 9, 'local_chain', {'retention_rule': 'two_person_future'})})
+    kept, manifest = pack(unknown, range(10, 13))
+    passed, lines, cannot, _ = walk(kept, manifest)
+    young = build(13, {10: (0, 9, 'local_chain', {'retention_applied_days': 365})})
+    kept2, manifest2 = pack(young, range(10, 13))
+    passed2, lines2, _, _ = walk(kept2, manifest2)
+    check('44k', passed and any('two_person_future' in p for _, p in cannot)
+          and not passed2 and has(lines2, 'retires a record younger than the retention it states'),
+          'an unknown retention rule is cannot evaluate, and a receipt inside its own retention fails',
+          f'{cannot} {lines2}')
+
+    # 44l — the command line: exit 0 on the retired pack (never saying
+    # complete), 1 on the uncovered gap, 2 with no key, 2 for a ledger on a
+    # 1.4 manifest, and 2 from a verifier that does not read 1.6.
+    def cli(kept, manifest, *extra):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = write(tmp, kept)
+            (Path(tmp) / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+            run = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--manifest',
+                                  str(Path(tmp) / 'manifest.json'), '--records', str(d), '--allow-unsigned', *extra],
+                                 capture_output=True, text=True)
+            return run.returncode, run.stdout + run.stderr
+
+    kept, manifest = pack(one, range(10, 13))
+    key = ['--chain-signing-key', public.hex()]
+    code_ok, out_ok = cli(kept, manifest, *key)
+    code_gap, _ = cli(kept, dict(manifest, retirements=[]), *key)
+    code_nokey, _ = cli(kept, manifest)
+    code_old, out_old = cli(kept, dict(manifest, schema_version='1.4'), *key)
+    saved = SUPPORTED_MANIFEST_SCHEMA_VERSIONS
+    globals()['SUPPORTED_MANIFEST_SCHEMA_VERSIONS'] = tuple(v for v in saved if v != '1.6')
+    try:
+        older = manifest_schema_version_error(manifest)
+    finally:
+        globals()['SUPPORTED_MANIFEST_SCHEMA_VERSIONS'] = saved
+    check('44l', code_ok == EXIT_OK and '10 earlier record(s) retired under 1 sealed retirement(s) under policy '
+                                        'revision 1 (retired, policy not checked)' in out_ok
+          and not any(l.startswith('OK:') and 'complete' in l.lower() for l in out_ok.splitlines())
+          and code_gap == EXIT_FAIL and code_nokey == EXIT_CANNOT_EVALUATE
+          and code_old == EXIT_CANNOT_EVALUATE and 'carries retirements, which only 1.6 defines' in out_old
+          and older is not None and "'1.6' is not one this verifier supports" in older,
+          'the command line exits 0 on a retired prefix and never says complete, 1 on an uncovered gap, 2 when '
+          'no key checks the receipt, and 2 for a ledger an older manifest version or verifier cannot read',
+          f'{code_ok} {code_gap} {code_nokey} {code_old} {older} {out_ok[-1500:]}')
+
+    check('44m', 'retention-retirement-v1' in VERIFIER_CAPABILITIES,
+          'VERIFIER_CAPABILITIES advertises retention-retirement-v1')
+    return ok
+
+
 def record_signature_self_test():
     """Record signatures: the Ed25519 primitive, the key and message pinned
     with the Rust signer, and the walk over signed chains (an unsigned
@@ -18793,12 +20008,239 @@ def witness_self_test():
     return ok
 
 
+def pack_source_self_test():
+    """The manifest `source` section and the S3 reader: each store's
+    section reads and names its store; an unknown store, basis or shape is
+    cannot evaluate; a section that contradicts itself or the manifest fails;
+    an unconfirmed Object Lock is a label, not a failure; the S3 reader reads
+    each key's first version (the earliest, and among equal times the one
+    listed last) across pages and reports later versions and delete markers;
+    a chain read through it verifies, and a GCS or S3 online read of a pack
+    from another store cannot be evaluated."""
+    import contextlib
+    import io
+    import subprocess
+    import tempfile
+    ok = True
+
+    def check(label, passed, what, detail=''):
+        nonlocal ok
+        if passed:
+            print(f'SELF-TEST assertion {label} PASS: {what}')
+        else:
+            print(f'SELF-TEST assertion {label} FAIL: {what} {detail}', file=sys.stderr)
+            ok = False
+
+    def quietly(fn, *a):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            result = fn(*a)
+        return result, out.getvalue()
+
+    compliant = {'verdict': 'compliant', 'mode': 'COMPLIANCE', 'default_retention_days': 2555, 'floor_days': 2555}
+    refused = {'verdict': 'refused', 'floor_days': 2555,
+               'refusals': ['the default retention mode is GOVERNANCE, not COMPLIANCE']}
+    none_found = {'count': 0}
+
+    def s3(basis, lock, findings=none_found):
+        return {'store': 's3_worm', 'immutability': {'basis': basis, 'object_lock': lock,
+                                                     'version_findings': findings}}
+
+    def manifest(source, local=False):
+        m = {'prefix': 'audit/self-test/'}
+        if source is not None:
+            m['source'] = source
+        if local:
+            m['evidence_class'] = LOCAL_CHAIN_EVIDENCE_CLASS
+        return m
+
+    gcs = {'store': 'gcs_worm', 'immutability': {'basis': 'not_read_by_generator'}}
+    local = {'store': 'local_chain', 'immutability': {'basis': 'not_write_once'}}
+    good = [(manifest(gcs), 'gcs_worm'), (manifest(local, local=True), 'local_chain'),
+            (manifest(s3('object_lock_compliant', compliant)), 's3_worm'),
+            (manifest(s3('object_lock_not_confirmed', refused,
+                         {'count': 2, 'codes': ['s3_delete_marker', 's3_extra_version']})), 's3_worm')]
+    check('45a', all(manifest_source(m)[0] == store and pack_store(m) == store for m, store in good)
+          and manifest_source(manifest(None)) is None and pack_store(manifest(None)) == 'gcs_worm'
+          and pack_store(manifest(None, local=True)) == 'local_chain'
+          and all(quietly(check_source, m)[0] == PASSED for m, _ in good),
+          "each store's source section reads and names the store a retirement receipt is judged against; a "
+          "manifest without one reads as before")
+
+    unreadable = [
+        {'store': 'azure_blob', 'immutability': {'basis': 'not_read_by_generator'}},
+        {'store': 'gcs_worm', 'immutability': {'basis': 'immutable'}},
+        {'store': 'gcs_worm'},
+        {'store': 'gcs_worm', 'immutability': {'basis': 'not_read_by_generator'}, 'extra': 1},
+        {'store': 'gcs_worm', 'immutability': {'basis': 'not_read_by_generator', 'note': 'x'}},
+        s3('object_lock_compliant', dict(compliant, verdict='partial')),
+        s3('object_lock_compliant', dict(compliant, floor_days=0)),
+        s3('object_lock_compliant', {'verdict': 'compliant', 'floor_days': 1}),
+        s3('object_lock_compliant', compliant, {'count': 1, 'codes': ['s3_rewritten']}),
+        s3('object_lock_compliant', compliant, {'count': -1}),
+        'gcs_worm',
+    ]
+    results = [quietly(check_source, manifest(src))[0] for src in unreadable]
+    check('45b', all(r == CANNOT_EVALUATE for r in results),
+          "an unknown store, basis, verdict or finding code, or a section of another shape, cannot be evaluated",
+          results)
+
+    contradictions = [
+        (manifest({'store': 'gcs_worm', 'immutability': {'basis': 'object_lock_compliant'}}), 'basis'),
+        (manifest(local), 'local-chain-not-write-once'),
+        (manifest(gcs, local=True), 'evidence class but names gcs_worm'),
+        (manifest(s3('object_lock_compliant', dict(compliant, refusals=['x']))), 'lists refusals'),
+        (manifest(s3('object_lock_not_confirmed', dict(refused, refusals=[]))), 'names no reason'),
+        (manifest(s3('object_lock_compliant', refused)), 'contradicts the immutability basis'),
+        (manifest(s3('object_lock_not_confirmed', compliant)), 'contradicts the immutability basis'),
+        (manifest(s3('object_lock_compliant', dict(compliant, mode='GOVERNANCE'))), 'mode GOVERNANCE'),
+        (manifest(s3('object_lock_compliant', dict(compliant, default_retention_days=30))), '30 days'),
+        (manifest(s3('object_lock_compliant', compliant, {'count': 2})), 'disagrees with their codes'),
+        (manifest(s3('object_lock_compliant', compliant, {'count': 0, 'codes': ['s3_extra_version']})),
+         'disagrees with their codes'),
+        (manifest({'store': 's3_worm', 'immutability': {'basis': 'object_lock_compliant'}}), 'no Object Lock'),
+        (manifest({'store': 'gcs_worm', 'immutability': {'basis': 'not_read_by_generator',
+                                                         'object_lock': compliant}}), 'carries an S3'),
+    ]
+    failed = []
+    for m, words in contradictions:
+        status, out = quietly(check_source, m)
+        if status != FAILED or words not in out or 'FAIL source:' not in out:
+            failed.append((m.get('source'), status, out))
+    check('45c', not failed,
+          "a section that contradicts itself or the manifest fails: a basis of another store, a local chain without "
+          "its evidence class or that class on another store, an Object Lock verdict at odds with its basis, its "
+          "refusals or its own mode and retention, and findings whose count and codes disagree", failed)
+
+    status, out = quietly(check_source, manifest(s3('object_lock_not_confirmed', refused,
+                                                     {'count': 1, 'codes': ['s3_extra_version']})))
+    check('45d', status == PASSED and 'NOT CONFIRMED IMMUTABLE' in out and 'GOVERNANCE, not COMPLIANCE' in out
+          and 'WARN: 1 version finding(s)' in out
+          and source_suffix(manifest(s3('object_lock_not_confirmed', refused))) ==
+          ' [source: s3_worm, object_lock_not_confirmed]'
+          and source_suffix(manifest({'store': 'x'})) == '' and source_suffix(manifest(None)) == ''
+          and source_suffix(manifest(gcs)) == '',
+          "an Object Lock the generator could not confirm is a label on every verdict, with its reasons and the "
+          "version findings, never a failure; a GCS pack's verdict reads as it always has", out)
+
+    # A three-record chain under an S3 root, as the gateway writes it.
+    genesis = genesis_hash()
+    events = []
+    for seq in range(3):
+        event = {'schema_version': 'v1', 'sequence_number': seq, 'timestamp_utc': f'2026-01-01T00:00:0{seq}+00:00',
+                 'event_id': f'evt-{seq}', 'request_id': f'req-{seq}', 'model_requested': 'gpt-4.1-mini',
+                 'action': 'allow', 'input_tokens': 11, 'output_tokens': 7, 'total_tokens': 18,
+                 'cache_creation_input_tokens': None, 'cache_read_input_tokens': None, 'cached_input_tokens': None,
+                 'reasoning_tokens': None, 'estimated_cost_usd': 0.000123, 'policy_reason': None,
+                 'previous_hash': events[-1]['event_hash'] if events else genesis}
+        event['event_hash'] = recompute_event_hash(event, seq, event['previous_hash'])
+        events.append(event)
+    raw = [json.dumps(e, separators=(',', ':')).encode('utf-8') for e in events]
+    tampered = raw[1].replace(b'"input_tokens":11', b'"input_tokens":12')
+    root, prefix = 'gw/', 'audit/self-test/'
+
+    class StubS3:
+        """list_object_versions in S3's order (keys ascending, newest
+        version first) in pages of three entries, and get_object by
+        version."""
+
+        def __init__(self, entries):
+            # (key, version id, last modified, body, or None for a delete
+            # marker), oldest first per key.
+            order = sorted(range(len(entries)), key=lambda i: (entries[i][0], -i))
+            self.entries = [entries[i] for i in order]
+
+        def list_object_versions(self, Bucket, Prefix, Delimiter=None, KeyMarker=None, VersionIdMarker=None):
+            items = [e for e in self.entries if e[0].startswith(Prefix)]
+            if KeyMarker and VersionIdMarker:
+                at = next(i for i, e in enumerate(items) if (e[0], e[1]) == (KeyMarker, VersionIdMarker))
+                items = items[at + 1:]
+            elif KeyMarker:
+                items = [e for e in items if e[0] > KeyMarker]
+            page, rest = items[:3], items[3:]
+            out = {'Versions': [{'Key': k, 'VersionId': v, 'LastModified': t} for k, v, t, b in page if b is not None],
+                   'DeleteMarkers': [{'Key': k, 'VersionId': v} for k, v, t, b in page if b is None],
+                   'IsTruncated': bool(rest)}
+            if rest:
+                out['NextKeyMarker'], out['NextVersionIdMarker'] = page[-1][0], page[-1][1]
+            return out
+
+        def get_object(self, Bucket, Key, VersionId):
+            body = next(b for k, v, t, b in self.entries if (k, v) == (Key, VersionId))
+            return {'Body': io.BytesIO(body)}
+
+    def key(seq):
+        return f"{root}{prefix}{seq:020d}.bin"
+
+    entries = [(key(0), 'v0', 10, raw[0]), (key(1), 'v1', 10, raw[1]), (key(1), 'v1b', 20, tampered),
+               (key(1), 'm1', 30, None), (key(2), 'v2', 15, raw[2]), (key(2), 'v2a', 15, tampered),
+               (key(3), 'm3', 40, None), (f"{root}{prefix}nested/{0:020d}.bin", 'n0', 5, raw[0])]
+    lines = []
+    versions = S3FirstVersions(StubS3(entries), 'evidence', report=lines.append)
+    listed = versions.list_keys(f"{root}{prefix}")
+    check('45e', listed == [key(0), key(1), key(2)] and versions.read(key(1)) == raw[1]
+          and versions.read(key(2)) == raw[2]
+          and any('s3_extra_version' in l and key(1) in l for l in lines)
+          and any('s3_delete_marker' in l and key(1) in l for l in lines)
+          and any('s3_key_without_version' in l and key(3) in l for l in lines)
+          and S3FirstVersions(StubS3(entries), 'evidence', report=lines.append).read(key(2)) == raw[2],
+          "the S3 reader reads each key's first version across pages (the earliest, and among equal times the one "
+          "listed last), skips nested keys and a key with only delete markers, and reports later versions and "
+          "delete markers", (listed, lines))
+
+    walk_manifest = {'hash_version': 'v1', 'prefix': prefix, 'schema_version': '1.0',
+                     'events': [{'sequence': n, 'recomputed_event_hash': e['event_hash']} for n, e in enumerate(events)]}
+
+    def walk(stub_entries):
+        reader = S3FirstVersions(StubS3(stub_entries), 'evidence', report=lambda _: None)
+        return quietly(verify_manifest_with, s3_fetcher(reader, f"{root}{prefix}", report=lambda _: None),
+                       walk_manifest, True)[0]
+
+    first_tampered = [(key(0), 'v0', 10, raw[0]), (key(1), 'v1', 10, tampered), (key(1), 'v1b', 20, raw[1]),
+                      (key(2), 'v2', 15, raw[2])]
+    check('45f', walk(entries) and not walk(first_tampered),
+          "a chain read through the S3 reader verifies though later versions and a delete marker sit on its keys, "
+          "and a first version that was changed fails, whatever is written after it")
+
+    check('45g', parse_s3_location('s3://evidence-bucket/gw/') == ('evidence-bucket', 'gw/')
+          and parse_s3_location('s3://evidence-bucket/') == ('evidence-bucket', '')
+          and parse_s3_location('s3://evidence-bucket/gw') is None
+          and parse_s3_location('local-chain:pxy_a') is None and parse_s3_location(None) is None
+          and 'pack-source-v1' in VERIFIER_CAPABILITIES,
+          "an S3 pack's bucket reads as s3://<bucket>/<root>, and pack-source-v1 is advertised")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        refusals = []
+        for source, flag in ((s3('object_lock_compliant', compliant), ['--bucket', 'some-gcs-bucket']),
+                             (local, ['--s3-bucket', 'some-s3-bucket']), (gcs, ['--s3-bucket', 'some-s3-bucket'])):
+            path = Path(tmp) / 'manifest.json'
+            m = dict(walk_manifest, source=source, bucket='s3://some-s3-bucket/')
+            if source is local:
+                m.update(schema_version='1.4', evidence_class=LOCAL_CHAIN_EVIDENCE_CLASS)
+            path.write_text(json.dumps(m), encoding='utf-8')
+            run = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--manifest', str(path)] + flag,
+                                 capture_output=True, text=True)
+            refusals.append((run.returncode, 'records were read from' in run.stderr, run.stderr[-300:]))
+    check('45h', all(code == EXIT_CANNOT_EVALUATE and said for code, said, _ in refusals),
+          "an online read of a pack from another store is refused before any bucket is read (exit 2)", refusals)
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Meilynx Integrity Pack reproducer — independently verifies GCS WORM audit chain.'
+        description='Meilynx Integrity Pack reproducer: independently verifies an audit chain read from a GCS '
+                    'or S3 write-once bucket or a gateway local chain.'
     )
     source = parser.add_mutually_exclusive_group()
     source.add_argument('--bucket', help='GCS bucket name (no gs:// prefix) — online mode')
+    source.add_argument(
+        '--s3-bucket',
+        help=(
+            'S3 bucket name: online mode for a pack whose source is s3_worm. Each key is read at its first '
+            'version; later versions and delete markers are reported. Needs boto3 and '
+            's3:ListBucketVersions plus s3:GetObjectVersion.'
+        ),
+    )
     source.add_argument(
         '--records',
         help=(
@@ -18808,6 +20250,13 @@ def main():
         ),
     )
     parser.add_argument('--manifest', help='Path to manifest.json')
+    parser.add_argument(
+        '--s3-root',
+        help=("With --s3-bucket: the key prefix the gateway's objects sit under (empty, or ending in /). "
+              "Defaults to the root the manifest's s3:// bucket names."),
+    )
+    parser.add_argument('--s3-region', help='With --s3-bucket: the bucket region (else the AWS default chain).')
+    parser.add_argument('--s3-endpoint', help='With --s3-bucket: an S3-compatible endpoint URL.')
     parser.add_argument(
         '--gateway-key',
         '--chain-signing-key',
@@ -19001,10 +20450,16 @@ def main():
         ok = record_signature_self_test() and ok
         ok = gateway_evidence_key_self_test() and ok
         ok = witness_self_test() and ok
+        ok = retirement_self_test() and ok
+        ok = pack_source_self_test() and ok
         sys.exit(0 if ok else 1)
 
-    if not (args.bucket or args.records) or not args.manifest:
-        parser.error("--manifest plus one of --bucket / --records is required (or use --self-test)")
+    if not (args.bucket or args.records or args.s3_bucket) or not args.manifest:
+        parser.error("--manifest plus one of --bucket / --s3-bucket / --records is required (or use --self-test)")
+    if (args.s3_root or args.s3_region or args.s3_endpoint) and not args.s3_bucket:
+        parser.error("--s3-root, --s3-region and --s3-endpoint need --s3-bucket")
+    if args.s3_root and not args.s3_root.endswith('/'):
+        parser.error("--s3-root must end in /")
     try:
         chain_keys = [parse_gateway_key(k) for k in args.gateway_key]
     except (OSError, ValueError, binascii.Error) as exc:
@@ -19081,7 +20536,8 @@ def main():
         print("ERROR: manifest is not a JSON object", file=sys.stderr)
         sys.exit(EXIT_FAIL)
     version_error = (manifest_schema_version_error(manifest) or manifest_storage_layout_error(manifest)
-                     or manifest_evidence_class_error(manifest) or manifest_content_error(manifest))
+                     or manifest_evidence_class_error(manifest) or manifest_content_error(manifest)
+                     or manifest_retirements_error(manifest))
     if version_error:
         print(f"ERROR: {version_error}", file=sys.stderr)
         finish(EXIT_CANNOT_EVALUATE)
@@ -19090,16 +20546,28 @@ def main():
     # What the pack claims to hold; anchors are judged against it.
     claim_status = check_claim(manifest)
     claim_status = combine_with_anchor_status(claim_status, required_coverage_status(manifest, args.require_through))
+    # Where the records come from and what the generator observed about
+    # that store; on every verdict line.
+    source_status = check_source(manifest)
     # A stripped Exchange pack says so before the records and on
     # every verdict line, and is verified from its own records only.
-    label = evidence_class_suffix(manifest) + content_suffix(manifest)
+    label = evidence_class_suffix(manifest) + source_suffix(manifest) + content_suffix(manifest)
     for line in content_lines(manifest):
         print(line)
     stripped = frozenset(STRIPPED_FIELDS) if pack_is_stripped(manifest) else frozenset()
-    if stripped and args.bucket:
+    if stripped and (args.bucket or args.s3_bucket):
         print("ERROR: this pack's records are content-stripped (manifest 1.5); --bucket would read the holder's "
               "full records, which are not what the manifest describes. Verify the pack's own records with "
               "--records.", file=sys.stderr)
+        finish(EXIT_CANNOT_EVALUATE)
+    # An online read goes to the store the pack names: a GCS bucket is never
+    # read for an S3 or local-chain pack, nor an S3 bucket for any other.
+    named_store = pack_store(manifest)
+    if (args.bucket and named_store != SOURCE_STORE_GCS) or (args.s3_bucket and named_store != SOURCE_STORE_S3):
+        reads = '--bucket reads a GCS bucket' if args.bucket else '--s3-bucket reads an S3 bucket'
+        other = ", or its bucket with --s3-bucket" if named_store == SOURCE_STORE_S3 else ""
+        print(f"ERROR: this pack's records were read from {named_store}; {reads}. Verify the pack's own records "
+              f"with --records{other}.", file=sys.stderr)
         finish(EXIT_CANNOT_EVALUATE)
     try:
         tsa_roots = load_tsa_roots(args.tsa_root)
@@ -19130,6 +20598,27 @@ def main():
         anchor_source = DirectoryAnchorSource(anchors_dir) if Path(args.records).is_dir() else None
         holders = None
         control_plane_fetch = control_plane_local_fetcher(args.records)
+    elif args.s3_bucket:
+        try:
+            import boto3
+        except ImportError:
+            print("ERROR: boto3 not installed. Run: pip install boto3 (or verify offline with --records).",
+                  file=sys.stderr)
+            sys.exit(1)
+        named = parse_s3_location(manifest.get('bucket'))
+        root = args.s3_root if args.s3_root is not None else (
+            named[1] if named and named[0] == args.s3_bucket else '')
+        client_options = {k: v for k, v in (('region_name', args.s3_region), ('endpoint_url', args.s3_endpoint)) if v}
+        versions = S3FirstVersions(boto3.client('s3', **client_options), args.s3_bucket)
+        print(f"Online verification: s3://{args.s3_bucket}/{root}, each key at its first version")
+        fetch = s3_fetcher(versions, f"{root}{manifest.get('prefix', 'audit/')}")
+        fetch.expect(*manifest_sequence_window(manifest))
+        holders = fetch.holders
+        anchor_chain = chain_for_prefix(manifest.get('prefix', 'audit/'))
+        anchor_source = S3AnchorSource(versions, root, anchor_chain) if anchor_chain else None
+
+        def control_plane_fetch(seq):
+            return versions.read(f"{root}{CONTROL_PLANE_PREFIX}{control_plane_record_name(seq)}")
     else:
         try:
             from google.cloud import storage as gcs
@@ -19160,6 +20649,7 @@ def main():
     hash_version = manifest.get('hash_version', '')
     pack_full_records = {}
     control_plane_records = {}
+    retired = {}
     evidence_status = None
     gateway_verdict = None
     records_dir = Path(args.records) if args.records and Path(args.records).is_dir() else None
@@ -19179,7 +20669,7 @@ def main():
                                       receipts_out=receipts, records_out=pack_full_records,
                                       stripped=stripped, cannot_evaluate_out=stripped_problems,
                                       stubs=manifest_stubs(manifest), chain_keys=evidence_keys.walk_keys(),
-                                      signatures_out=signatures,
+                                      signatures_out=signatures, retired_out=retired,
                                       chain_keys_label=('the keys the attestations name'
                                                         if evidence_keys.mode == 'attested' else None))
         # The gateway evidence key: attestations, evidence-key seals, signed
@@ -19222,12 +20712,19 @@ def main():
     # The verdict counts the hash-only stubs it linked through.
     stub_count = len(manifest_stubs(manifest))
     stubbed = (f", {stub_count} of them as hash-only stubs (linked, hash not recomputed)" if stub_count else "")
+    # A pack with retired spans names them on every verdict; it never says
+    # the chain is complete.
+    if retired:
+        stubbed += (f"; {retired['records']} earlier record(s) retired under {retired['receipts']} sealed "
+                    f"retirement(s) under policy revision {', '.join(map(str, retired['revisions']))} "
+                    f"(retired, policy not checked)")
     # The gateway evidence-key verdict (attestations, seals, signed heads)
     # combines with the chain's by the same precedence.
     witness_status = witness_outcome.status if witness_outcome is not None else (
         CANNOT_EVALUATE if args.witness else PASSED)
     code = final_exit_code(combine_with_anchor_status(combine_with_anchor_status(
-        combine_with_anchor_status(combine_with_anchor_status(chain_status, claim_status), anchor_status),
+        combine_with_anchor_status(combine_with_anchor_status(combine_with_anchor_status(chain_status, claim_status),
+                                                              source_status), anchor_status),
         evidence_status or PASSED), witness_status), signature_status, bool(args.allow_unsigned))
     # The OCSF export beside the pack. Its verdict
     # combines with the pack's by the same precedence (1 > 2 > 4 > 3 > 0).
@@ -19289,6 +20786,9 @@ def main():
             print(f"\nFAIL: chain-head anchor verification failed (see above).{label}", file=sys.stderr)
         if claim_status == FAILED:
             print(f"\nFAIL: the manifest's claim contradicts the manifest (see above).{label}", file=sys.stderr)
+        if source_status == FAILED:
+            print(f"\nFAIL: the manifest's source section contradicts the manifest (see above).{label}",
+                  file=sys.stderr)
         if signature_status == FAILED:
             print(f"\nFAIL: the manifest signature did not verify (see above).{label}", file=sys.stderr)
         if evidence_status == FAILED:

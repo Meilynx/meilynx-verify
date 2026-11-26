@@ -674,7 +674,7 @@ def verdict_v2_cases(root):
     write_case(out, local_manifest(base, head), {"runs": [
         {"args": ["--allow-unsigned"], "exit": 1, "contains": [
             f"FAIL seq=1: verdict receipt {receipts[1]}: a v1.21 record stores a judgment_verdict.v2 form, "
-            "which only a v1.22 record carries"]},
+            "which only a later record carries"]},
     ]})
 
 

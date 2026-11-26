@@ -5,14 +5,15 @@ enough that a verifier can be written from it without reading Meilynx code.
 `verify-pack.py` in this repository is one such verifier; its `--self-test`
 pins the values below against fixture hashes.
 
-Status: describes chain records with `schema_version` v1 through v1.26, the
+Status: describes chain records with `schema_version` v1 through v1.28, the
 per-record and segment storage layouts, pack manifest `schema_version` 1.0
-through 1.5, the control-plane chain a 1.3 manifest carries, the per-tenant
+through 1.6, the control-plane chain a 1.3 manifest carries, the per-tenant
 pack signature, the local-chain evidence class (§6.5), the manifest's
-coverage claim (§6.7) and list of evidence modes (§6.8), the export copy a
-pack can be checked against (§9), the customer-conditions verdict (§10),
-record signatures (§11) and the gateway evidence key (§12), as read by
-`verify-pack.py` from meilynx-proxy commit `e786536` (2026-11-24). A chain written before the
+coverage claim (§6.7) and list of evidence modes (§6.8), the retirements
+ledger of a 1.6 manifest (§6.11) and the manifest's source section (§6.12),
+the export copy a pack can be checked against (§9), the customer-conditions
+verdict (§10), record signatures (§11) and the gateway evidence key (§12), as
+read by `verify-pack.py` from meilynx-proxy commit `5be3dace` (2026-11-26). A chain written before the
 segment rollout is per-record, and its packs carry manifest 1.0 or 1.1.
 
 ## 1. Records
@@ -100,8 +101,8 @@ Every record carries at least these fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.26"`). Absent means `"v1"`. |
-| `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`, `decision_receipt`, `compliance_record`, `judgment_verdict`, `control_probe_run`, `provenance_verification`). Absent means `llm_request`. |
+| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.28"`). Absent means `"v1"`. |
+| `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`, `decision_receipt`, `compliance_record`, `judgment_verdict`, `control_probe_run`, `provenance_verification`, `retention_retirement`). Absent means `llm_request`. |
 | `sequence_number` | integer | Position in the chain, starting at 0. |
 | `timestamp_utc` | string | RFC 3339 UTC timestamp, nanosecond precision, `Z` suffix. |
 | `event_id` | string | Unique id of this record. |
@@ -118,7 +119,7 @@ Every record carries at least these fields:
 Kind-specific payloads live under `admin_action`, `auth_session`,
 `mcp_event`, `coverage`, `coverage_key_inventory`, `decision_receipt`,
 `compliance_record`, `judgment_verdict`, `control_probe_run`,
-`provenance_verification`, `join_context`, `content`,
+`provenance_verification`, `retention_retirement`, `join_context`, `content`,
 `identity`, `evaluation_trace` and `customer`.
 LLM records also carry
 `messages`, `response_text`, `findings`, `policy_version`,
@@ -225,6 +226,7 @@ wire names differ from the serde `event_kind` values stored in the JSON:
 | `judgment_verdict` | `judgment.verdict` |
 | `control_probe_run` | `control_probe.run` |
 | `provenance_verification` | `provenance.verification` |
+| `retention_retirement` | `retention.retirement` |
 
 ### 4.3 Per-version suffixes
 
@@ -583,7 +585,7 @@ digit; *hex* is 1 to 128 hex digits):
 | `pack` | `{ "version": unsigned integer or null, "sha256": hex }`, closed |
 | `verdict` | `PASS`, `FLAG` or `INDETERMINATE` |
 | `source` | `judge`, `floor` or `none` |
-| `reason_code` | one of `ok`, `clause_violated`, `floor_match`, `abstained`, `input_missing`, `budget_exceeded`, `backend_timeout`, `backend_unavailable`, `backend_error`, `malformed_answer`, `backlog_dropped`, `no_backend_configured`, `no_validated_backend`, `pack_unavailable`, `floor_unavailable`, `floor_triggered_unanswered`, `raw_input_not_permitted`; on v1.24 only, `pacing_limited` |
+| `reason_code` | one of `ok`, `clause_violated`, `floor_match`, `abstained`, `input_missing`, `budget_exceeded`, `backend_timeout`, `backend_unavailable`, `backend_error`, `malformed_answer`, `backlog_dropped`, `no_backend_configured`, `no_validated_backend`, `pack_unavailable`, `floor_unavailable`, `floor_triggered_unanswered`, `raw_input_not_permitted`; on v1.24, v1.26 and v1.28 only, `pacing_limited` |
 | `enforceable` | boolean |
 | `questions` | a list of closed objects `{ "id": code, "clause_sha256": hex, "outcome": PASS, FLAG or INDETERMINATE, "p", "p_pass", "flag_at", "pass_at": number or null }` |
 | `execution` | `gateway` or `pool` |
@@ -711,8 +713,8 @@ knows seventeen codes refuses the version instead of reading the new code as
 tampering. The receipt has one shape: `verdict` `INDETERMINATE`, `source`
 `none`, `execution` `gateway` and `backend` `null`. `timing` is the rule's
 configured timing, so it can be either value. A `pacing_limited` receipt on
-any other version, a v1.24 receipt with any other reason code, and a v1.24
-stamp on any other kind fail verification.
+any version other than v1.24, v1.26 or v1.28, a v1.24 receipt with any other
+reason code, and a v1.24 stamp on any other kind fail verification.
 
 What a v1.24 receipt does not show: that pacing was the cause, or that the
 configured rate was the one in force; only that the gateway recorded the
@@ -866,12 +868,104 @@ is withheld under the capture policy or the range names no whole-character
 slice, and a receipt whose `reason_text_withheld` is true keeps no passage.
 The local part stays bound by `local_sha256`, so a changed passage fails
 verification. A v2 local part on a v1.26 receipt, a v3 local part on any
-other version, and a v1.26 stamp on any other kind fail verification.
+version other than v1.26 or v1.28, and a v1.26 stamp on any other kind fail
+verification.
 
 What a v1.26 receipt does not show: that the passage is where the range
 points in the original turn, because the judge's copy of the turn is not
 kept; only that the passage the gateway recorded has not changed since, and
 fits the range it names.
+
+**v1.27 `retention.retirement`**: a new kind with a bucket of its own. From
+`retention_retirement`, after the kind attestation: `run_id`,
+`run_started_at`, `chain_id`, `store` (length-prefixed strings, §3),
+`first_sequence`, `last_sequence`, `count` (u64), `oldest_occurred_at`,
+`newest_occurred_at`, `first_previous_hash`, `last_event_hash`,
+`policy_sha256` (length-prefixed strings), `policy_revision` (u64),
+`retention_rule` (length-prefixed string), `retention_applied_days` (u64),
+`hold_ids` (the number of ids as a u64, then each id as a length-prefixed
+string), then `gcs`: `0x00` when it is null, else `0x01` followed by
+`anchors_retired`, `captures_retired` (u64) and `capture_list_sha256`
+(length-prefixed string). 33 fields, counting `gcs` as one. Every member is
+hashed and nothing rides beside it. The payload holds exactly these
+seventeen members, and `gcs`, when it is not null, exactly its three; a
+member that is missing, extra or of another type fails verification. A
+`retention_retirement` payload on any other version or kind, a v1.27 record
+of another kind or without the payload, and one that also carries another
+kind's payload or an LLM field fail. v1.27 holds no other kind.
+
+A retirement receipt records one contiguous span of one chain,
+`first_sequence` through `last_sequence`, that the gateway retired under a
+signed retention policy, sealed and signed (§11) before any record of the
+span is deleted. It is content free: sequences, times, hashes, the policy's
+digest (`policy_sha256`) and revision, the rule applied, the retention it
+states in days, and the ids of the holds that ended the span (`hold_ids`).
+`first_previous_hash` is the `previous_hash` of the span's first record and
+`last_event_hash` the `event_hash` of its last. `store` names the store the
+span was pruned from: `local_chain` (a gateway's local chain),
+`local_buffer` (the local buffer of a gateway with a write-once store) or
+`gcs_worm` (a GCS write-once bucket). `gcs`, present exactly on a `gcs_worm`
+receipt, counts the anchors and captures retired with the span and carries
+the digest of the capture list.
+
+The verifier checks, at the record, that:
+
+- `run_id` is a UUID;
+- `run_started_at`, `oldest_occurred_at` and `newest_occurred_at` are RFC
+  3339 timestamps in UTC (`Z` or a zero offset), `newest_occurred_at` is not
+  before `oldest_occurred_at`, and the record's own `timestamp_utc` is not
+  before `run_started_at`;
+- `chain_id` is the chain the record is sealed on (the chain its `source`
+  names: `proxy`, absent included, is `proxy`, `shadow_browser` is
+  `shadow` and `coverage` is `coverage`);
+- `store` is `local_chain`, `local_buffer` or `gcs_worm`, and `gcs` is
+  present exactly on a `gcs_worm` receipt, its counts unsigned integers and
+  its digest 64 lowercase hex;
+- `count` is `last_sequence` − `first_sequence` + 1 (a retired span is one
+  contiguous prefix), and the record's own sequence is after
+  `last_sequence`;
+- `first_previous_hash`, `last_event_hash` and `policy_sha256` are 64
+  lowercase hex, and `policy_revision` and `retention_applied_days` are 1
+  or more;
+- `newest_occurred_at` plus `retention_applied_days` days is not after
+  `run_started_at`: the receipt retires no record younger than the
+  retention it states;
+- `hold_ids` is a sorted list of distinct ids, each 1 to 64 characters from
+  `A-Za-z0-9_-` starting with a letter or digit.
+
+A broken check fails verification at that record. `retention_rule` names
+the rule the gateway applied; this verifier reads `monotone`, and any other
+rule is cannot evaluate (exit 2), never a pass. In a pack whose manifest is
+not 1.6, a receipt is checked as a record and nothing more: no missing range
+reads as retired. In a 1.6 pack the receipt is what lets a missing range
+verify as retired, under the checks of §6.11.
+
+What a retirement receipt does not show: that the retention policy allowed
+the retirement. The policy is named by its digest and revision only; the
+pack does not hold it, and the verifier does not check it, the rule it names
+or the holds. The `gcs` counts and capture-list digest are checked for their
+form only. A receipt shows that the gateway sealed a statement of the span
+it retired, and that the statement has not changed since.
+
+**v1.28 `judgment.verdict`**: the v1.22 record and preimage, unchanged, with
+every v1.22 check and the eighteen reason codes of v1.24 (`pacing_limited`
+included). A gateway that names the judged turn's verified agent stamps
+v1.28 on every receipt. The uploaded form is then `judgment_verdict.v3`: the
+closed `judgment_verdict.v2` form, its keys, values and cross-field rules,
+with `schema` `"judgment_verdict.v3"` and one more key, `agent_id`, always
+present: the registered agent the judged turn's verified credential resolved
+to, as a code, or `null` when the turn had no verified agent. The form stays
+bound by `uploaded_sha256`, so a changed agent fails verification. The local
+part is checked by its own `schema`: a `judgment_verdict_local.v3` part
+under the v1.26 rules, any other under the `judgment_verdict_local.v2`
+rules. A v3 form on any other version, a v2 form on v1.28, a v3 form without
+`agent_id`, a v2 form that carries one, an `agent_id` that is neither a code
+nor `null`, and a v1.28 stamp on any other kind fail verification.
+
+What a v1.28 receipt does not show: that the agent it names is the one that
+made the judged turn. The verifier checks that `agent_id` is a code or null
+and has not changed since; it does not compare it with the sealed identity
+of the judged record (§4.5).
 
 MCP kinds are: `mcp.tool_call`, `mcp.policy_decision`, `mcp.tool_result`,
 `mcp.tools_list.served`, `mcp.error`, `mcp.catalog_drift`. Any MCP hasher
@@ -888,8 +982,8 @@ asserted-claims digest (§4.5), for v1.16, v1.18, v1.19 and v1.25 records the
 evaluation outcome digest, for v1.15 records the evidence-set digest (§4.3),
 for v1.18, v1.19 and v1.25 records the customer label digest (§4.6), for v1.20
 records the stored-record, file-content and findings digests (§4.3), and for
-v1.21, v1.22 and v1.24 records the digests of the uploaded form and the local
-part, for v1.23 records the digests of the probe sets and the case results, and
+v1.21, v1.22, v1.24, v1.26 and v1.28 records the digests of the uploaded form
+and the local part, for v1.23 records the digests of the probe sets and the case results, and
 for v1.25 `llm_request` records the context provenance digest (§4.3).
 
 ### 4.4 LLM content attestation (v1.10, v1.11, v1.12, v1.16, v1.18, v1.19, v1.25)
@@ -1037,12 +1131,12 @@ useful for a from-scratch implementation:
 
 ## 6. Pack manifest
 
-`manifest.json` (schema_version `"1.0"` through `"1.5"`) describes one
+`manifest.json` (schema_version `"1.0"` through `"1.6"`) describes one
 verification window of one chain:
 
 ```json
 {
-  "schema_version": "1.0" | "1.1" | "1.2" | "1.3" | "1.4" | "1.5",
+  "schema_version": "1.0" | "1.1" | "1.2" | "1.3" | "1.4" | "1.5" | "1.6",
   "pack_id": "<uuid>",
   "window": "A" | "B",
   "signing_deferred": true | false,
@@ -1068,12 +1162,14 @@ verification window of one chain:
   "signature": { … present on window B only … },
   "anchoring": { … present on 1.1 and later, §6.1 … },
   "storage_layout": "per-record" | "segmented-v1",   … present on 1.2; on 1.3 and later when the chain is segmented, §6.2 …
-  "control_plane": { … present on 1.3; on 1.4 and 1.5 when the pack carries that chain, §6.3 … },
+  "control_plane": { … present on 1.3; on 1.4 to 1.6 when the pack carries that chain, §6.3 … },
   "decision_receipts": [ … present when the pack holds decision receipts, §6.4 … ],
-  "evidence_class": "<label>",                        … present on 1.4; optional on 1.5, §6.5 …
+  "evidence_class": "<label>",                        … present on 1.4; optional on 1.5 and 1.6, §6.5 …
   "content": "stripped",                              … present on 1.5 only, §6.6 …
   "removed_fields": [ … ],                            … present on 1.5 only, §6.6 …
   "stubs": [ … ],                                     … optional on 1.5 only, §6.6 …
+  "retirements": [ … ],                               … present on 1.6 only, §6.11 …
+  "source": { … },                                    … optional, §6.12 …
   "events": [
     {
       "sequence": 0,
@@ -1257,7 +1353,7 @@ the 1.2 manifest's exact bytes as before (§7).
 a bucket with a 1.1 manifest, it finds no `{seq}.bin` object and reports
 every record missing (exit 1). It never passes such a chain.
 
-On 1.3, 1.4 and 1.5, `storage_layout` and `events[].object` are present
+On 1.3 to 1.6, `storage_layout` and `events[].object` are present
 exactly when the chain is segmented, and are read as on 1.2; a per-record
 chain carries neither.
 
@@ -1266,8 +1362,8 @@ chain carries neither.
 A manifest with `schema_version` 1.3 carries a `control_plane` section
 describing a second chain in the same bucket: the control plane's record of
 the human actions a governance decision involved (a held call released,
-denied or expired; a review disposition; a condition set accepted). A 1.4 or
-1.5 manifest carries the section when the pack holds that chain; a 1.0, 1.1
+denied or expired; a review disposition; a condition set accepted). A 1.4,
+1.5 or 1.6 manifest carries the section when the pack holds that chain; a 1.0, 1.1
 or 1.2 manifest that carries one fails verification, as does a 1.3 manifest
 without one.
 
@@ -1343,7 +1439,7 @@ entry and `RECEIPTS INDEX OK`.
 
 A 1.4 manifest is a 1.3 manifest with a required `evidence_class` label
 inside the manifest, covered by its signature when the pack is signed, saying what kind of evidence the pack holds; a 1.5
-manifest carries it when it has one. The label must be one the verifier
+or 1.6 manifest carries it when it has one. The label must be one the verifier
 reads:
 
 | Label | Meaning |
@@ -1364,7 +1460,8 @@ signature, `bucket` set to `local-chain:<gateway id>`), the records under
 record under `records/anchors/` (§6.1). The pack always starts at sequence 0
 and runs to the head the generator read, and its manifest says so with a
 `chain_to_head` claim (§6.7). A chain whose first records the gateway's
-retention removed is not packed.
+retention removed is not packed, except as a 1.6 pack whose retirements
+ledger covers them (§6.11).
 
 What such a pack can show: that each record's hash recomputes and links to
 the record before it, and, where an anchor verifies, that the chain head at
@@ -1413,8 +1510,8 @@ names only sequences in `events[]`.
 
 | Finding | Verdict |
 |---|---|
-| `content` is not `stripped`, `removed_fields` is not exactly the set above, `stubs` is malformed or names an unknown reason, or any of the three keys appears on a 1.0 to 1.4 manifest | Cannot evaluate (exit 2) |
-| The pack is read with `--bucket` | Cannot evaluate (exit 2): the bucket holds the full records, which are not what the manifest describes |
+| `content` is not `stripped`, `removed_fields` is not exactly the set above, `stubs` is malformed or names an unknown reason, or any of the three keys appears on a manifest other than 1.5 | Cannot evaluate (exit 2) |
+| The pack is read with `--bucket` or `--s3-bucket` | Cannot evaluate (exit 2): the bucket holds the full records, which are not what the manifest describes |
 | A record (or stub) still carries a removed field, or a non-null `auth_session.user_email` | Cannot evaluate (exit 2) at that sequence, after the walk; a chain failure outranks it |
 | A stub holds a member other than the four, lacks one, names another sequence, or its `event_hash` differs from the entry's `stored_event_hash` or `recomputed_event_hash` (on a signed pack the entry must carry `recomputed_event_hash`) | Fail (exit 1) at that sequence |
 | A stub's `previous_hash` does not link to the record before it, or the record after it does not link to the stub's `event_hash` | Fail (exit 1): chain break |
@@ -1453,7 +1550,7 @@ claim:` with the reason when the claim contradicts the manifest.
 | Finding | Verdict |
 |---|---|
 | An explicit claim whose bounds differ from `from_sequence` and `to_sequence` | Fail (exit 1) |
-| An explicit `chain_to_head` claim with `from_sequence` other than 0 | Fail (exit 1) |
+| An explicit `chain_to_head` claim with `from_sequence` other than 0, unless the manifest is 1.6 and `from_sequence` is one past the prefix its retirements ledger retired from sequence 0 (§6.11) | Fail (exit 1) |
 | A `local-chain-not-write-once` pack that claims `interval` | Fail (exit 1): relabelling such a pack as a window would stop a later anchor from being judged |
 | An unknown scope, missing or extra keys, or a bound that is not a non-negative integer | Cannot evaluate (exit 2) |
 | `chain_to_head`, and a verified anchor that the manifest does not list, found next to the records, names this chain at a sequence N after the pack's last record | Coverage not established (exit 4) |
@@ -1670,6 +1767,200 @@ verifier on the same pack and witness file gives the same receipt apart from
 manifest (not for a usage error or an unreadable manifest or records
 directory). Only exit 0 is a pass.
 
+### 6.11 Retirements ledger (manifest 1.6)
+
+A 1.6 manifest has the 1.4 fields as in 1.4, `evidence_class` optional, and a
+required `retirements` ledger: a list, empty when nothing was retired, with
+one entry per `retention.retirement` record (§4.3, v1.27) of the pack's
+chain, each restating that record's sealed span:
+
+```json
+"retirements": [
+  {"sequence": 10, "recomputed_event_hash": "<hex>",
+   "chain_id": "proxy", "store": "local_chain",
+   "first_sequence": 0, "last_sequence": 9, "count": 10,
+   "first_previous_hash": "<hex>", "last_event_hash": "<hex>",
+   "policy_sha256": "<hex>", "policy_revision": 1}
+]
+```
+
+`sequence` and `recomputed_event_hash` are the receipt record's own
+coordinates. The other nine members must equal the same members of its
+`retention_retirement` payload. A `retirements` key on any other manifest
+version, or a 1.6 manifest whose `retirements` is not a list, is cannot
+evaluate (exit 2): a ledger is never ignored.
+
+The ledger fails the pack (exit 1, `FAIL retirements: …`) when it
+contradicts itself: an entry that does not hold exactly these eleven
+members; a sequence, count or revision that is not an unsigned integer; a
+hash that is not 64 lowercase hex; a store other than `local_chain`,
+`local_buffer` or `gcs_worm`, or a `chain_id` that is not a string; a
+`count` other than `last_sequence` − `first_sequence` + 1; a receipt
+`sequence` that is not after its span; one receipt sequence named twice; two
+spans that overlap; or a span that contains a receipt the ledger names (a
+retirement record is never retired).
+
+**A retired range.** In a 1.6 pack, a range of sequences the manifest's
+`events` do not list, before its first record (from sequence 0) or between
+two listed records, verifies as retired only when ledger entries whose
+`store` is the pack's store cover it exactly, one after another: the first
+starts at the range's first sequence, each next one starts right after the
+one before it ends, and the last ends at the range's last sequence. The
+first entry's `first_previous_hash` must be the hash of the record before
+the range (the genesis hash for a range from 0), each later entry's
+`first_previous_hash` must be the `last_event_hash` of the entry before it,
+and the record after the range must link to the last entry's
+`last_event_hash`. The verifier prints `RETIRED seq=A..B: N record(s) under
+K sealed retirement(s) (receipt seq=…), policy revision R; the receipts are
+checked after the walk`. Any other missing range fails: `FAIL seq=A..B: N
+record(s) missing and no sealed retirement covers them exactly`, or the
+reason a covering receipt does not count.
+
+The pack's store is the `source` store its manifest names (§6.12), else
+`local_chain` for a `local-chain-not-write-once` pack and `gcs_worm`
+otherwise. A `local_buffer` receipt never covers a range, and no receipt
+store names an S3 bucket, so this verifier reads no range of an `s3_worm`
+pack as retired.
+
+**The receipts.** After the walk, every receipt the ledger names is checked.
+The pack fails (exit 1, `FAIL retirement seq=N: …`) when:
+
+- the pack does not carry the receipt record: every pack carries every
+  retirement record of its chain;
+- the receipt record's hash is not the entry's `recomputed_event_hash`, or
+  the entry differs from the receipt in any of the nine restated members;
+- the receipt record did not verify (its hash, link, the checks of §4.3, or
+  its record signature, §11);
+- it carries no `record_sig`: a receipt is signed by the gateway evidence key
+  before anything is deleted;
+- it was signed while the evidence key was not in force, after
+  `evidence_key_signing_stopped` or while the key was lost (§12): such a
+  gateway retires nothing.
+
+A `retention.retirement` record in the pack that the ledger does not name
+also fails. A receipt whose signature no key could check (no
+`chain_signing_started` in the pack, and neither `--chain-signing-key` nor
+`--attestation-key`) is cannot evaluate (exit 2): `CANNOT EVALUATE
+retirement seq=N: its record_sig was not checked …`. A retention rule this
+verifier does not read is cannot evaluate too (§4.3). Failures outrank both.
+
+**Verdict.** A pack with retired ranges prints `RETIREMENTS: N record(s)
+retired under K sealed retirement(s), policy revision R; the retention
+policy was not checked`, and its verdict line adds `N earlier record(s)
+retired under K sealed retirement(s) under policy revision R (retired,
+policy not checked)`. It never says the chain is complete. A
+`chain_to_head` claim (§6.7) on a 1.6 pack may start one past the prefix the
+ledger retired from sequence 0, by consecutive entries of the pack's store,
+and prints `CLAIM: chain C from seq=L up to its head at seq=H, every record
+before seq=L retired under the receipts its retirements ledger names`; the
+walk still checks every receipt.
+
+What a retired range does not show: the retired records. They are gone, and
+nothing in the pack shows what they held. It does not show that the
+retention policy allowed their removal: the policy itself is not checked
+(§4.3). It shows that a signed receipt sealed on the chain names the range,
+and that the chain links across it.
+
+**Older verifiers.** A verifier before 0.18.0 is cannot evaluate (exit 2) on
+a 1.6 manifest, and fails a v1.27 record in a pack of an earlier manifest
+version (exit 1, unknown kind). It never passes such a pack.
+
+### 6.12 Pack source
+
+A manifest may carry `source`, covered by its signature when the pack is
+signed, naming the store the pack's records were read from and what the
+generator observed, when it built the pack, about whether that store lets a
+record change:
+
+```json
+"source": {
+  "store": "s3_worm",
+  "immutability": {
+    "basis": "object_lock_compliant",
+    "object_lock": {"verdict": "compliant", "mode": "COMPLIANCE",
+                    "default_retention_days": 400, "floor_days": 365, "refusals": []},
+    "version_findings": {"count": 0, "codes": []}
+  }
+}
+```
+
+`source` holds exactly `store` and `immutability`; `immutability` holds
+`basis`, and `object_lock` and `version_findings` besides when the store is
+`s3_worm`. Each basis belongs to exactly one store, and the verifier prints
+its sentence:
+
+| `store` | `basis` | Printed |
+|---|---|---|
+| `gcs_worm` | `not_read_by_generator` | write-once bucket; its retention policy was not read when the pack was built |
+| `s3_worm` | `object_lock_compliant` | immutable: S3 Object Lock in compliance mode, read when the pack was built |
+| `s3_worm` | `object_lock_not_confirmed` | NOT CONFIRMED IMMUTABLE: the bucket's Object Lock configuration is not compliant |
+| `local_chain` | `not_write_once` | mutable: a gateway's local chain, not confirmed by a write-once store |
+
+On an `s3_worm` source, `object_lock` holds `verdict` (`compliant` or
+`refused`) and `floor_days` (a positive integer), and only `mode`,
+`default_retention_days` and `refusals` (a list of non-empty strings)
+besides; a compliant observation states `mode` and
+`default_retention_days`. `version_findings` holds `count` (a non-negative
+integer) and only `codes` besides: distinct codes from `s3_extra_version`,
+`s3_delete_marker` and `s3_key_without_version`, what a version-aware read
+of the chain's keys found besides each key's first version.
+
+| Finding | Verdict |
+|---|---|
+| An unknown `store` or `basis`, an unknown Object Lock verdict or version-finding code, or a section, `object_lock` or `version_findings` of another shape | Cannot evaluate (exit 2) |
+| A basis of another store | Fail (exit 1) |
+| An `s3_worm` source without `object_lock` or `version_findings`, or another store's source with either | Fail (exit 1) |
+| An Object Lock verdict `compliant` on a basis other than `object_lock_compliant`, or `refused` on that basis | Fail (exit 1) |
+| A `refused` verdict that names no refusal, or a `compliant` one that lists refusals, whose `mode` is not `COMPLIANCE`, or whose `default_retention_days` is below `floor_days` | Fail (exit 1) |
+| A version-findings `count` of 0 with codes, or above 0 with none, or fewer than its codes | Fail (exit 1) |
+| A `local_chain` source on a pack without the `local-chain-not-write-once` evidence class, or that class with another store | Fail (exit 1) |
+
+A contradiction prints `FAIL source: …` and the verdict `FAIL: the
+manifest's source section contradicts the manifest`. Otherwise the verifier
+prints `SOURCE: <store>; <sentence>.`, the Object Lock observation (mode,
+default retention and floor when compliant, each refusal when not), and a
+`WARN` with the version findings when their count is above 0. Every verdict
+line of a pack whose source is not `gcs_worm` carries `[source: <store>,
+<basis>]`. An `object_lock_not_confirmed` bucket is labelled, never failed:
+its records verify as any others. A manifest without `source` predates it
+and reads as before.
+
+**Online reads.** The store also decides which bucket the verifier may read.
+`--bucket` reads a GCS bucket and is used only for a `gcs_worm` pack (or a
+pack with no source that is not a local-chain pack); `--s3-bucket` reads an
+S3 bucket and is used only for an `s3_worm` pack. Any other pairing is cannot
+evaluate (exit 2) before a bucket is read; verify the pack's own records with
+`--records` instead.
+
+An S3 pack's manifest `bucket` reads `s3://<bucket>/<root>`, `<root>` empty
+or ending in `/`. `--s3-bucket BUCKET` reads the records under
+`<root><prefix>`, the anchors (§6.1) under `<root>anchors/<chain>/` and the
+control-plane records (§6.3) under `<root>control-plane/`. `--s3-root`
+(ending in `/`) gives the root; without it, the root is the manifest's when
+its bucket is the one named, else empty. `--s3-region` and `--s3-endpoint`
+(an S3-compatible endpoint) set the client. The reader needs boto3 and the
+permissions `s3:ListBucketVersions` and `s3:GetObjectVersion`. Each key is
+read at its first version: the earliest `LastModified`, and among equal
+times the one listed last (S3 lists newer versions first). A later version
+(`s3_extra_version`), a delete marker on a key that holds a version
+(`s3_delete_marker`) and a key with delete markers and no version
+(`s3_key_without_version`) are each reported once, `WARN:
+s3://<bucket>/<key>: <code>: …`, and never read as the record; a key with no
+version holds no record, so its sequence is missing. A record overwritten in
+a versioned bucket is therefore still read as first written, and a first
+version that was changed fails its hash.
+
+What a source section does not show: that the store is immutable. It is the
+generator's observation when it built the pack. The verifier checks that the
+section agrees with itself and with the manifest; it reads no bucket's
+retention policy or Object Lock configuration, offline or online. A
+`gcs_worm` basis says the bucket's retention policy was not read. A bucket
+whose lock was not confirmed is labelled, never failed: nothing shows that
+its records could not have been changed, though they may still be intact.
+
+**Older verifiers.** A verifier before 0.18.0 ignores `source`: it verifies
+the records but prints no source label, and it has no `--s3-bucket`.
+
 ## 7. Signed packs (window B)
 
 ### 7.1 Descriptor and bundle
@@ -1773,7 +2064,7 @@ as unsupported, never as a pass.
 |---|---|
 | 0 | Records verified, and for a signed pack the signature. An unsigned pack reaches 0 only when the reader passes `--allow-unsigned`. |
 | 1 | A record or the signature failed. The reason is one of: signature required by manifest but missing; manifest bytes changed since signing; untrusted certificate chain; signer identity mismatch; OIDC issuer mismatch; invalid transparency-log proof; transparency-log entry does not match this signature; signed outside certificate validity; malformed signature material. |
-| 2 | Cannot evaluate: unsupported hash version, manifest version, storage layout, evidence class, content claim, signature method or bundle format; unusable trust anchors; a per-tenant signer checked without `--certificate-identity`; a content-stripped pack read with `--bucket` or still carrying a removed field. |
+| 2 | Cannot evaluate: unsupported hash version, manifest version, storage layout, evidence class, content claim, signature method or bundle format; unusable trust anchors; a per-tenant signer checked without `--certificate-identity`; a content-stripped pack read with `--bucket` or `--s3-bucket` or still carrying a removed field; a retirements ledger on a manifest other than 1.6, a retention rule it does not read, or a retirement receipt whose signature no key checks (§6.11); a pack source it does not read, or a pack read online from a store other than the one it names (§6.12). |
 | 3 | Unsigned pack: records verified, authenticity not established. |
 | 4 | Coverage not established: every record verified, but the pack claims the chain up to its head and a verified anchor names a later head (§6.7), or the pack stops before the sequence given with `--require-through`. `--allow-unsigned` does not turn it into 0. |
 
