@@ -46,7 +46,7 @@
   "verifier": {
     "name": "meilynx-verify",
     "sha256": "7928f6d5065289fe7334273a6e851ecdac5b5373d1bb7f6871a8cee7cb37dc84",
-    "version": "0.16.0"
+    "version": "0.17.0"
   },
   "witness_file": {
     "file_sha256": "93bb64bd3953fcc7e411ef7e0397feb0d7cb76430cf900c061d9e5797f95b814",
