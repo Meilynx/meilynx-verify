@@ -1,5 +1,74 @@
 # Changelog
 
+## 0.18.0 (2026-11-26)
+
+- `verify-pack.py` from meilynx-proxy `main` (`34495402`), byte-identical.
+- **Upgrade before verifying chains or packs written after this release.**
+  A verifier older than 0.18.0 fails every v1.27 and v1.28 record (exit 1),
+  and cannot evaluate a manifest 1.6 pack (exit 2). It never reports such a
+  chain as a pass. It ignores a manifest's `source` section: it verifies the
+  records but prints no source label, so a pack from an S3 bucket whose
+  Object Lock was not confirmed reads like any other.
+- Chain v1.27 (SPEC §4.3, `retention.retirement`): a receipt for one span of
+  a chain that the gateway retired under a signed retention policy, sealed
+  and signed before any record of the span is deleted. 33 hashed fields: the
+  kind attestation, then the run id and start, the chain, the store, the
+  span's first and last sequence, count, oldest and newest times and end
+  hashes, the policy digest and revision, the retention rule and days, the
+  hold ids, and, on a `gcs_worm` receipt only, the anchors and captures
+  retired with the span and the digest of the capture list.
+  - The verifier checks that the payload has exactly these members, the run
+    id is a UUID, the times are in UTC, the chain is the one the record is
+    sealed on, the count is the span's, the receipt is sealed after its
+    span, it retires no record younger than the retention it states, and
+    the hold ids are sorted and distinct.
+  - A retention rule other than `monotone` is cannot evaluate (exit 2).
+    The retention policy itself is not checked.
+- Manifest 1.6 (SPEC §6.11): the `retirements` ledger, one entry per
+  retirement receipt of the pack's chain, restating its span.
+  - A range of records missing from a 1.6 pack verifies as retired only
+    when consecutive receipts of the pack's own store cover it exactly and
+    link the chain across it, and each receipt is in the pack, verifies, is
+    signed by the gateway evidence key while it was in force, and is
+    restated by the ledger. Any other gap, an unsigned receipt, a receipt
+    of another store and a ledger that differs from its receipt fail.
+  - A receipt whose signature no key could check is cannot evaluate
+    (exit 2). A ledger on any other manifest version is cannot evaluate.
+  - A `chain_to_head` pack may start right after its retired prefix. The
+    verdict line counts the retired records and says the policy was not
+    checked; it never says the chain is complete.
+- Chain v1.28 (SPEC §4.3, `judgment.verdict`): a verdict receipt that names
+  the judged turn's verified agent. The v1.22 record and preimage with the
+  eighteen reason codes; the uploaded form is `judgment_verdict.v3`, the
+  closed v2 form and `agent_id` (a code, or null when the turn had no
+  verified agent), bound by `uploaded_sha256`. The local part is checked as
+  `judgment_verdict_local.v2` or `.v3`, by its own schema. A v3 form on any
+  other stamp, a v2 form on v1.28, and a v3 form without `agent_id` fail.
+- Pack source (SPEC §6.12): a manifest's `source` names the store the
+  records were read from (`gcs_worm`, `s3_worm` or `local_chain`) and what
+  the generator observed about its immutability.
+  - The verifier prints it before the records and, for a pack not from a
+    GCS bucket, on every verdict line. An unknown store, basis or shape is
+    cannot evaluate (exit 2); a section that contradicts itself or the
+    manifest fails (exit 1). An S3 bucket whose Object Lock was not
+    confirmed is labelled, never failed.
+  - `--s3-bucket BUCKET` reads an S3 pack online, each key at its first
+    version; later versions and delete markers are reported, never read as
+    the record. `--s3-root`, `--s3-region` and `--s3-endpoint` set the
+    prefix and the client; it needs boto3.
+  - `--bucket` reads only a pack from a GCS bucket and `--s3-bucket` only an
+    S3 pack. Any other pairing, a local-chain pack read with `--bucket`
+    included, is cannot evaluate (exit 2) before a bucket is read.
+- `VERIFIER_CAPABILITIES` adds `retention-retirement-v1`,
+  `judgment-verdicts-v5` and `pack-source-v1`. Self-test assertions 39i,
+  44a to 44m and 45a to 45h.
+- A v1.21 receipt that stores a later uploaded form now fails with "which
+  only a later record carries"; the `judgment-verdicts-v2-relabelled`
+  fixture expects that line. The verification receipt example states
+  0.18.0.
+- Packs without v1.27 or v1.28 records, a 1.6 manifest or a `source`
+  section verify as before.
+
 ## 0.17.0 (2026-11-26)
 
 - `verify-pack.py` from meilynx-proxy `main` (MEI-4265), byte-identical.

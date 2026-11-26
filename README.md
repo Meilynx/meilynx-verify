@@ -75,7 +75,7 @@ Exit codes, the same online and offline:
 |---|---|
 | `0` | Every record verified, and on a signed pack the signature too. An unsigned pack reaches `0` only with `--allow-unsigned`, and the output still says authenticity is not established. |
 | `1` | Verification failed. The output names the first record that failed and why (hash mismatch, chain break, missing record, unknown record kind, two stored copies of one record that differ), why the signature failed, which chain-head anchor failed and why, which gateway evidence-key check failed (see "Gateway evidence key" below), or which witnessed head the pack contradicts (see "Witness files" below). |
-| `2` | This verifier cannot evaluate the pack: an unsupported hash version, manifest version, storage layout, evidence class, content claim, signature method or bundle format (use a newer release), an unusable `--trusted-root`, an anchor from a witness with no trust root (pass `--tsa-root`), a pack signed by a per-tenant signer checked without `--certificate-identity`, a pack or export signed by a gateway evidence key checked with neither `--attestation-key` nor `--gateway-key`, or a content-stripped pack read with `--bucket` or still carrying a removed field. |
+| `2` | This verifier cannot evaluate the pack: an unsupported hash version, manifest version, storage layout, evidence class, content claim, signature method or bundle format (use a newer release), an unusable `--trusted-root`, an anchor from a witness with no trust root (pass `--tsa-root`), a pack signed by a per-tenant signer checked without `--certificate-identity`, a pack or export signed by a gateway evidence key checked with neither `--attestation-key` nor `--gateway-key`, a content-stripped pack read with `--bucket` or `--s3-bucket` or still carrying a removed field, a retention rule or pack source this verifier does not read, a retirement receipt whose signature no key checks, or a pack read online from a store other than the one its manifest names. |
 | `3` | The records verified, but the pack is unsigned, so nothing shows who produced the manifest. |
 | `4` | Integrity passed, coverage not established. Every record verified, but the pack does not reach a sequence the chain is known to have reached: the pack claims the whole chain up to its head and a verified chain-head anchor, or a chain head the gateway signed, names a later head, the pack stops before the sequence you passed with `--require-through`, or it stops before a head its control plane witnessed (`--witness`). Not a pass, and not a tampering verdict (see "Local-chain evidence" below). |
 
@@ -136,6 +136,25 @@ Online form, for a reviewer who has been granted read access to the bucket
 pip install google-cloud-storage && gcloud auth application-default login
 python3 verify-pack.py --bucket <bucket> --manifest manifest.json
 ```
+
+A pack whose manifest names an S3 bucket as its source (`source.store`
+`s3_worm`, `bucket` `s3://<bucket>/<root>`) is read online with
+`--s3-bucket` instead, by a reviewer granted `s3:ListBucketVersions` and
+`s3:GetObjectVersion`. Each key is read at its first version; later versions
+and delete markers are reported as `WARN` and never read as the record.
+`--s3-root` sets the key prefix the gateway's objects sit under (ending in
+`/`; by default the root the manifest's `s3://` bucket names), and
+`--s3-region` and `--s3-endpoint` set the client. `--export-records`
+works here too.
+
+```bash
+pip install boto3
+python3 verify-pack.py --s3-bucket <bucket> --manifest manifest.json
+```
+
+`--bucket` reads only a pack from a GCS bucket and `--s3-bucket` only a pack
+from an S3 bucket; any other pairing exits `2` before a bucket is read
+([SPEC.md](SPEC.md) §6.12).
 
 ## Signed packs
 
@@ -638,6 +657,19 @@ the same exit-code precedence.
 - **Control probe runs** (no flag). A v1.23 `control_probe_run` record is
   checked for its stored probe sets and case results and for its counts
   (see "Control probe runs").
+- **Retention retirements** (no flag). A v1.27 `retention_retirement` record
+  is checked for its span, times and members. In a manifest 1.6 pack, a
+  range of records that is not in the pack verifies as retired only when
+  signed receipts of the pack's own store, restated by the manifest's
+  `retirements` ledger, cover it exactly; any other gap fails. The verdict
+  names the retired records and says the retention policy was not checked
+  ([SPEC.md](SPEC.md) §4.3, §6.11).
+- **Pack source** (no flag). A manifest's `source` names the store the
+  records were read from and what the pack generator observed about its
+  immutability. It is printed before the records and on every verdict line
+  of a pack not from a GCS bucket; a section that contradicts the manifest
+  fails, and an S3 bucket whose Object Lock was not confirmed is labelled,
+  never failed ([SPEC.md](SPEC.md) §6.12).
 - **Gateway evidence key** (`--attestation-key JWK` or `--gateway-key KEY`).
   Attestations, record signatures, signed chain heads and evidence-key
   manifest signatures (see "Gateway evidence key").
@@ -709,10 +741,10 @@ It does **not** prove:
 ## Versions
 
 The verifier understands chain records with `schema_version` v1 through
-v1.25, stored per record or in segment objects, and pack manifests 1.0
-through 1.5 (1.1 adds chain-head anchors, 1.2 the storage layout, 1.3 the
+v1.28, stored per record or in segment objects, and pack manifests 1.0
+through 1.6 (1.1 adds chain-head anchors, 1.2 the storage layout, 1.3 the
 control-plane chain, 1.4 the evidence class label, 1.5 the content-stripped
-pack with its hash-only stubs). It declares the pack features it checks in
+pack with its hash-only stubs, 1.6 the retirements ledger). It declares the pack features it checks in
 `VERIFIER_CAPABILITIES`: `chain-anchors-v1`, `segmented-records-v1`,
 `decision-receipts-v1`, `evaluation-trace-v1`, `data-reach-evidence-v1`,
 `control-plane-chain-v1`, `ocsf-export-v1`, `customer-scope-v1`,
@@ -722,7 +754,8 @@ pack with its hash-only stubs). It declares the pack features it checks in
 `gateway-evidence-key-v1`, `judgment-verdicts-v1`,
 `judgment-verdicts-v2`, `control-probe-runs-v1`, `judgment-verdicts-v3`,
 `witness-file-v1`, `verification-receipt-v1`, `context-provenance-v1`,
-`provenance-verifications-v1` and `judgment-verdicts-v4`.
+`provenance-verifications-v1`, `judgment-verdicts-v4`,
+`retention-retirement-v1`, `judgment-verdicts-v5` and `pack-source-v1`.
 A record of an unknown
 version or kind fails verification rather than being skipped; a manifest of
 an unknown version, storage layout, evidence class or content claim is
