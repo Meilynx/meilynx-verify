@@ -5,7 +5,7 @@ enough that a verifier can be written from it without reading Meilynx code.
 `verify-pack.py` in this repository is one such verifier; its `--self-test`
 pins the values below against fixture hashes.
 
-Status: describes chain records with `schema_version` v1 through v1.25, the
+Status: describes chain records with `schema_version` v1 through v1.26, the
 per-record and segment storage layouts, pack manifest `schema_version` 1.0
 through 1.5, the control-plane chain a 1.3 manifest carries, the per-tenant
 pack signature, the local-chain evidence class (§6.5), the manifest's
@@ -100,7 +100,7 @@ Every record carries at least these fields:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.25"`). Absent means `"v1"`. |
+| `schema_version` | string | Which preimage layout below applies (`"v1"`, `"v1.1"`, `"v1.2"`, … `"v1.26"`). Absent means `"v1"`. |
 | `event_kind` | string | Record kind in serde form (`llm_request`, `admin_action`, `auth_session_started`, `mcp_tool_call`, `mcp_policy_decision`, `mcp_tool_result`, `mcp_tools_list_served`, `mcp_error`, `mcp_catalog_drift`, `coverage_computed`, `coverage_key_inventory`, `decision_receipt`, `compliance_record`, `judgment_verdict`, `control_probe_run`, `provenance_verification`). Absent means `llm_request`. |
 | `sequence_number` | integer | Position in the chain, starting at 0. |
 | `timestamp_utc` | string | RFC 3339 UTC timestamp, nanosecond precision, `Z` suffix. |
@@ -851,6 +851,27 @@ What a provenance verification does not show: that the gateway ran the
 checks over every record of the window, or that its counts are right; only
 that the stated counts were recorded, have not changed since and add up. It
 holds no label, tool name or digest of a list.
+
+**v1.26 `judgment.verdict`**: the v1.22 record, preimage and uploaded form,
+unchanged, with every v1.22 check and the eighteen reason codes of v1.24
+(`pacing_limited` included). A gateway stamps v1.26 on every receipt while
+it keeps the passages a judge quotes, a setting that is off by default. The
+local part (`raw_response`) is then `judgment_verdict_local.v3`: the
+`judgment_verdict_local.v2` keys and types, with each `spans[]` entry closed
+to `{ "input": string, "start", "end": unsigned 32-bit integers, "text":
+string or null }`. `input` is one of the judgment's inputs, `start` is not
+after `end`, and a `text` that is not null is exactly `end - start` bytes of
+UTF-8: the passage as the judge read it. `text` is null when the reason text
+is withheld under the capture policy or the range names no whole-character
+slice, and a receipt whose `reason_text_withheld` is true keeps no passage.
+The local part stays bound by `local_sha256`, so a changed passage fails
+verification. A v2 local part on a v1.26 receipt, a v3 local part on any
+other version, and a v1.26 stamp on any other kind fail verification.
+
+What a v1.26 receipt does not show: that the passage is where the range
+points in the original turn, because the judge's copy of the turn is not
+kept; only that the passage the gateway recorded has not changed since, and
+fits the range it names.
 
 MCP kinds are: `mcp.tool_call`, `mcp.policy_decision`, `mcp.tool_result`,
 `mcp.tools_list.served`, `mcp.error`, `mcp.catalog_drift`. Any MCP hasher

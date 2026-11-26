@@ -721,8 +721,8 @@ pack with its hash-only stubs). It declares the pack features it checks in
 `local-chain-evidence-v1`, `coverage-claim-v1`, `evidence-modes-v1`,
 `gateway-evidence-key-v1`, `judgment-verdicts-v1`,
 `judgment-verdicts-v2`, `control-probe-runs-v1`, `judgment-verdicts-v3`,
-`witness-file-v1`, `verification-receipt-v1`, `context-provenance-v1` and
-`provenance-verifications-v1`.
+`witness-file-v1`, `verification-receipt-v1`, `context-provenance-v1`,
+`provenance-verifications-v1` and `judgment-verdicts-v4`.
 A record of an unknown
 version or kind fails verification rather than being skipped; a manifest of
 an unknown version, storage layout, evidence class or content claim is

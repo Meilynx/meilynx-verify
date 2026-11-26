@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.17.0 (2026-11-26)
+
+- `verify-pack.py` from meilynx-proxy `main` (MEI-4265), byte-identical.
+- **Upgrade before verifying chains or packs written after this release.**
+  A verifier older than 0.17.0 fails every v1.26 record (exit 1). It never
+  reports such a chain as a pass.
+- Chain v1.26 (SPEC, `judgment.verdict`): a judgment verdict receipt that
+  keeps the passages the judge quoted. The local part is
+  `judgment_verdict_local.v3`: each span carries its passage as the judge read
+  it, or null when the reason text is withheld. Bound by `local_sha256` like
+  the v2 local part, so a changed passage fails.
+- `VERIFIER_CAPABILITIES` adds `judgment-verdicts-v4`. Self-test assertion 39h.
+
 ## 0.16.0 (2026-11-24)
 
 - `verify-pack.py` from meilynx-proxy `e786536`.
