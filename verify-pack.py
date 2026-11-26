@@ -426,6 +426,11 @@ EVIDENCE_MODE_INDEX_FIELDS = ("sequence", "mode", "source")
 # `judgment-verdicts-v3` reads v1.24 judgment.verdict records: the
 # v1.22 record and checks again, stamped v1.24 on the receipt of a
 # `pacing_limited` verdict (the eighteenth reason code) and on nothing else.
+# `judgment-verdicts-v4` reads v1.26 judgment.verdict records: the v1.22
+# record and checks again with the eighteen codes, and the local part held to
+# `judgment_verdict_local.v3`, whose spans carry the passage each quotes as
+# the judge read it (or null): each passage is exactly its span's bytes, and
+# none is kept where the reason text is withheld.
 # `coverage-claim-v1` reads a manifest's `claim`, fails a claim that
 # contradicts the manifest, and reports a verified anchor after a
 # chain_to_head claim as coverage not established (exit 4), never as a
@@ -469,7 +474,8 @@ VERIFIER_CAPABILITIES = frozenset(
      "record-signatures-v1", "compliance-records-v1", "local-chain-evidence-v1", "coverage-claim-v1",
      "evidence-modes-v1", "gateway-evidence-key-v1", "judgment-verdicts-v1",
      "judgment-verdicts-v2", "control-probe-runs-v1", "judgment-verdicts-v3", "witness-file-v1",
-     "verification-receipt-v1", "context-provenance-v1", "provenance-verifications-v1"}
+     "verification-receipt-v1", "context-provenance-v1", "provenance-verifications-v1",
+     "judgment-verdicts-v4"}
 )
 # The stripped profile of a manifest 1.5 Exchange pack. Mirror of
 # `exchange::STRIPPED_FIELDS` / `WITHHELD_FIELDS` / `STUB_FIELDS` /
@@ -1423,12 +1429,21 @@ JUDGMENT_VERDICT_LOCAL_FIELDS = ('schema', 'reason_text', 'reason_text_withheld'
 # instead of reading the eighteenth as tampering. `pacing_limited` on any
 # other version is a relabelled v1.24 record, and v1.24 with any other code
 # is refused.
-JUDGMENT_VERDICT_SCHEMA_VERSIONS = ('v1.21', 'v1.22', 'v1.24')
+#
+# The v1.26 bucket: the v1.22 record again, stamped v1.26 on every receipt
+# of a gateway that keeps the quoted passages, with the eighteen codes
+# (`pacing_limited` included). The same feed and the same closed v2 uploaded
+# form; the local part is `judgment_verdict_local.v3`, whose spans carry the
+# passage each quotes as the judge read it, still bound by local_sha256. A v2
+# local part on v1.26, or a v3 one on any other version, is refused.
+JUDGMENT_VERDICT_SCHEMA_VERSIONS = ('v1.21', 'v1.22', 'v1.24', 'v1.26')
 JUDGMENT_VERDICT_V2_SCHEMA_VERSION = 'v1.22'
-JUDGMENT_VERDICT_V2_SCHEMA_VERSIONS = ('v1.22', 'v1.24')
+JUDGMENT_VERDICT_V2_SCHEMA_VERSIONS = ('v1.22', 'v1.24', 'v1.26')
 JUDGMENT_VERDICT_PACING_SCHEMA_VERSION = 'v1.24'
+JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION = 'v1.26'
 JUDGMENT_VERDICT_UPLOADED_SCHEMA_V2 = 'judgment_verdict.v2'
 JUDGMENT_VERDICT_LOCAL_SCHEMA_V2 = 'judgment_verdict_local.v2'
+JUDGMENT_VERDICT_LOCAL_SCHEMA_V3 = 'judgment_verdict_local.v3'
 # Every key of the v2 uploaded form. `raw_input_grant` is the one optional
 # key: present exactly when the input form is `raw` and a backend answered,
 # otherwise absent (never null).
@@ -1496,6 +1511,15 @@ JUDGMENT_VERDICT_V2_QUESTION_FIELDS = ('id', 'clause_sha256', 'outcome', 'p', 'p
 JUDGMENT_VERDICT_V2_BACKEND_FIELDS = ('id', 'distribution', 'validated', 'prompt_version', 'prompt_sha256',
                                       'validation_run', 'validation_sha256')
 JUDGMENT_VERDICT_LOCAL_SPAN_FIELDS = ('input', 'start', 'end')
+# A v3 span names its range and the passage it quotes: `text` is null or a
+# string of exactly end - start UTF-8 bytes, and null on every span of a
+# local part whose reason text is withheld (the same capture rule).
+JUDGMENT_VERDICT_LOCAL_SPAN_FIELDS_V3 = ('input', 'start', 'end', 'text')
+# The inputs a span may name: the judgment input vocabulary.
+JUDGMENT_VERDICT_SPAN_INPUTS = (
+    'last_user_turn', 'reply', 'declared_context', 'tool_call', 'tool_result',
+    'conversation_window', 'session_facts',
+)
 JUDGMENT_VERDICT_LOCAL_FLOOR_TRIGGER_FIELDS = ('rule_id', 'term_id', 'language')
 # The upload allowlist's value classes (contracts/control-plane-upload-allowlist.v1.json):
 # `code` (a system-assigned identifier) and `hex`.
@@ -1744,6 +1768,67 @@ def judgment_verdict_local_v2_problems(local):
                     bad(f'{at}.{key}', 'a string')
                 elif kind == 'u32' and not _jv_is_uint(entry[key], 32):
                     bad(f'{at}.{key}', 'an unsigned 32-bit integer')
+    return problems
+
+
+def judgment_verdict_local_v3_problems(local):
+    """The problems of a stored `judgment_verdict_local.v3` local part on its
+    own: the v2 key set and types (`judgment_verdict_local_v2_problems` with
+    the v3 schema name), each `spans[]` entry closed to `{input, start, end,
+    text}` with an input of the judgment input list, `start <= end`, and a
+    `text` that is null or a string of exactly `end - start` UTF-8 bytes; and
+    no passage kept where the reason text is withheld. Mirror of
+    `check_local_part_v3` in meilynx-audit."""
+    problems = []
+
+    def bad(path, what):
+        problems.append(f"`{path}` is not {what}")
+
+    as_v2 = dict(local)
+    if 'schema' in as_v2:
+        if as_v2['schema'] != JUDGMENT_VERDICT_LOCAL_SCHEMA_V3:
+            bad('schema', JUDGMENT_VERDICT_LOCAL_SCHEMA_V3)
+        as_v2['schema'] = JUDGMENT_VERDICT_LOCAL_SCHEMA_V2
+    # The v2 checks of every key; the spans, which v3 closes differently,
+    # are checked below.
+    if 'spans' in as_v2:
+        as_v2['spans'] = []
+    problems.extend(judgment_verdict_local_v2_problems(as_v2))
+    if 'spans' not in local:
+        return problems
+    entries = local['spans']
+    if not isinstance(entries, list):
+        bad('spans', 'a list')
+        return problems
+    withheld = local.get('reason_text_withheld') is True
+    for i, entry in enumerate(entries):
+        at = f'spans[{i}]'
+        if not isinstance(entry, dict):
+            bad(at, 'an object')
+            continue
+        problems.extend(f"`{at}` {p}" for p in _jv_closed_keys(entry, JUDGMENT_VERDICT_LOCAL_SPAN_FIELDS_V3))
+        if 'input' in entry and entry['input'] not in JUDGMENT_VERDICT_SPAN_INPUTS:
+            bad(f'{at}.input', 'an input of the judgment input list')
+        start, end = entry.get('start'), entry.get('end')
+        ok_range = True
+        for key in ('start', 'end'):
+            if key in entry and not _jv_is_uint(entry[key], 32):
+                bad(f'{at}.{key}', 'an unsigned 32-bit integer')
+                ok_range = False
+        if ok_range and 'start' in entry and 'end' in entry and start > end:
+            problems.append(f"`{at}` ends before it starts")
+            ok_range = False
+        if 'text' not in entry:
+            continue
+        text = entry['text']
+        if text is None:
+            continue
+        if not isinstance(text, str):
+            bad(f'{at}.text', 'a string or null')
+        elif withheld:
+            problems.append(f"`{at}` keeps a quoted passage though the reason text is withheld")
+        elif ok_range and 'start' in entry and 'end' in entry and len(text.encode('utf-8', 'surrogatepass')) != end - start:
+            problems.append(f"`{at}.text` is not the {end - start} bytes its span names")
     return problems
 
 
@@ -2080,8 +2165,13 @@ def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=N
 
     A v1.24 record is a v1.22 record whose sealed reason code is
     `pacing_limited`, checked the same way. `pacing_limited` on any other
-    version is a relabelled v1.24 record, and a v1.24 record with any other
-    code fails.
+    version but v1.26 is a relabelled v1.24 record, and a v1.24 record with
+    any other code fails.
+
+    A v1.26 record is a v1.22 record whose stored local part is a closed
+    `judgment_verdict_local.v3` object (`judgment_verdict_local_v3_problems`:
+    each span carries the passage it quotes, or null), with the eighteen
+    codes. A v2 local part on v1.26, or a v3 one on any other version, fails.
 
     Returns a list of problems; empty means the record checks out. Records on
     any other schema version return no problems."""
@@ -2096,10 +2186,12 @@ def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=N
     vid = fields.get('verdict_id', '?')
     pacing_limited = fields.get('reason_code') == JUDGMENT_VERDICT_PACING_LIMITED
     stamped_pacing = version == JUDGMENT_VERDICT_PACING_SCHEMA_VERSION
-    if pacing_limited and not stamped_pacing:
+    passages = version == JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION
+    if pacing_limited and not stamped_pacing and not passages:
         problems.append(
             f"verdict receipt {vid}: a {version} record carries {JUDGMENT_VERDICT_PACING_LIMITED}, "
-            f"which only a {JUDGMENT_VERDICT_PACING_SCHEMA_VERSION} record carries"
+            f"which only a {JUDGMENT_VERDICT_PACING_SCHEMA_VERSION} or "
+            f"{JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION} record carries"
         )
     if stamped_pacing and not pacing_limited:
         problems.append(
@@ -2172,10 +2264,13 @@ def check_judgment_verdict(event, stripped=frozenset(), seq=None, pack_records=N
                 f"not the sealed local_sha256 {fields.get('local_sha256')}"
             )
         if isinstance(stored, dict) and v2:
-            for problem in judgment_verdict_local_v2_problems(stored):
+            local_schema = JUDGMENT_VERDICT_LOCAL_SCHEMA_V3 if passages else JUDGMENT_VERDICT_LOCAL_SCHEMA_V2
+            local_problems = (judgment_verdict_local_v3_problems if passages
+                              else judgment_verdict_local_v2_problems)
+            for problem in local_problems(stored):
                 problems.append(
                     f"verdict receipt {vid}: the stored local part is not a "
-                    f"{JUDGMENT_VERDICT_LOCAL_SCHEMA_V2} object: {problem}"
+                    f"{local_schema} object: {problem}"
                 )
             # The judged bytes have a digest exactly when a backend was sent them.
             if isinstance(uploaded, dict) and 'backend' in uploaded and 'judged_input_sha256' in stored:
@@ -4503,14 +4598,14 @@ def compute_event_hash_dispatch(
             f"{event_kind!r} event — it is hashed only in the v1.23 control_probe.run bucket."
         )
     # Fail closed. The verdict receipt payload is hashed only by the v1.21
-    # judgment.verdict hasher (the v1.21, v1.22 and v1.24 buckets); anywhere
-    # else it would sit on the record unhashed.
+    # judgment.verdict hasher (the v1.21, v1.22, v1.24 and v1.26 buckets);
+    # anywhere else it would sit on the record unhashed.
     if judgment_verdict is not None and (
         schema_version not in JUDGMENT_VERDICT_SCHEMA_VERSIONS or event_kind != EVENT_KIND_JUDGMENT_VERDICT
     ):
         raise ValueError(
             f"judgment_verdict payload present on a {schema_version!r} "
-            f"{event_kind!r} event — it is hashed only in the v1.21, v1.22 and v1.24 judgment.verdict buckets."
+            f"{event_kind!r} event — it is hashed only in the v1.21, v1.22, v1.24 and v1.26 judgment.verdict buckets."
         )
     # Fail closed. The compliance-record payload is hashed only by the v1.20
     # compliance.record hasher; anywhere else it would sit on the record
@@ -4836,7 +4931,8 @@ def compute_event_hash_dispatch(
         # v1.22 is the same record and the same feed; only
         # the stamp differs, and it obliges the closed checks of the stored
         # forms in check_judgment_verdict. v1.24 is v1.22 again on
-        # the receipt of a `pacing_limited` verdict.
+        # the receipt of a `pacing_limited` verdict, and v1.26 on a receipt
+        # whose local part keeps the quoted passages.
         if event_kind != EVENT_KIND_JUDGMENT_VERDICT:
             raise ValueError(
                 f"schema_version {schema_version} is defined only for "
@@ -6316,6 +6412,92 @@ def run_self_test():
         print(f'SELF-TEST assertion 39g FAIL: intact {v124_intact}, configured before delivery {v124_configured_before}, '
               f'not caught {[n for n, c in v124_caught.items() if not c]}, '
               f'dispatched {dispatched_v124 == got_v124}, refused {rejected} of {len(v124_refusals)}',
+              file=sys.stderr)
+        ok = False
+
+    # Assertion 39h — v1.26 judgment.verdict: a receipt whose local part
+    # keeps the quoted passages (`judgment_verdict_local.v3`). The feed is the
+    # v1.21 one, so the dispatcher routes the v1.26 stamp to the same hasher;
+    # the record checks out with a passage, with every passage withheld, and
+    # on `pacing_limited`; a v3 local part relabelled v1.22 or v1.24, a v2
+    # local part on v1.26, a passage that is not its span's bytes, a passage
+    # kept while the reason text is withheld, an unknown span key, a span that
+    # ends before it starts, an input outside the list, a text that is not a
+    # string and a span without its text all fail; an edited passage breaks
+    # local_sha256; and the dispatcher's fail-closed guards hold for the stamp.
+    v126_passage = 'Take twice the dose of the tablets tonight.'
+    v126_span = dict(input='reply', start=10, end=10 + len(v126_passage.encode('utf-8')), text=v126_passage)
+    v126_local = dict(schema=JUDGMENT_VERDICT_LOCAL_SCHEMA_V3, spans=[v126_span])
+    v126_event = v122_with(stamp=JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION, local=v126_local)
+    v126_payload = v126_event['judgment_verdict']
+    got_v126 = compute_event_hash_v1_21_judgment_verdict(receipt=v126_payload, **v121_args)
+    dispatched_v126 = compute_event_hash_dispatch(
+        JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION, *(v121_args[k] for k in (
+            'sequence_number', 'timestamp_utc', 'event_id', 'request_id', 'model_requested', 'action',
+            'input_tokens', 'output_tokens', 'total_tokens', 'cache_creation_input_tokens',
+            'cache_read_input_tokens', 'cached_input_tokens', 'reasoning_tokens', 'estimated_cost_usd',
+            'previous_hash')),
+        event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=v126_payload)
+
+    def passaged(span=None, stamp=JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION, **local):
+        spans = [span] if span is not None else [v126_span]
+        return v122_with(stamp=stamp, local=dict(v126_local, spans=spans, **local))
+
+    v126_accepted = {
+        'a FLAG with its passage': check_judgment_verdict(v126_event, frozenset(), 7, llm_pack),
+        'a FLAG whose passages are withheld': check_judgment_verdict(
+            passaged(dict(v126_span, text=None), reason_text=None, reason_text_withheld=True),
+            frozenset(), 7, llm_pack),
+        'a span whose passage was not kept': check_judgment_verdict(
+            passaged(dict(v126_span, text=None)), frozenset(), 7, llm_pack),
+        'a pacing_limited verdict': check_judgment_verdict(
+            v122_with(stamp=JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION,
+                      **dict(pacing, local=dict(pacing['local'], schema=JUDGMENT_VERDICT_LOCAL_SCHEMA_V3))),
+            frozenset(), 7, llm_pack),
+        'a stripped pack without the local part': check_judgment_verdict(
+            dict(v126_event, raw_response=None), frozenset({'raw_response'}), 7, llm_pack),
+    }
+    edited_passage = dict(v126_event, raw_response=dict(
+        v126_event['raw_response'], spans=[dict(v126_span, text='Take half the dose of the tablets tonight..')]))
+    v126_edits = {
+        'a v3 local part relabelled v1.22': passaged(stamp='v1.22'),
+        'a v3 local part relabelled v1.24 on pacing_limited': v122_with(
+            stamp=JUDGMENT_VERDICT_PACING_SCHEMA_VERSION,
+            **dict(pacing, local=dict(pacing['local'], schema=JUDGMENT_VERDICT_LOCAL_SCHEMA_V3))),
+        'a v2 local part on v1.26': v122_with(stamp=JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION),
+        'a passage that is not its span\'s bytes': passaged(dict(v126_span, end=v126_span['end'] - 1)),
+        'a passage kept while the reason text is withheld': passaged(
+            reason_text=None, reason_text_withheld=True),
+        'an unknown span key': passaged(dict(v126_span, note='x')),
+        'a span that ends before it starts': passaged(dict(v126_span, start=60, end=10, text=None)),
+        'an input outside the list': passaged(dict(v126_span, input='prompt')),
+        'a text that is not a string': passaged(dict(v126_span, text=7)),
+        'a span without its text': passaged({k: v for k, v in v126_span.items() if k != 'text'}),
+        'an edited passage': edited_passage,
+    }
+    v126_caught = {name: bool(check_judgment_verdict(e, frozenset(), 7, llm_pack)) for name, e in v126_edits.items()}
+    rejected = 0
+    v126_refusals = (
+        dict(event_kind=EVENT_KIND_LLM_REQUEST, judgment_verdict=v126_payload),
+        dict(event_kind=EVENT_KIND_JUDGMENT_VERDICT, judgment_verdict=None),
+    )
+    for refusal in v126_refusals:
+        try:
+            compute_event_hash_dispatch(JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION, *base_args, **refusal)
+        except ValueError:
+            rejected += 1
+    if (got_v126 == dispatched_v126 and recompute_event_hash(v126_event, 7, 'b' * 64) == got_v126
+            and not any(v126_accepted.values())
+            and all(v126_caught.values()) and len(v126_caught) == 11
+            and rejected == len(v126_refusals)
+            and JUDGMENT_VERDICT_PASSAGES_SCHEMA_VERSION in JUDGMENT_VERDICT_SCHEMA_VERSIONS
+            and 'judgment-verdicts-v4' in VERIFIER_CAPABILITIES):
+        print('SELF-TEST assertion 39h PASS: a v1.26 judgment.verdict with quoted passages recomputes through the '
+              f'v1.21 feed and checks out; {len(v126_caught)} relabels and wrong passages are caught')
+    else:
+        print(f'SELF-TEST assertion 39h FAIL: refused {[(n, p) for n, p in v126_accepted.items() if p]}, '
+              f'not caught {[n for n, c in v126_caught.items() if not c]}, '
+              f'dispatched {dispatched_v126 == got_v126}, refused {rejected} of {len(v126_refusals)}',
               file=sys.stderr)
         ok = False
 
@@ -12257,7 +12439,7 @@ def required_coverage_status(manifest, require_through):
 # --receipt FILE writes what the run concluded as a content-free JSON
 # receipt (`meilynx.verification_receipt.v1`, RFC 8785 bytes).
 
-VERIFIER_VERSION = "0.16.0"
+VERIFIER_VERSION = "0.17.0"
 WITNESS_MANIFEST_FORMAT = "meilynx.witness_manifest.v1"
 WITNESS_MANIFEST_NAME = "witness-manifest.json"
 WITNESS_SIGNATURE_DOMAIN = WITNESS_MANIFEST_FORMAT.encode("ascii") + b"\x00"
