@@ -2,9 +2,7 @@
 
 ## 0.18.0 (2026-11-26)
 
-- `verify-pack.py` from meilynx-proxy `dev` at commit `5be3dace`,
-  byte-identical. That commit reaches the proxy's `main` with the next
-  release train.
+- `verify-pack.py` from meilynx-proxy `main` (`34495402`), byte-identical.
 - **Upgrade before verifying chains or packs written after this release.**
   A verifier older than 0.18.0 fails every v1.27 and v1.28 record (exit 1),
   and cannot evaluate a manifest 1.6 pack (exit 2). It never reports such a
