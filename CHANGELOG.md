@@ -1,5 +1,63 @@
 # Changelog
 
+## 0.19.0 (2026-11-27)
+
+- `verify-pack.py` from meilynx-proxy `main` (`9e933c2a`), byte-identical.
+- No new record version or manifest version. A verifier older than 0.19.0
+  cannot evaluate a restored-backup pack (exit 2), has no
+  `--retention-policy`, and reads every retired range with the retention
+  policy not checked.
+- Signed retention policies (SPEC §6.13). `--retention-policy PATH` (a
+  file, or a directory of `.json` files; repeatable) gives the signed
+  `retention_policy.v1` revisions a pack's retirement receipts name, and
+  `--retention-policy-key FILE` pins the project's bundle signing key (a
+  P-256 JWK, bare or as `{"keyId", "jwk"}`, or a PEM public key). Either
+  flag without the other is a usage error (exit 2).
+  - Each copy is checked under the pinned key over a `bundle_signature.v1`
+    statement the verifier builds itself: `artifact` `retention_policy`,
+    the policy's `project_id`, and the SHA-256 of the RFC 8785 bytes of the
+    policy body alone, which is the digest a receipt names and the next
+    revision links to. The key a copy names is never trusted. An unsigned or
+    forged copy, or one for another project than the pack's, fails (exit 1).
+    A policy format, rule or signature format this verifier does not read
+    is cannot evaluate (exit 2).
+  - The body holds exactly nine members, and its schedule and holds are
+    checked for their shape. The revisions supplied must link through
+    `previous_sha256`, never lower retention, and only extend the schedule.
+  - Each receipt must not apply less retention than any revision up to its
+    own states. Against the revision it names, when supplied, it must carry
+    that revision's digest and rule, retire only records older than that
+    revision's retention when it was sealed, name only that revision's
+    holds, and retire no span one of its holds reaches by chain, sequence
+    or time.
+  - The `RETIREMENTS` and verdict lines say `policy checked`, `policy
+    revision R not supplied` or `policy revision R failed` in place of "the
+    retention policy was not checked". A receipt whose revision was not
+    supplied still verifies as retired (exit 0). Without
+    `--retention-policy` the output is as in 0.18.0.
+- Witness files (SPEC §6.9): a witnessed head inside a retired range is
+  reported as retired, with its policy revision, and never counted. A file
+  whose only heads are retired establishes no coverage (exit 4).
+- Restored-backup packs (SPEC §6.5): the evidence class
+  `restored-backup-not-write-once` and its required `restored_backup`
+  section, which names the backup, its digest, the restore test and the
+  chain head sealed for the backup.
+  - The verifier prints a `RESTORED BACKUP` line and adds `[restored
+    backup: <backup>, restore test <test>]` to every verdict line.
+  - A section without the class or the class without a section, a result
+    its failures contradict, a pack that does not end at the sealed head,
+    and a restore test recorded as failed fail (exit 1). A section it
+    cannot read is cannot evaluate (exit 2).
+  - The verdict line of a live local-chain pack, and of every other pack,
+    is unchanged.
+- `VERIFIER_CAPABILITIES` adds `restored-backup-evidence-v1` and
+  `retention-policy-v1`. Self-test assertions 46a to 46i and 47a to 47o;
+  47a pins the `retention_policy.v1` known-answer vector (two linked
+  revisions and a hold, signed under a test key).
+- The verification receipt example states 0.19.0.
+- Packs without retirements, a witnessed head in a retired range or a
+  restored-backup class verify as before.
+
 ## 0.18.0 (2026-11-26)
 
 - `verify-pack.py` from meilynx-proxy `main` (`34495402`), byte-identical.

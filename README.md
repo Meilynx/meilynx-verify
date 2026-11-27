@@ -74,8 +74,8 @@ Exit codes, the same online and offline:
 | Code | Meaning |
 |---|---|
 | `0` | Every record verified, and on a signed pack the signature too. An unsigned pack reaches `0` only with `--allow-unsigned`, and the output still says authenticity is not established. |
-| `1` | Verification failed. The output names the first record that failed and why (hash mismatch, chain break, missing record, unknown record kind, two stored copies of one record that differ), why the signature failed, which chain-head anchor failed and why, which gateway evidence-key check failed (see "Gateway evidence key" below), or which witnessed head the pack contradicts (see "Witness files" below). |
-| `2` | This verifier cannot evaluate the pack: an unsupported hash version, manifest version, storage layout, evidence class, content claim, signature method or bundle format (use a newer release), an unusable `--trusted-root`, an anchor from a witness with no trust root (pass `--tsa-root`), a pack signed by a per-tenant signer checked without `--certificate-identity`, a pack or export signed by a gateway evidence key checked with neither `--attestation-key` nor `--gateway-key`, a content-stripped pack read with `--bucket` or `--s3-bucket` or still carrying a removed field, a retention rule or pack source this verifier does not read, a retirement receipt whose signature no key checks, or a pack read online from a store other than the one its manifest names. |
+| `1` | Verification failed. The output names the first record that failed and why (hash mismatch, chain break, missing record, unknown record kind, two stored copies of one record that differ), why the signature failed, which chain-head anchor failed and why, which gateway evidence-key check failed (see "Gateway evidence key" below), which witnessed head the pack contradicts (see "Witness files" below), which signed retention policy or retirement receipt failed the policy check (see "Further checks"), or why a restored backup's section fails (see "Local-chain evidence"). |
+| `2` | This verifier cannot evaluate the pack: an unsupported hash version, manifest version, storage layout, evidence class, content claim, signature method or bundle format (use a newer release), an unusable `--trusted-root`, an anchor from a witness with no trust root (pass `--tsa-root`), a pack signed by a per-tenant signer checked without `--certificate-identity`, a pack or export signed by a gateway evidence key checked with neither `--attestation-key` nor `--gateway-key`, a content-stripped pack read with `--bucket` or `--s3-bucket` or still carrying a removed field, a retention rule or pack source this verifier does not read, a retirement receipt whose signature no key checks, a supplied retention policy whose format, rule or signature format this verifier does not read, a restored backup's section it cannot read, `--retention-policy` without `--retention-policy-key` (or the other way round), or a pack read online from a store other than the one its manifest names. |
 | `3` | The records verified, but the pack is unsigned, so nothing shows who produced the manifest. |
 | `4` | Integrity passed, coverage not established. Every record verified, but the pack does not reach a sequence the chain is known to have reached: the pack claims the whole chain up to its head and a verified chain-head anchor, or a chain head the gateway signed, names a later head, the pack stops before the sequence you passed with `--require-through`, or it stops before a head its control plane witnessed (`--witness`). Not a pass, and not a tampering verdict (see "Local-chain evidence" below). |
 
@@ -427,6 +427,19 @@ the modes (`evidence_modes`, [SPEC.md](SPEC.md) §6.8) must list exactly the
 seals in the records; otherwise the pack fails with `FAIL evidence_modes`
 lines instead.
 
+**Restored backups.** A gateway can also write a pack from the restored copy
+of a backup of its chain, once a restore test of that copy passed its digest
+and integrity checks. Such a pack is a local-chain pack with evidence class
+`restored-backup-not-write-once` and a `restored_backup` section naming the
+backup, the restore test and the chain head sealed for the backup
+([SPEC.md](SPEC.md) §6.5). The verifier prints `RESTORED BACKUP: backup … taken
+… (sha256 …), restore test … at …: passed.` and adds `[restored backup: …,
+restore test …]` to every verdict line. It fails a pack that does not end at
+the sealed head, a section that contradicts the manifest, and a pack whose
+restore test the gateway recorded as failed (exit `1`). A restored-backup
+pack shows that the backup restores to a chain that verifies up to that
+head; it does not show that the live chain still holds those records.
+
 `fixtures/local-chain/` holds eleven packs: a clean local-chain pack, the
 same chain packed at an earlier head and checked against the later anchor
 (exit `4`), that pack with its claim edited (exit `1`), a chain with a
@@ -662,8 +675,22 @@ the same exit-code precedence.
   range of records that is not in the pack verifies as retired only when
   signed receipts of the pack's own store, restated by the manifest's
   `retirements` ledger, cover it exactly; any other gap fails. The verdict
-  names the retired records and says the retention policy was not checked
-  ([SPEC.md](SPEC.md) §4.3, §6.11).
+  names the retired records and says the retention policy was not checked,
+  unless you supply it ([SPEC.md](SPEC.md) §4.3, §6.11).
+- `--retention-policy PATH`, with `--retention-policy-key FILE`: check each
+  retirement receipt against the signed retention policy revision it names.
+  Give the revisions as files, or a directory of `.json` files, and pin the
+  project's bundle signing key (a P-256 JWK or PEM public key; it is not the
+  attestation key). Each revision's signature is checked under the pinned
+  key over a statement the verifier builds from the policy's own digest, the
+  revisions against each other (linked, retention never decreasing), and
+  each receipt against its revision: the digest it names, the retention when
+  it was sealed, and the revision's holds. A copy that is unsigned, forged
+  or for another project, and a receipt the policy does not allow, fail
+  (exit `1`). A receipt whose revision you did not supply still reads as
+  retired, with that revision "not supplied". The verdict then says
+  `policy checked` instead of "not checked"; it never says the chain is
+  complete ([SPEC.md](SPEC.md) §6.13).
 - **Pack source** (no flag). A manifest's `source` names the store the
   records were read from and what the pack generator observed about its
   immutability. It is printed before the records and on every verdict line
@@ -755,7 +782,8 @@ pack with its hash-only stubs, 1.6 the retirements ledger). It declares the pack
 `judgment-verdicts-v2`, `control-probe-runs-v1`, `judgment-verdicts-v3`,
 `witness-file-v1`, `verification-receipt-v1`, `context-provenance-v1`,
 `provenance-verifications-v1`, `judgment-verdicts-v4`,
-`retention-retirement-v1`, `judgment-verdicts-v5` and `pack-source-v1`.
+`retention-retirement-v1`, `judgment-verdicts-v5`, `pack-source-v1`,
+`restored-backup-evidence-v1` and `retention-policy-v1`.
 A record of an unknown
 version or kind fails verification rather than being skipped; a manifest of
 an unknown version, storage layout, evidence class or content claim is
