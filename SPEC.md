@@ -8,12 +8,14 @@ pins the values below against fixture hashes.
 Status: describes chain records with `schema_version` v1 through v1.28, the
 per-record and segment storage layouts, pack manifest `schema_version` 1.0
 through 1.6, the control-plane chain a 1.3 manifest carries, the per-tenant
-pack signature, the local-chain evidence class (§6.5), the manifest's
-coverage claim (§6.7) and list of evidence modes (§6.8), the retirements
-ledger of a 1.6 manifest (§6.11) and the manifest's source section (§6.12),
-the export copy a pack can be checked against (§9), the customer-conditions
-verdict (§10), record signatures (§11) and the gateway evidence key (§12), as
-read by `verify-pack.py` from meilynx-proxy commit `5be3dace` (2026-11-26). A chain written before the
+pack signature, the local-chain and restored-backup evidence classes
+(§6.5), the manifest's coverage claim (§6.7) and list of evidence modes
+(§6.8), the retirements ledger of a 1.6 manifest (§6.11), the manifest's
+source section (§6.12), the signed retention policy a retirement names
+(§6.13), the export copy a pack can be checked against (§9), the
+customer-conditions verdict (§10), record signatures (§11) and the gateway
+evidence key (§12), as read by `verify-pack.py` from meilynx-proxy commit
+`9e933c2a` (2026-11-27). A chain written before the
 segment rollout is per-record, and its packs carry manifest 1.0 or 1.1.
 
 ## 1. Records
@@ -941,10 +943,11 @@ reads as retired. In a 1.6 pack the receipt is what lets a missing range
 verify as retired, under the checks of §6.11.
 
 What a retirement receipt does not show: that the retention policy allowed
-the retirement. The policy is named by its digest and revision only; the
-pack does not hold it, and the verifier does not check it, the rule it names
-or the holds. The `gcs` counts and capture-list digest are checked for their
-form only. A receipt shows that the gateway sealed a statement of the span
+the retirement. The policy is named by its digest and revision only, and the
+pack does not hold it. Unless the reader supplies the signed policy
+revisions with the project's key (§6.13), the verifier does not check the
+policy, the rule it names or the holds. The `gcs` counts and capture-list
+digest are checked for their form only. A receipt shows that the gateway sealed a statement of the span
 it retired, and that the statement has not changed since.
 
 **v1.28 `judgment.verdict`**: the v1.22 record and preimage, unchanged, with
@@ -1446,6 +1449,7 @@ reads:
 |---|---|
 | `sandbox-non-production` | Evidence sealed on a self-serve evaluation tenant, not production evidence. |
 | `local-chain-not-write-once` | Records read from a gateway's own local hash chain. No write-once store confirmed them, and the pack is unsigned. |
+| `restored-backup-not-write-once` | Records read from the restored copy of a backup of a gateway's local hash chain, not from the live chain. No write-once store confirmed them, and nothing shows that the gateway still holds them. Carried only with a `restored_backup` section (below). |
 
 The verifier prints the label and its meaning before the records and the
 label on every verdict line. An unknown label, a 1.4 manifest without one,
@@ -1474,6 +1478,51 @@ anchor cannot be detected); anything about records after the last anchor
 beyond their internal consistency. The one truncation a reader can detect is
 a pack that stops before a head that a later anchor names, which §6.7
 reports as coverage not established.
+
+**Restored-backup packs.** A gateway can back up its local chain and test a
+backup by restoring it to a separate copy. When that copy matches the
+backup's digest and passes the database's integrity check, the gateway can
+write a pack of the restored chain. Such a pack is built like a local-chain
+pack: one chain from sequence 0 to its head, a `chain_to_head` claim
+(§6.7), a `local_chain` source (§6.12), unsigned. It carries the
+`restored-backup-not-write-once` class and a required `restored_backup`
+section naming the backup and its restore test:
+
+```json
+"restored_backup": {
+  "backup_id": "<uuid>", "backup_taken_at": "<timestamp>", "backup_sha256": "<hex>",
+  "test_id": "<uuid>", "tested_at": "<timestamp>",
+  "restore_test": "passed", "failures": [],
+  "sealed_head": {"sequence": 4, "event_hash": "<hex>"}
+}
+```
+
+`sealed_head` is the chain head the gateway sealed for the backup when it
+took it. The verifier reads the section as follows:
+
+| Finding | Verdict |
+|---|---|
+| A section that does not hold exactly these eight members; a `backup_id` or `test_id` that is not a lowercase UUID; an empty or non-string time; a `backup_sha256` that is not 64 lowercase hex; a `restore_test` other than `passed` or `failed`; `failures` that are not a list of codes (`[a-z][a-z0-9_]*`); a `sealed_head` that is not exactly an unsigned `sequence` and a 64-hex `event_hash` | Cannot evaluate (exit 2) |
+| The section without the class, or the class without the section | Fail (exit 1) |
+| `restore_test` `passed` with failures, or `failed` with none | Fail (exit 1) |
+| A `sealed_head` sequence other than the manifest's `to_sequence`, or a record at that sequence whose `event_hash` is not the sealed head's | Fail (exit 1) |
+| `restore_test` `failed` | Fail (exit 1): the pack is the evidence of that failure, not of a sound backup |
+
+A contradiction or a failed test prints `FAIL restored backup: …`.
+Otherwise the verifier prints `RESTORED BACKUP: backup <backup_id> taken
+<backup_taken_at> (sha256 <backup_sha256>), restore test <test_id> at
+<tested_at>: passed.`, and every verdict line carries `[restored backup:
+<backup_id>, restore test <test_id>]` after the class and source labels. The
+verdict line of a live local-chain pack, and of every other pack, is
+unchanged.
+
+What a restored-backup pack shows: that the copy restored from the backup
+holds a chain whose records verify and link, and that it ends at the head the
+gateway sealed for the backup. What it does not show, beyond what a
+local-chain pack does not: that the live chain still holds these records,
+or anything about records sealed after the backup. The restore test is the
+gateway's own statement, and the pack is unsigned. A verifier before 0.19.0
+is cannot evaluate (exit 2) on the class.
 
 ### 6.6 Content-stripped packs (manifest 1.5)
 
@@ -1726,7 +1775,17 @@ gateway's key (`--gateway-key`) or the pack carries attestations
 | A counted head after the pack's last record, whatever the pack claims | Coverage not established (exit 4) |
 | No counted head for the pack's chain | Coverage not established (exit 4) |
 | A head that does not count, a head before the pack's first record, another chain of the gateway, a recorded contradiction | NOTICE |
+| A head inside a range the walk read as retired (§6.11) | NOTICE, never counted: neither coverage nor a contradiction |
 | A token whose witness has no trust root, or that cannot be parsed, on a head that does not otherwise count | Cannot evaluate (exit 2) |
+
+A head in a retired range prints `NOTICE witness seq=<seq> (<basis>):
+retired under policy revision <R> (seq=<A>..<B>); not counted`, adding
+`(policy revision <R> not supplied)`, `(the policy check failed)` or
+`(policy not checked)` unless the receipt was checked against its signed
+policy (§6.13). It is never the head the pack is witnessed through. A file
+whose only heads are retired establishes no coverage (exit 4), and the
+`WITNESS COVERAGE NOT ESTABLISHED` line counts them: `…; <n> witnessed
+head(s) are in retired spans, which no pack covers`.
 
 A pass prints `WITNESS OK: chain <chain> matches <n> witnessed head(s)
 inside the pack, witnessed through seq=<seq> (<basis>, <time>)`. A witnessed
@@ -1817,8 +1876,8 @@ record(s) missing and no sealed retirement covers them exactly`, or the
 reason a covering receipt does not count.
 
 The pack's store is the `source` store its manifest names (§6.12), else
-`local_chain` for a `local-chain-not-write-once` pack and `gcs_worm`
-otherwise. A `local_buffer` receipt never covers a range, and no receipt
+`local_chain` for a `local-chain-not-write-once` or
+`restored-backup-not-write-once` pack and `gcs_worm` otherwise. A `local_buffer` receipt never covers a range, and no receipt
 store names an S3 bucket, so this verifier reads no range of an `s3_worm`
 pack as retired.
 
@@ -1848,7 +1907,9 @@ verifier does not read is cannot evaluate too (§4.3). Failures outrank both.
 retired under K sealed retirement(s), policy revision R; the retention
 policy was not checked`, and its verdict line adds `N earlier record(s)
 retired under K sealed retirement(s) under policy revision R (retired,
-policy not checked)`. It never says the chain is complete. A
+policy not checked)`. When the reader supplies the signed policy (§6.13),
+both lines say instead how far it was checked. It never says the chain is
+complete. A
 `chain_to_head` claim (§6.7) on a 1.6 pack may start one past the prefix the
 ledger retired from sequence 0, by consecutive entries of the pack's store,
 and prints `CLAIM: chain C from seq=L up to its head at seq=H, every record
@@ -1856,10 +1917,12 @@ before seq=L retired under the receipts its retirements ledger names`; the
 walk still checks every receipt.
 
 What a retired range does not show: the retired records. They are gone, and
-nothing in the pack shows what they held. It does not show that the
-retention policy allowed their removal: the policy itself is not checked
-(§4.3). It shows that a signed receipt sealed on the chain names the range,
-and that the chain links across it.
+nothing in the pack shows what they held. On its own it does not show that
+the retention policy allowed their removal: the pack does not hold the
+policy (§4.3). It shows that a signed receipt sealed on the chain names the
+range, and that the chain links across it. A reader who holds the project's
+signed policy revisions can check each receipt against the revision it
+names (§6.13).
 
 **Older verifiers.** A verifier before 0.18.0 is cannot evaluate (exit 2) on
 a 1.6 manifest, and fails a v1.27 record in a pack of an earlier manifest
@@ -1913,7 +1976,7 @@ of the chain's keys found besides each key's first version.
 | An Object Lock verdict `compliant` on a basis other than `object_lock_compliant`, or `refused` on that basis | Fail (exit 1) |
 | A `refused` verdict that names no refusal, or a `compliant` one that lists refusals, whose `mode` is not `COMPLIANCE`, or whose `default_retention_days` is below `floor_days` | Fail (exit 1) |
 | A version-findings `count` of 0 with codes, or above 0 with none, or fewer than its codes | Fail (exit 1) |
-| A `local_chain` source on a pack without the `local-chain-not-write-once` evidence class, or that class with another store | Fail (exit 1) |
+| A `local_chain` source on a pack without the `local-chain-not-write-once` or `restored-backup-not-write-once` evidence class, or either class with another store | Fail (exit 1) |
 
 A contradiction prints `FAIL source: …` and the verdict `FAIL: the
 manifest's source section contradicts the manifest`. Otherwise the verifier
@@ -1960,6 +2023,149 @@ its records could not have been changed, though they may still be intact.
 
 **Older verifiers.** A verifier before 0.18.0 ignores `source`: it verifies
 the records but prints no source label, and it has no `--s3-bucket`.
+
+### 6.13 Signed retention policies
+
+A retirement receipt (§4.3, v1.27) names the policy it was sealed under by
+`policy_sha256` and `policy_revision`, and the pack does not carry that
+policy. The project's control plane signs every revision of its retention
+policy with the project's bundle signing key. A reader who obtains the
+signed revisions can check each receipt against the revision it names:
+
+- `--retention-policy PATH`: one signed revision as a file, or a directory
+  whose `.json` files are each one, read in name order. Repeat it to give
+  several.
+- `--retention-policy-key FILE`: the project's bundle signing key, a P-256
+  public key as a bare JWK, as `{"keyId": …, "jwk": {…}}` (a stated `keyId`
+  must be the key's RFC 7638 thumbprint), or as a PEM public key. Repeat it
+  to pin several. It is not the gateway attestation key (§12).
+
+Either flag without the other, a path that is neither a file nor a
+directory, a directory with no `.json` file, a file that is not a JSON
+object with a `policy` object, and a key that is not a P-256 public key are
+usage errors (exit 2) before any record is read.
+
+**A signed copy.** A JSON object with exactly `policy` (the revision's body)
+and `signature`, and optionally `copy`, which this verifier does not read
+(it states whether a gateway may act on the copy now, which says nothing
+about records the gateway already retired). Any other member is cannot
+evaluate (exit 2). `signature` holds `format_version` and `signature`
+(strings), and only `key_id` and `public_key_jwk` besides; a signature
+object of another shape fails (exit 1). A `format_version` other than
+`bundle_signature.v1` is cannot evaluate.
+
+**The statement.** The verifier builds the signed statement itself, never
+reading it from the copy:
+
+```json
+{"artifact":"retention_policy","format_version":"bundle_signature.v1","project_id":"<the policy's project_id>","sha256":"<hex>"}
+```
+
+`sha256` is the SHA-256 of the RFC 8785 bytes of the policy body alone,
+never of the signed copy: it is the `policy_sha256` a receipt names, and the
+`previous_sha256` the next revision names. `signature` is ECDSA P-256 with
+SHA-256 over the statement's RFC 8785 bytes, the 64-byte `r || s` in
+standard base64. It must verify under one of the keys the reader pinned. The
+key the copy names (`key_id`, `public_key_jwk`) is never trusted. A copy
+without a signature, one that does not verify, one whose policy names no
+project, and a signature that is not 64 bytes fail (exit 1).
+
+**The policy body** (`retention_policy.v1`) holds exactly these members:
+
+| Member | Rule |
+|---|---|
+| `format_version` | `retention_policy.v1`; any other format is cannot evaluate (exit 2) |
+| `project_id` | A non-empty string, the project the policy governs |
+| `revision` | An integer of 1 or more |
+| `previous_sha256` | `null` on revision 1; otherwise 64 lowercase hex, the body digest of the revision before |
+| `issued_at` | An RFC 3339 timestamp in UTC |
+| `retention_rule` | `monotone`; any other rule is cannot evaluate (exit 2) |
+| `retention_days` | An integer of 1 or more |
+| `retention_schedule` | A non-empty list of `{revision, effective_from, retention_days}`: each `revision` from 1 to this one and increasing, each `effective_from` an RFC 3339 UTC timestamp not before the entry before it, each `retention_days` 1 or more and never lower than the entry before it; the last entry states `retention_days` |
+| `holds` | A list of holds with distinct `hold_id`s (below) |
+
+A hold holds exactly `hold_id` (1 to 64 characters from `A-Za-z0-9_-`,
+starting with a letter or digit), `reason_code` (a code of lowercase letters,
+digits and underscores, up to 64 characters, starting with a letter),
+`chain_id` (a chain, or `null`), `sequences` (`{first, last}` with `first`
+≤ `last`, or `null`; a sequence span needs a `chain_id`) and `occurred`
+(`{from, until}`, RFC 3339 UTC timestamps, `until` `null` for an open hold
+or not before `from`; or `null`). A hold names at least one of a chain, a
+sequence span and a time span. It carries no free text. A body that breaks
+any of these fails (exit 1), naming the member.
+
+**The revisions against each other.** All supplied revisions must name one
+project, and, when the manifest names a `project_id`, the pack's (a pack
+that names none prints a NOTICE that the policy is bound to its project by
+the pinned key only). Two different bodies under one revision fail. For two
+supplied revisions in order:
+
+- consecutive revisions must link: the later one's `previous_sha256` is the
+  earlier one's body digest. Revisions that are not consecutive print a
+  NOTICE that the link between them was not checked;
+- `retention_days` never decreases;
+- the later `retention_schedule` begins with the earlier one and adds at
+  most one entry per revision in between, each for one of those revisions.
+
+A schedule entry that names a supplied revision must state that revision's
+`retention_days`. The verifier then prints one line listing the revisions
+that verified: `RETENTION POLICY: revision <R>[, <R>…] signed under the
+bundle signing key you pinned`.
+
+**Each receipt against its revision.** Every receipt the retirements ledger
+names (§6.11) that passed the ledger's checks is checked. The floor applies
+whether or not its revision was supplied: `retention_applied_days` must not
+be below the highest retention stated for any revision up to the receipt's,
+by that revision's own `retention_days` when it was supplied, or by an entry
+for it in any supplied revision's schedule (a later revision's schedule
+records the earlier ones). When the revision the receipt names was
+supplied, the receipt must also hold to it:
+
+- `policy_sha256` is that revision's body digest;
+- `retention_rule` is that revision's rule;
+- `newest_occurred_at` plus that revision's `retention_days` is not after
+  `run_started_at`: the span was older than the retention when the receipt
+  was sealed;
+- every id in `hold_ids` is a hold of that revision;
+- no hold of that revision reaches the span. A hold reaches it when every
+  scope the hold names does: its `chain_id` is the receipt's chain, its
+  sequence span meets `first_sequence`..`last_sequence`, and its time span
+  meets `oldest_occurred_at`..`newest_occurred_at` (an open hold runs on).
+  Any overlap counts: a held record ends the prefix a gateway retires.
+
+A break fails the pack: `FAIL retention policy <file>: …` for a copy,
+`FAIL retention policy revision <R>: …` for the revisions against each
+other, `FAIL retirement seq=<N>: …` for a receipt (exit 1). A copy this
+verifier cannot read prints `CANNOT EVALUATE retention policy <file>: …`
+(exit 2); then no receipt is checked against the policy. Failures outrank
+cannot evaluate.
+
+**Verdict.** The `RETIREMENTS` line and the verdict line of §6.11 say how far
+the policy was checked, by revision: `policy checked` when every revision
+the receipts name was supplied and held, `policy revision <R> not supplied`
+for a revision the reader did not give, and `policy revision <R> failed` for
+one a receipt broke. Without `--retention-policy`, or when a supplied copy
+could not be evaluated, both lines keep the wording of §6.11 (the policy was
+not checked). A list combines the readings, for
+example `(retired, policy revision 1 checked, policy revision 3 not
+supplied)`. A receipt whose revision was not supplied still verifies as
+retired (exit 0); it is never read as checked. The verdict never says the
+chain is complete.
+
+What a checked policy shows: that a revision signed with the key the reader
+pinned allowed each receipt as the receipt states it (its retention when the
+receipt was sealed, and no hold of that revision over the span), and that
+the revisions supplied form one history in which retention never decreases.
+What it does not show: that the revision a receipt names was the one in
+force when it was sealed (the verifier does not compare `issued_at` or
+`effective_from` with the receipt's times); that a hold placed in a later
+revision did not cover the span; that the reader holds every revision; or
+that the pinned key is the project's. The reader obtains the key from the
+project, outside the pack.
+
+**Older verifiers.** A verifier before 0.19.0 has no `--retention-policy`
+(a usage error, exit 2), and reads every retired range with the policy not
+checked.
 
 ## 7. Signed packs (window B)
 

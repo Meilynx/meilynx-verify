@@ -346,11 +346,29 @@ EVIDENCE_CLASSES = {
         "records read from a gateway's own local hash chain; no write-once store "
         "confirmed them, so this pack cannot show that its history is complete"
     ),
+    "restored-backup-not-write-once": (
+        "records read from the restored copy of a backup of a gateway's local hash "
+        "chain, not from the live chain; no write-once store confirmed them, so this "
+        "pack cannot show that its history is complete or that the gateway still holds it"
+    ),
 }
 # The class of a pack read from a gateway's local chain. Such a pack is built
 # from sequence 0 to the chain's head, from a store its operator can rewrite,
 # so it claims the whole chain up to that head (CLAIM_CHAIN_TO_HEAD).
 LOCAL_CHAIN_EVIDENCE_CLASS = "local-chain-not-write-once"
+# The class of a pack read from the restored copy of a gateway's evidence
+# store backup: the local chain as the backup held it. Built like a local-chain
+# pack, and carried only with the manifest's `restored_backup` section, which
+# names the backup, the restore test of the copy and the chain head sealed for
+# the backup (manifest_restored_backup).
+RESTORED_BACKUP_EVIDENCE_CLASS = "restored-backup-not-write-once"
+LOCAL_CHAIN_EVIDENCE_CLASSES = (LOCAL_CHAIN_EVIDENCE_CLASS, RESTORED_BACKUP_EVIDENCE_CLASS)
+
+
+def is_local_chain_class(manifest):
+    """The pack's records come from a gateway's local chain: the live chain,
+    or the restored copy of a backup of it."""
+    return manifest.get("evidence_class") in LOCAL_CHAIN_EVIDENCE_CLASSES
 # A manifest's `claim`: what the pack says it holds. `chain_to_head`: every
 # record of the chain from sequence 0 up to the head its generator read.
 # `interval`: one window of a longer chain (a pack read from a write-once
@@ -528,6 +546,12 @@ EVIDENCE_MODE_INDEX_FIELDS = ("sequence", "mode", "source")
 # chain without the local-chain evidence class or that class on another
 # store), and reads an S3 pack online with --s3-bucket, each key's first
 # version. An S3 bucket whose lock was not confirmed is labelled, never failed.
+# `restored-backup-evidence-v1` reads the restored-backup-not-write-once class
+# and the manifest's `restored_backup` section: names the backup and the
+# restore test on every verdict line, refuses a section it cannot read (exit
+# 2), and fails a section without its class or the class without the section,
+# a pack that does not end at the chain head sealed for the backup, and a pack
+# whose restore test the gateway recorded as failed.
 VERIFIER_CAPABILITIES = frozenset(
     {"chain-anchors-v1", "segmented-records-v1", "decision-receipts-v1", "evaluation-trace-v1",
      "data-reach-evidence-v1", "control-plane-chain-v1", "ocsf-export-v1", "customer-scope-v1",
@@ -536,7 +560,8 @@ VERIFIER_CAPABILITIES = frozenset(
      "evidence-modes-v1", "gateway-evidence-key-v1", "judgment-verdicts-v1",
      "judgment-verdicts-v2", "control-probe-runs-v1", "judgment-verdicts-v3", "witness-file-v1",
      "verification-receipt-v1", "context-provenance-v1", "provenance-verifications-v1",
-     "judgment-verdicts-v4", "retention-retirement-v1", "judgment-verdicts-v5", "pack-source-v1"}
+     "judgment-verdicts-v4", "retention-retirement-v1", "judgment-verdicts-v5", "pack-source-v1",
+     "restored-backup-evidence-v1", "retention-policy-v1"}
 )
 # The stripped profile of a manifest 1.5 Exchange pack. Mirror of
 # `exchange::STRIPPED_FIELDS` / `WITHHELD_FIELDS` / `STUB_FIELDS` /
@@ -9941,7 +9966,7 @@ class RecordSignatureWalk:
 def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=False, holders=None,
                          receipts_out=None, records_out=None, stripped=frozenset(), cannot_evaluate_out=None,
                          stubs=None, chain_keys=(), signatures_out=None, chain_keys_label=None,
-                         retired_out=None):
+                         retired_out=None, retention_policies=None, policy_keys=()):
     """Walk each event in the manifest, fetch its record through `fetch(seq)`,
     recompute the hash and check the chain linkage. Source-agnostic: `fetch`
     is the only thing that differs between the GCS and the offline path, so
@@ -10336,6 +10361,7 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             report(f"FAIL seq={seq}: the retention.retirement record is not in the manifest's retirements ledger")
             all_passed = False
         unchecked = set()
+        sound = []
         for e in ledger:
             seq, rec = e['sequence'], receipt_records.get(e['sequence'])
             problem = None
@@ -10365,16 +10391,47 @@ def verify_manifest_with(fetch, manifest, quiet=False, require_manifest_hash=Fal
             if problem:
                 report(f"FAIL retirement seq={seq}: {problem}")
                 all_passed = False
+            else:
+                sound.append((seq, rec['payload']))
+    # The signed retention policy the reader supplied, then each sound
+    # receipt against the revision it names.
+    policy_states = {}
+    if retention_policies is not None:
+        revisions_in, failures, unknown = judge_retention_policies(
+            retention_policies, policy_keys, manifest.get('project_id'), report)
+        for seq, payload in ([] if revisions_in is None or ledger is None else sound):
+            state, problems = check_receipt_against_policy(seq, payload, revisions_in)
+            failures += problems
+            policy_states[seq] = 'failed' if problems else state
+        for line in failures:
+            report(line)
+            all_passed = False
+        for line in unknown:
+            report(f"CANNOT EVALUATE {line}")
+            if cannot_evaluate_out is not None:
+                cannot_evaluate_out.append((None, line))
+            else:
+                all_passed = False
+    if ledger is not None:
         if retired_spans:
             total = sum(hi - lo + 1 for lo, hi, _ in retired_spans)
             receipts_used = sum(len(spans) for _, _, spans in retired_spans)
             revisions = sorted({e['policy_revision'] for _, _, spans in retired_spans for e in spans})
+            by_receipt = [(e['first_sequence'], e['last_sequence'], e['sequence'], e['policy_revision'],
+                           policy_states.get(e['sequence'], 'not_checked'))
+                          for _, _, spans in retired_spans for e in spans]
+            states = {}
+            for *_, rev, state in by_receipt:
+                if states.get(rev) in (None, 'checked'):
+                    states[rev] = state
+            phrase = retired_policy_phrase(states)
             report(f"RETIREMENTS: {total} record(s) retired under {receipts_used} sealed retirement(s), policy "
-                   f"revision {', '.join(map(str, revisions))}; the retention policy was not checked")
+                   f"revision {', '.join(map(str, revisions))}; "
+                   + ("the retention policy was not checked" if phrase == 'policy not checked' else phrase))
             if retired_out is not None:
                 retired_out.update(records=total, receipts=receipts_used, revisions=revisions,
                                    spans=[(lo, hi) for lo, hi, _ in retired_spans],
-                                   unchecked=sorted(unchecked))
+                                   unchecked=sorted(unchecked), by_receipt=by_receipt, policy=states)
     if signatures_out is not None:
         signatures_out['state'] = sig_walk.state()
         signatures_out['walk'] = sig_walk
@@ -12965,7 +13022,7 @@ def manifest_claim(manifest):
     lo, hi = manifest.get("from_sequence"), manifest.get("to_sequence")
     claim = manifest.get("claim")
     if claim is None:
-        scope = CLAIM_CHAIN_TO_HEAD if manifest.get("evidence_class") == LOCAL_CHAIN_EVIDENCE_CLASS else CLAIM_INTERVAL
+        scope = CLAIM_CHAIN_TO_HEAD if is_local_chain_class(manifest) else CLAIM_INTERVAL
         return scope, lo, hi, False
     if not isinstance(claim, dict) or set(claim) != {"scope", "from_sequence", "to_sequence"}:
         raise ValueError("manifest claim must carry exactly scope, from_sequence, to_sequence")
@@ -12985,11 +13042,11 @@ def manifest_claim(manifest):
             raise ClaimContradiction(f"the manifest claims the whole chain up to its head but starts at seq={c_lo}"
                                      + ("" if through is None else
                                         f", and its retirements ledger retired seq=0..{through}"))
-    if scope != CLAIM_CHAIN_TO_HEAD and manifest.get("evidence_class") == LOCAL_CHAIN_EVIDENCE_CLASS:
+    if scope != CLAIM_CHAIN_TO_HEAD and is_local_chain_class(manifest):
         # A local-chain pack is only ever built from 0 to the head its
         # gateway held. Relabelling it a window would stop a later anchor
         # from being judged.
-        raise ClaimContradiction(f"a {LOCAL_CHAIN_EVIDENCE_CLASS} pack claims {scope!r}; such a pack is built "
+        raise ClaimContradiction(f"a {manifest['evidence_class']} pack claims {scope!r}; such a pack is built "
                                  f"from seq=0 to its head and claims {CLAIM_CHAIN_TO_HEAD!r}")
     return scope, c_lo, c_hi, True
 
@@ -13118,12 +13175,13 @@ def manifest_source(manifest):
         _source_version_findings(findings)
     elif lock is not None or findings is not None:
         raise SourceContradiction(f"a {store} source carries an S3 Object Lock observation or version findings")
-    local_class = manifest.get("evidence_class") == LOCAL_CHAIN_EVIDENCE_CLASS
+    local_class = is_local_chain_class(manifest)
     if store == SOURCE_STORE_LOCAL_CHAIN and not local_class:
         raise SourceContradiction(f"the records come from a gateway's local chain but the pack does not carry "
-                                  f"the {LOCAL_CHAIN_EVIDENCE_CLASS} evidence class")
+                                  f"the {LOCAL_CHAIN_EVIDENCE_CLASS} or {RESTORED_BACKUP_EVIDENCE_CLASS} evidence "
+                                  f"class")
     if local_class and store != SOURCE_STORE_LOCAL_CHAIN:
-        raise SourceContradiction(f"the pack carries the {LOCAL_CHAIN_EVIDENCE_CLASS} evidence class but names "
+        raise SourceContradiction(f"the pack carries the {manifest['evidence_class']} evidence class but names "
                                   f"{store} as its source")
     return store, basis, lock, findings
 
@@ -13174,6 +13232,114 @@ def source_suffix(manifest):
     return f" [source: {source[0]}, {source[1]}]"
 
 
+RESTORE_TEST_RESULTS = ("passed", "failed")
+_RESTORED_BACKUP_KEYS = {"backup_id", "backup_taken_at", "backup_sha256", "test_id", "tested_at", "restore_test",
+                         "failures", "sealed_head"}
+_RESTORED_ID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
+_RESTORED_FAILURE_RE = re.compile(r"[a-z][a-z0-9_]*")
+
+
+class RestoredBackupContradiction(Exception):
+    """A restored_backup section that disagrees with the manifest itself."""
+
+
+def manifest_restored_backup(manifest):
+    """The manifest's `restored_backup` section, or None when the pack is not
+    a restored backup's. Raises ValueError for a section this verifier cannot
+    read and RestoredBackupContradiction for one that disagrees with the
+    manifest: a section without the restored-backup class, the class without
+    a section, a result its failures contradict, or a sealed head that is not
+    the pack's last sequence."""
+    restored_class = manifest.get("evidence_class") == RESTORED_BACKUP_EVIDENCE_CLASS
+    if "restored_backup" not in manifest:
+        if restored_class:
+            raise RestoredBackupContradiction(f"the pack carries the {RESTORED_BACKUP_EVIDENCE_CLASS} evidence class "
+                                              f"but no restored_backup section naming the backup and its restore test")
+        return None
+    if not restored_class:
+        raise RestoredBackupContradiction(f"the pack names a restored backup but does not carry the "
+                                          f"{RESTORED_BACKUP_EVIDENCE_CLASS} evidence class")
+    section = manifest["restored_backup"]
+    if not isinstance(section, dict) or set(section) != _RESTORED_BACKUP_KEYS:
+        raise ValueError("manifest restored_backup must carry exactly " + ", ".join(sorted(_RESTORED_BACKUP_KEYS)))
+    for key in ("backup_id", "test_id"):
+        if not (isinstance(section[key], str) and _RESTORED_ID_RE.fullmatch(section[key])):
+            raise ValueError(f"manifest restored_backup {key} must be a lowercase UUID")
+    for key in ("backup_taken_at", "tested_at"):
+        if not (isinstance(section[key], str) and section[key]):
+            raise ValueError(f"manifest restored_backup {key} must be a timestamp")
+    if not (isinstance(section["backup_sha256"], str) and _SHA256_HEX.fullmatch(section["backup_sha256"])):
+        raise ValueError("manifest restored_backup backup_sha256 must be 64 lowercase hex characters")
+    result, failures = section["restore_test"], section["failures"]
+    if result not in RESTORE_TEST_RESULTS:
+        raise ValueError(f"manifest restored_backup restore_test {result!r} is not one this verifier reads "
+                         f"({', '.join(RESTORE_TEST_RESULTS)}). Re-run with an updated verifier.")
+    if not (isinstance(failures, list) and all(isinstance(f, str) and _RESTORED_FAILURE_RE.fullmatch(f)
+                                               for f in failures)):
+        raise ValueError("manifest restored_backup failures must be a list of failure codes")
+    head = section["sealed_head"]
+    if not (isinstance(head, dict) and set(head) == {"sequence", "event_hash"} and _is_count(head["sequence"])
+            and isinstance(head["event_hash"], str) and _EVENT_HASH_RE.fullmatch(head["event_hash"])):
+        raise ValueError("manifest restored_backup sealed_head must carry exactly a sequence and a 64-hex event_hash")
+    if (result == "passed") != (not failures):
+        raise RestoredBackupContradiction(f"the restore test is recorded as {result} with "
+                                          f"{len(failures)} failure(s)")
+    if head["sequence"] != manifest.get("to_sequence"):
+        raise RestoredBackupContradiction(f"the chain head sealed for the backup is seq={head['sequence']}, but the "
+                                          f"pack ends at seq={manifest.get('to_sequence')}")
+    return section
+
+
+def check_restored_backup(manifest, records):
+    """Print the backup and the restore test a restored-backup pack was read
+    from and return PASSED, FAILED or CANNOT_EVALUATE (a section this
+    verifier cannot read). FAILED: the section contradicts the manifest, the
+    pack's last record is not the head sealed for the backup, or the gateway
+    recorded the restore test of the copy as failed. `records` are the
+    records the walk read, by sequence; the manifest's entry stands in for a
+    record the walk did not read, which already fails the walk."""
+    try:
+        section = manifest_restored_backup(manifest)
+    except RestoredBackupContradiction as exc:
+        print(f"FAIL restored backup: {exc}")
+        return FAILED
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return CANNOT_EVALUATE
+    if section is None:
+        return PASSED
+    head = section["sealed_head"]
+    print(f"RESTORED BACKUP: backup {section['backup_id']} taken {section['backup_taken_at']} "
+          f"(sha256 {section['backup_sha256']}), restore test {section['test_id']} at {section['tested_at']}: "
+          f"{section['restore_test']}.")
+    status = PASSED
+    record = records.get(head["sequence"])
+    last = record.get("event_hash") if isinstance(record, dict) else next(
+        (e.get("stored_event_hash") for e in manifest.get("events", [])
+         if isinstance(e, dict) and e.get("sequence") == head["sequence"]), None)
+    if last != head["event_hash"]:
+        print(f"FAIL restored backup: the pack's record at seq={head['sequence']} is not the chain head sealed for "
+              f"the backup ({head['event_hash']})")
+        status = FAILED
+    if section["restore_test"] != "passed":
+        print(f"FAIL restored backup: the gateway's restore test of this copy failed "
+              f"({', '.join(section['failures'])}); the pack is the evidence of that failure, not of a sound backup")
+        status = FAILED
+    return status
+
+
+def restored_backup_suffix(manifest):
+    """The label every verdict line carries for a restored-backup pack whose
+    section reads, else ''."""
+    try:
+        section = manifest_restored_backup(manifest)
+    except (ValueError, RestoredBackupContradiction):
+        return ""
+    if section is None:
+        return ""
+    return f" [restored backup: {section['backup_id']}, restore test {section['test_id']}]"
+
+
 def required_coverage_status(manifest, require_through):
     """--require-through: the reader's own expectation of how far the pack
     reaches, independent of the manifest's (possibly unsigned) claim. A pack
@@ -13208,10 +13374,16 @@ def required_coverage_status(manifest, require_through):
 # the reader pins (--attestation-key). An unsigned file therefore counts only
 # timestamp-backed heads, and the verifier says so.
 #
+# Retired heads. A head at a sequence the walk read as retired (inside a span a
+# sealed retirement covers, its records no longer in the pack) is neither
+# coverage nor a contradiction: it is reported as retired, with the policy
+# revision its receipt names, and never counted. A file whose only heads are
+# retired establishes no coverage (exit 4).
+#
 # --receipt FILE writes what the run concluded as a content-free JSON
 # receipt (`meilynx.verification_receipt.v1`, RFC 8785 bytes).
 
-VERIFIER_VERSION = "0.18.0"
+VERIFIER_VERSION = "0.19.0"
 WITNESS_MANIFEST_FORMAT = "meilynx.witness_manifest.v1"
 WITNESS_MANIFEST_NAME = "witness-manifest.json"
 WITNESS_SIGNATURE_DOMAIN = WITNESS_MANIFEST_FORMAT.encode("ascii") + b"\x00"
@@ -13438,6 +13610,7 @@ class WitnessOutcome:
         self.matched = 0
         self.after = 0
         self.not_counted = 0
+        self.retired = 0
         self.through = None
         self.bound = False
 
@@ -13545,10 +13718,13 @@ def _witness_signed_head(wf, m, chain, h, keys):
     return None, f"signed by gateway key {statement['key_fingerprint']}"
 
 
-def judge_witness(witness_path, manifest, records, pins, roots_for, keys, report=print):
+def judge_witness(witness_path, manifest, records, pins, roots_for, keys, report=print, retired=None):
     """Judge the pack against a witness file. Returns a WitnessOutcome whose
     status is PASSED, FAILED, CANNOT_EVALUATE or COVERAGE_NOT_ESTABLISHED.
-    `records` is seq -> record as the chain walk read it."""
+    `records` is seq -> record as the chain walk read it; `retired` is what
+    the walk read as retired. A head inside a retired span is neither a
+    contradiction nor coverage: it is reported as retired, never counted, and
+    never the head the pack is witnessed through."""
     out = WitnessOutcome()
     try:
         wf = WitnessFile(witness_path)
@@ -13604,6 +13780,7 @@ def judge_witness(witness_path, manifest, records, pins, roots_for, keys, report
         report(f"NOTICE witness: {entry['omitted_earlier_heads']} earlier head(s) of chain {chain} are not in the file")
 
     failures, cannot, counted = [], [], []
+    retired_spans = retired_head_spans(retired)
     for h in heads:
         seq, basis = h["seq"], h["basis"]
         if basis == WITNESS_BASIS_TIMESTAMP:
@@ -13622,6 +13799,11 @@ def judge_witness(witness_path, manifest, records, pins, roots_for, keys, report
             continue
         if verdict == "cannot":
             cannot.append(f"ERROR: witness seq={seq} ({basis}) could not be evaluated: {detail}")
+            continue
+        span = next((s for s in retired_spans if s[0] <= seq <= s[1]), None)
+        if span is not None:
+            out.retired += 1
+            report(f"NOTICE witness seq={seq} ({basis}): retired {span[2]} (seq={span[0]}..{span[1]}); not counted")
             continue
         record = records.get(seq) if lo <= seq <= hi else None
         if verdict == "not_counted":
@@ -13659,6 +13841,8 @@ def judge_witness(witness_path, manifest, records, pins, roots_for, keys, report
         out.status = CANNOT_EVALUATE
     elif not counted:
         report(f"WITNESS COVERAGE NOT ESTABLISHED: no witnessed head of chain {chain} counts"
+               + (f"; {out.retired} witnessed head(s) are in retired spans, which no pack covers" if out.retired
+                  else "")
                + ("" if signed or not heads else "; pass --witness-key to count reported heads in a signed file"))
         out.status = COVERAGE_NOT_ESTABLISHED
     elif out.after:
@@ -13914,7 +14098,7 @@ def pack_store(manifest):
     source = manifest.get("source")
     if isinstance(source, dict) and source.get("store") in SOURCE_STORES:
         return source["store"]
-    return 'local_chain' if manifest.get("evidence_class") == LOCAL_CHAIN_EVIDENCE_CLASS else 'gcs_worm'
+    return 'local_chain' if is_local_chain_class(manifest) else 'gcs_worm'
 
 
 def retirement_ledger(manifest):
@@ -14013,6 +14197,424 @@ def retired_gap(lo, hi, entries, store, link_targets):
             return [], None, (f"{count} record(s) missing; the retirement receipt at seq={b['sequence']} does not "
                               f"link to the one at seq={a['sequence']}")
     return spans, spans[-1]['last_event_hash'], None
+
+
+# A retention_policy.v1 revision is the authority a retirement receipt names.
+# The control plane signs each revision with the project's bundle signing key
+# under the bundle_signature.v1 scheme: the verifier builds the statement
+# itself, {"artifact": "retention_policy", "format_version":
+# "bundle_signature.v1", "project_id": <the policy's project>, "sha256": <the
+# SHA-256 of the policy's RFC 8785 bytes>}, as RFC 8785 text, and checks
+# ECDSA P-256 over SHA-256 (r || s, standard base64) under the key the reader
+# pinned (--retention-policy-key). The key the signature object names is
+# never trusted. The digest is over the policy body only, never over a signed
+# copy: it is the policy_sha256 a receipt names and the previous_sha256 the
+# next revision names. A signed copy is {"policy", "signature"} and may carry
+# a `copy` member (its validity for a gateway), which this verifier does not
+# read: whether a gateway may act on a copy now is not a question about the
+# records it already retired.
+RETENTION_POLICY_FORMAT = 'retention_policy.v1'
+RETENTION_POLICY_ARTIFACT = 'retention_policy'
+BUNDLE_SIGNATURE_FORMAT = 'bundle_signature.v1'
+RETENTION_POLICY_FIELDS = ('format_version', 'project_id', 'revision', 'previous_sha256', 'issued_at',
+                           'retention_rule', 'retention_days', 'retention_schedule', 'holds')
+RETENTION_SCHEDULE_FIELDS = ('revision', 'effective_from', 'retention_days')
+RETENTION_HOLD_FIELDS = ('hold_id', 'reason_code', 'chain_id', 'sequences', 'occurred')
+RETENTION_POLICY_COPY_FIELDS = ('policy', 'signature', 'copy')
+BUNDLE_SIGNATURE_FIELDS = ('format_version', 'signature', 'key_id', 'public_key_jwk')
+_RP_REASON_CODE = re.compile(r'\A[a-z][a-z0-9_]{0,63}\Z')
+
+
+def load_retention_policy_copies(specs):
+    """[(label, document)] of the signed retention policy copies the reader
+    supplies: each spec a file, or a directory whose .json files are read in
+    name order. Raises ValueError for a path that is neither, or a file that is
+    not a JSON object carrying a `policy` object."""
+    out = []
+    for spec in specs:
+        path = Path(spec)
+        if path.is_dir():
+            files = sorted(p for p in path.iterdir() if p.is_file() and p.suffix == '.json')
+            if not files:
+                raise ValueError(f'{spec}: the directory holds no .json file')
+        elif path.is_file():
+            files = [path]
+        else:
+            raise ValueError(f'{spec}: no such file or directory')
+        for f in files:
+            doc = json.loads(f.read_text(encoding='utf-8'))
+            if not isinstance(doc, dict) or not isinstance(doc.get('policy'), dict):
+                raise ValueError(f'{f}: not a signed retention policy copy (a JSON object with a policy object)')
+            out.append((str(f), doc))
+    return out
+
+
+def load_policy_key(text):
+    """(point, thumbprint) of the project's bundle signing key: a P-256 JWK,
+    bare or as the control plane serves it ({"keyId": ..., "jwk": {...}}), or
+    a PEM public key. Raises ValueError."""
+    text = text.strip()
+    if text.startswith('-----BEGIN PUBLIC KEY-----'):
+        body = text[len('-----BEGIN PUBLIC KEY-----'):]
+        if '-----END PUBLIC KEY-----' not in body:
+            raise ValueError('unterminated PEM public key')
+        der = base64.b64decode(''.join(body.split('-----END PUBLIC KEY-----')[0].split()), validate=True)
+        try:
+            curve, point = parse_ec_public_key(der)
+        except DerError as exc:
+            raise ValueError(f'the PEM public key is not a P-256 key ({exc})')
+        if curve is not P256:
+            raise ValueError('the PEM public key is not a P-256 key')
+        jwk = {'kty': 'EC', 'crv': 'P-256', 'x': _b64url_text(point[0].to_bytes(32, 'big')),
+               'y': _b64url_text(point[1].to_bytes(32, 'big'))}
+        return point, p256_jwk_thumbprint(jwk)
+    return load_attestation_pin(text, what='the bundle signing key')
+
+
+def retention_policy_statement(project_id, sha256):
+    """The RFC 8785 bytes of the bundle_signature.v1 statement over a
+    retention policy whose body digest is `sha256`."""
+    return jcs_dumps({'artifact': RETENTION_POLICY_ARTIFACT, 'format_version': BUNDLE_SIGNATURE_FORMAT,
+                      'project_id': project_id, 'sha256': sha256}).encode('utf-8')
+
+
+def retention_hold_shape(hold):
+    """None when `hold` is a retention_policy.v1 hold, else what is wrong.
+    A hold names a chain, a sequence span on a chain, a time span, or more
+    than one of them; an opaque hold id; and a reason code, checked for its
+    form only. It carries no free text."""
+    if not isinstance(hold, dict) or set(hold) != set(RETENTION_HOLD_FIELDS):
+        return f"is not exactly {', '.join(RETENTION_HOLD_FIELDS)}"
+    if not (isinstance(hold['hold_id'], str) and _RR_HOLD_ID.match(hold['hold_id'])):
+        return 'carries a hold_id that is not an opaque hold id'
+    if not (isinstance(hold['reason_code'], str) and _RP_REASON_CODE.match(hold['reason_code'])):
+        return 'carries a reason_code that is not a code of lowercase letters, digits and underscores'
+    chain, seqs, occurred = hold['chain_id'], hold['sequences'], hold['occurred']
+    if chain is not None and not (isinstance(chain, str) and chain):
+        return 'carries a chain_id that is neither null nor a chain'
+    if seqs is not None:
+        if (not isinstance(seqs, dict) or set(seqs) != {'first', 'last'} or not _is_count(seqs['first'])
+                or not _is_count(seqs['last']) or seqs['last'] < seqs['first']):
+            return 'carries sequences that are not first and last with first <= last'
+        if chain is None:
+            return 'names a sequence span without the chain it is on'
+    if occurred is not None:
+        start = _utc_instant(occurred.get('from')) if isinstance(occurred, dict) else None
+        until = occurred.get('until') if isinstance(occurred, dict) else None
+        end = None if until is None else _utc_instant(until)
+        if (not isinstance(occurred, dict) or set(occurred) != {'from', 'until'} or start is None
+                or (until is not None and (end is None or end < start))):
+            return ('carries an occurred span that is not from and until, RFC 3339 UTC timestamps, until null '
+                    'or not before from')
+    if chain is None and seqs is None and occurred is None:
+        return 'names no chain, sequence span or time span'
+    return None
+
+
+def retention_policy_shape(body):
+    """The checks of a retention_policy.v1 body once its signature verified.
+    Returns (problems, unknown): `problems` fail the pack, each naming a
+    member; `unknown` is what this verifier cannot evaluate (exit 2)."""
+    if body.get('format_version') != RETENTION_POLICY_FORMAT:
+        return [], [f'its format is not one this verifier reads ({RETENTION_POLICY_FORMAT}). '
+                    f'Re-run with an updated verifier.']
+    if set(body) != set(RETENTION_POLICY_FIELDS):
+        return [f"the policy is not exactly {', '.join(RETENTION_POLICY_FIELDS)}"], []
+    revision = body['revision']
+    if not (_is_count(revision) and revision >= 1):
+        return ['revision is not a revision of 1 or more'], []
+    problems, unknown = [], []
+    previous = body['previous_sha256']
+    if revision == 1 and previous is not None:
+        problems.append('previous_sha256 is not null on revision 1')
+    elif revision > 1 and not (isinstance(previous, str) and _RR_HEX64.match(previous)):
+        problems.append('previous_sha256 is not 64 lowercase hex characters')
+    if _utc_instant(body['issued_at']) is None:
+        problems.append('issued_at is not an RFC 3339 UTC timestamp')
+    if not isinstance(body['project_id'], str) or not body['project_id']:
+        problems.append('project_id is not a project')
+    if body['retention_rule'] not in RETENTION_RULES:
+        unknown.append(f"its retention_rule is not a rule this verifier reads ({', '.join(RETENTION_RULES)}). "
+                       f"Re-run with an updated verifier.")
+    days = body['retention_days']
+    if not (_is_count(days) and days >= 1):
+        problems.append('retention_days is not a number of days of 1 or more')
+    schedule = body['retention_schedule']
+    if not isinstance(schedule, list) or not schedule:
+        problems.append('retention_schedule is not a list of one entry or more')
+    else:
+        prev = None
+        for i, entry in enumerate(schedule):
+            if not isinstance(entry, dict) or set(entry) != set(RETENTION_SCHEDULE_FIELDS):
+                problems.append(f'retention_schedule[{i}] is not exactly revision, effective_from and retention_days')
+                break
+            at = _utc_instant(entry['effective_from'])
+            if not (_is_count(entry['revision']) and 1 <= entry['revision'] <= revision):
+                problems.append(f'retention_schedule[{i}].revision is not a revision from 1 to this one')
+                break
+            if at is None:
+                problems.append(f'retention_schedule[{i}].effective_from is not an RFC 3339 UTC timestamp')
+                break
+            if not (_is_count(entry['retention_days']) and entry['retention_days'] >= 1):
+                problems.append(f'retention_schedule[{i}].retention_days is not a number of days of 1 or more')
+                break
+            if prev is not None:
+                if entry['revision'] <= prev[0]['revision']:
+                    problems.append(f'retention_schedule[{i}] is not after the entry before it in revision order')
+                if at < prev[1]:
+                    problems.append(f'retention_schedule[{i}].effective_from is before the entry before it')
+                if entry['retention_days'] < prev[0]['retention_days']:
+                    problems.append(f"the retention schedule decreases at retention_schedule[{i}] (from "
+                                    f"{prev[0]['retention_days']} to {entry['retention_days']} days); retention "
+                                    f"never decreases")
+            prev = (entry, at)
+        else:
+            if _is_count(days) and schedule[-1]['retention_days'] != days:
+                problems.append('the last retention_schedule entry is not retention_days')
+    holds = body['holds']
+    if not isinstance(holds, list):
+        problems.append('holds is not a list')
+    else:
+        seen = set()
+        for i, hold in enumerate(holds):
+            problem = retention_hold_shape(hold)
+            if problem:
+                problems.append(f'holds[{i}] {problem}')
+            elif hold['hold_id'] in seen:
+                problems.append(f'holds[{i}] repeats a hold id')
+            else:
+                seen.add(hold['hold_id'])
+    return problems, unknown
+
+
+def check_retention_policy_copy(label, doc, keys):
+    """Check one signed copy of a retention_policy.v1 revision under the
+    pinned bundle signing keys `keys` ([(point, thumbprint)]). Returns
+    (revision, failures, unknown): `revision` is {'body', 'sha256', 'label'}
+    when the signature verifies and the body has its shape, else None. An
+    unsigned or forged copy fails; a format this verifier does not read is
+    exit 2."""
+    where = f'retention policy {label}'
+    extra = sorted(set(doc) - set(RETENTION_POLICY_COPY_FIELDS))
+    if extra:
+        return None, [], [f"{where} carries {', '.join(extra)}, which a signed {RETENTION_POLICY_FORMAT} copy does "
+                          f"not. Re-run with an updated verifier."]
+    body = doc['policy']
+    try:
+        digest = hashlib.sha256(jcs_dumps(body).encode('utf-8')).hexdigest()
+    except ValueError as exc:
+        return None, [f'FAIL {where}: the policy has no RFC 8785 form ({exc})'], []
+    sig = doc.get('signature')
+    if sig is None:
+        return None, [f'FAIL {where}: the copy is unsigned; a retention policy counts only signed with the '
+                      f'project key'], []
+    if (not isinstance(sig, dict) or set(sig) - set(BUNDLE_SIGNATURE_FIELDS)
+            or not isinstance(sig.get('format_version'), str) or not isinstance(sig.get('signature'), str)):
+        return None, [f"FAIL {where}: the signature object is not {', '.join(BUNDLE_SIGNATURE_FIELDS)}"], []
+    if sig['format_version'] != BUNDLE_SIGNATURE_FORMAT:
+        return None, [], [f'{where}: its signature format is not one this verifier reads ({BUNDLE_SIGNATURE_FORMAT}). '
+                          f'Re-run with an updated verifier.']
+    project = body.get('project_id')
+    if not isinstance(project, str) or not project:
+        return None, [f'FAIL {where}: the policy names no project, so no signed statement can be built for it'], []
+    try:
+        raw = base64.b64decode(sig['signature'], validate=True)
+    except (binascii.Error, ValueError):
+        raw = b''
+    if len(raw) != 64:
+        return None, [f'FAIL {where}: the signature is not 64 bytes r || s in standard base64'], []
+    r, s = int.from_bytes(raw[:32], 'big'), int.from_bytes(raw[32:], 'big')
+    hashed = hashlib.sha256(retention_policy_statement(project, digest)).digest()
+    if not any(ecdsa_verify(P256, point, hashed, r, s) for point, _ in keys):
+        named = sig.get('key_id') if isinstance(sig.get('key_id'), str) else None
+        return None, [f"FAIL {where}: the signature does not verify under the bundle signing key you pinned "
+                      f"({', '.join(k[1] for k in keys)})"
+                      + (f"; the copy names key {named}, which is never trusted" if named else "")], []
+    problems, unknown = retention_policy_shape(body)
+    if problems or unknown:
+        return None, [f'FAIL {where}: {p}' for p in problems], [f'{where}: {u}' for u in unknown]
+    return {'body': body, 'sha256': digest, 'label': label}, [], []
+
+
+def check_retention_policy_history(revisions, report=print):
+    """The supplied revisions against each other (`revisions`: revision ->
+    entry, each signed and well formed): consecutive revisions link through
+    previous_sha256, retention and the schedule never decrease, a later
+    schedule begins with the earlier one and adds at most one entry per
+    revision, and a schedule entry agrees with the revision it names.
+    Returns the failures."""
+    failures = []
+    ordered = [revisions[n] for n in sorted(revisions)]
+    projects = sorted({e['body']['project_id'] for e in ordered})
+    if len(projects) > 1:
+        failures.append(f"FAIL retention policy: the supplied revisions name more than one project "
+                        f"({', '.join(projects)})")
+    for a, b in zip(ordered, ordered[1:]):
+        ra, rb = a['body']['revision'], b['body']['revision']
+        where = f'FAIL retention policy revision {rb}'
+        if rb == ra + 1:
+            if b['body']['previous_sha256'] != a['sha256']:
+                failures.append(f"{where}: previous_sha256 is not the digest of revision {ra}'s policy "
+                                f"({a['sha256'][:16]}...); the revisions do not link")
+        else:
+            report(f"NOTICE retention policy: revisions {ra} and {rb} are not consecutive; the link between them "
+                   f"was not checked")
+        if b['body']['retention_days'] < a['body']['retention_days']:
+            failures.append(f"{where}: retention_days ({b['body']['retention_days']}) is lower than revision {ra}'s "
+                            f"({a['body']['retention_days']}); retention never decreases")
+        sa, sb = a['body']['retention_schedule'], b['body']['retention_schedule']
+        if sb[:len(sa)] != sa:
+            failures.append(f"{where}: its retention_schedule does not begin with revision {ra}'s; the schedule "
+                            f"is only ever extended")
+        elif len(sb) - len(sa) > rb - ra or any(not ra < e['revision'] <= rb for e in sb[len(sa):]):
+            failures.append(f"{where}: its retention_schedule adds entries revisions {ra + 1} to {rb} did not make "
+                            f"(at most one per revision)")
+    for e in ordered:
+        for entry in e['body']['retention_schedule']:
+            named = revisions.get(entry['revision'])
+            if named is not None and named['body']['retention_days'] != entry['retention_days']:
+                failures.append(f"FAIL retention policy revision {e['body']['revision']}: its retention_schedule "
+                                f"gives revision {entry['revision']} {entry['retention_days']} days, and revision "
+                                f"{entry['revision']} states {named['body']['retention_days']}")
+    return failures
+
+
+def retention_hold_overlap(hold, chain, first, last, oldest, newest):
+    """How `hold` reaches a retired span (chain `chain`, seq=first..last, its
+    records written from `oldest` to `newest`), or None. A hold reaches the
+    span when every scope it names does: its chain, its sequence span and its
+    time span. A time span is compared with the span's oldest and newest
+    records, so any intersection counts: the strict reading, under which a
+    gateway ends its prefix before the first record that would bring the span
+    into a hold's time span."""
+    how = []
+    if hold['chain_id'] is not None:
+        if hold['chain_id'] != chain:
+            return None
+        how.append(f'chain {chain}')
+    seqs = hold['sequences']
+    if seqs is not None:
+        if seqs['last'] < first or seqs['first'] > last:
+            return None
+        how.append(f"sequence seq={seqs['first']}..{seqs['last']}")
+    occurred = hold['occurred']
+    if occurred is not None:
+        start = _utc_instant(occurred['from'])
+        end = None if occurred['until'] is None else _utc_instant(occurred['until'])
+        if start > newest or (end is not None and end < oldest):
+            return None
+        how.append(f"time from {occurred['from']} " + (f"to {occurred['until']}" if end is not None else "on"))
+    return 'by ' + ', '.join(how)
+
+
+def check_receipt_against_policy(seq, payload, revisions):
+    """One retirement receipt (its retention_retirement payload, already
+    checked by the walk) against the supplied revisions. Returns (state,
+    failures): state is 'checked' when the revision it names was supplied,
+    'not_supplied' otherwise. A receipt that applied less retention than any
+    revision up to its own states fails either way: the schedule of a later
+    revision is the history of the earlier ones."""
+    failures = []
+    where = f'FAIL retirement seq={seq}'
+    rev, applied = payload['policy_revision'], payload['retention_applied_days']
+    stated = [(e['body']['retention_days'], n) for n, e in revisions.items() if n <= rev]
+    stated += [(s['retention_days'], s['revision']) for e in revisions.values()
+               for s in e['body']['retention_schedule'] if s['revision'] <= rev]
+    if stated:
+        floor, at = max(stated)
+        if applied < floor:
+            failures.append(f"{where}: retention_applied_days ({applied}) is below the {floor} days policy revision "
+                            f"{at} states; retention never decreases")
+    entry = revisions.get(rev)
+    if entry is None:
+        return 'not_supplied', failures
+    body = entry['body']
+    if payload['policy_sha256'] != entry['sha256']:
+        failures.append(f"{where}: the receipt names policy digest {payload['policy_sha256'][:16]}..., and policy "
+                        f"revision {rev} is {entry['sha256'][:16]}...")
+    if payload['retention_rule'] != body['retention_rule']:
+        failures.append(f"{where}: the receipt's retention_rule is not policy revision {rev}'s")
+    oldest, newest = _utc_instant(payload['oldest_occurred_at']), _utc_instant(payload['newest_occurred_at'])
+    started = _utc_instant(payload['run_started_at'])
+    if None in (oldest, newest, started):
+        return 'checked', failures + [f"{where}: the receipt's times cannot be read, so the policy cannot be applied"]
+    if newest + datetime.timedelta(days=body['retention_days']) > started:
+        failures.append(f"{where}: the span's newest record ({payload['newest_occurred_at']}) is not older than policy "
+                        f"revision {rev}'s retention of {body['retention_days']} days when the receipt was sealed "
+                        f"(run started {payload['run_started_at']})")
+    held = {h['hold_id'] for h in body['holds']}
+    for hold_id in payload['hold_ids']:
+        if hold_id not in held:
+            failures.append(f"{where}: the receipt names hold {hold_id}, which policy revision {rev} does not carry")
+    for hold in body['holds']:
+        how = retention_hold_overlap(hold, payload['chain_id'], payload['first_sequence'], payload['last_sequence'],
+                                     oldest, newest)
+        if how:
+            failures.append(f"{where}: hold {hold['hold_id']} of policy revision {rev} overlaps the span it retires "
+                            f"({how}); a held record ends the prefix")
+    return 'checked', failures
+
+
+def judge_retention_policies(copies, keys, pack_project, report=print):
+    """Every supplied copy, then the revisions against each other and the
+    pack's project. Returns (revisions, failures, unknown): `revisions` maps a
+    revision to its entry, None when something could not be evaluated (then
+    no receipt is checked against the policy)."""
+    revisions, failures, unknown = {}, [], []
+    for label, doc in copies:
+        entry, bad, cannot = check_retention_policy_copy(label, doc, keys)
+        failures += bad
+        unknown += cannot
+        if entry is None:
+            continue
+        n = entry['body']['revision']
+        held = revisions.get(n)
+        if held is not None and held['sha256'] != entry['sha256']:
+            failures.append(f"FAIL retention policy revision {n}: {held['label']} and {label} are two different "
+                            f"policies under one revision")
+            continue
+        revisions.setdefault(n, entry)
+    failures += check_retention_policy_history(revisions, report)
+    for n, entry in sorted(revisions.items()):
+        project = entry['body']['project_id']
+        if pack_project is not None and project != pack_project:
+            failures.append(f"FAIL retention policy revision {n}: it is the policy of project {project}, and the "
+                            f"pack is of project {pack_project}")
+    if revisions and pack_project is None:
+        report("NOTICE retention policy: the pack names no project; the policy is bound to its project by the key "
+               "you pinned only")
+    if revisions:
+        report(f"RETENTION POLICY: revision {', '.join(map(str, sorted(revisions)))} signed under the bundle signing "
+               f"key you pinned")
+    return (None if unknown else revisions), failures, unknown
+
+
+def retired_policy_phrase(states):
+    """How a verdict names the policy check of the receipts it relied on:
+    `states` maps a policy revision to 'checked', 'not_supplied' or
+    'not_checked'."""
+    by = {}
+    for rev, state in sorted(states.items()):
+        by.setdefault(state, []).append(str(rev))
+    if set(by) <= {'not_checked'}:
+        return 'policy not checked'
+    if set(by) == {'checked'}:
+        return 'policy checked'
+    words = {'checked': 'checked', 'failed': 'failed', 'not_supplied': 'not supplied', 'not_checked': 'not checked'}
+    return ', '.join(f"policy revision {', '.join(by[s])} {words[s]}"
+                     for s in ('checked', 'failed', 'not_supplied', 'not_checked') if s in by)
+
+
+def retired_head_spans(retired):
+    """[(first, last, label)] of the spans a walk read as retired, each
+    labelled with the policy revision its receipt names and how far the
+    policy was checked, for the witnessed heads that fall inside one."""
+    out = []
+    for first, last, _, rev, state in (retired or {}).get('by_receipt', ()):
+        note = {'checked': '', 'not_supplied': f' (policy revision {rev} not supplied)',
+                'failed': ' (the policy check failed)'}.get(state, ' (policy not checked)')
+        out.append((first, last, f'under policy revision {rev}{note}'))
+    return out
 
 
 def pack_is_stripped(manifest):
@@ -17568,7 +18170,7 @@ def p256_jwk_thumbprint(jwk):
     return _b64url_text(hashlib.sha256(canonical.encode('ascii')).digest())
 
 
-def load_attestation_pin(text):
+def load_attestation_pin(text, what='the attestation key'):
     """(point, thumbprint) of a project's attestation key: a P-256 JWK, bare
     or as the control plane serves it ({"keyId": ..., "jwk": {...}}). A
     stated keyId must be the key's thumbprint. Raises ValueError."""
@@ -17578,13 +18180,13 @@ def load_attestation_pin(text):
         stated = doc.get('keyId', doc.get('key_id'))
         doc = doc['jwk']
     if not isinstance(doc, dict) or doc.get('kty') != 'EC' or doc.get('crv') != 'P-256':
-        raise ValueError('the attestation key must be a P-256 EC JWK')
+        raise ValueError(f'{what} must be a P-256 EC JWK')
     x, y = _b64url_bytes(doc.get('x')), _b64url_bytes(doc.get('y'))
     if len(x) != 32 or len(y) != 32:
         raise ValueError('the P-256 JWK coordinates must be 32 bytes each')
     point = (int.from_bytes(x, 'big'), int.from_bytes(y, 'big'))
     if not _on_curve(P256, point):
-        raise ValueError('the attestation key is not a point on P-256')
+        raise ValueError(f'{what} is not a point on P-256')
     thumbprint = p256_jwk_thumbprint(doc)
     if stated is not None and stated != thumbprint:
         raise ValueError(f'keyId {stated!r} is not the RFC 7638 thumbprint of the key ({thumbprint})')
@@ -20226,6 +20828,566 @@ def pack_source_self_test():
     return ok
 
 
+def restored_backup_self_test():
+    """A restored-backup pack: it verifies (exit 0) with the backup and the
+    restore test on its verdict line, and every other pack's line is
+    unchanged; a record changed after the pack was built fails; a pack whose
+    restore test failed fails; a section without its class, the class without
+    a section, a result its failures contradict, or a pack that does not end
+    at the head sealed for the backup fails; a section this verifier cannot
+    read is exit 2."""
+    import contextlib
+    import io
+    import subprocess
+    import tempfile
+    ok = True
+
+    def check(label, passed, what, detail=''):
+        nonlocal ok
+        if passed:
+            print(f'SELF-TEST assertion {label} PASS: {what}')
+        else:
+            print(f'SELF-TEST assertion {label} FAIL: {what} {detail}', file=sys.stderr)
+            ok = False
+
+    def quietly(fn, *a):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(out):
+            result = fn(*a)
+        return result, out.getvalue()
+
+    genesis = genesis_hash()
+    records = []
+    for seq in range(3):
+        record = {'schema_version': 'v1', 'sequence_number': seq, 'timestamp_utc': f'2026-01-01T00:00:0{seq}+00:00',
+                  'event_id': f'evt-{seq}', 'request_id': f'req-{seq}', 'model_requested': 'gpt-4.1-mini',
+                  'action': 'allow', 'input_tokens': 11, 'output_tokens': 7, 'total_tokens': 18,
+                  'cache_creation_input_tokens': None, 'cache_read_input_tokens': None, 'cached_input_tokens': None,
+                  'reasoning_tokens': None, 'estimated_cost_usd': 0.000123, 'policy_reason': None,
+                  'previous_hash': records[-1]['event_hash'] if records else genesis}
+        record['event_hash'] = recompute_event_hash(record, seq, record['previous_hash'])
+        records.append(record)
+    hi = len(records) - 1
+    backup_id, test_id = '6f1c2a54-7d0e-4b8a-9c3d-2e5f6a7b8c9d', '0a9b8c7d-6e5f-4a3b-8c2d-1e0f9a8b7c6d'
+
+    def section(**override):
+        return dict({'backup_id': backup_id, 'backup_taken_at': '2026-11-26T02:00:00Z', 'backup_sha256': 'ab' * 32,
+                     'test_id': test_id, 'tested_at': '2026-11-26T03:00:00Z', 'restore_test': 'passed',
+                     'failures': [], 'sealed_head': {'sequence': hi, 'event_hash': records[hi]['event_hash']}},
+                    **override)
+
+    def manifest(restored=True, cls=RESTORED_BACKUP_EVIDENCE_CLASS, **override):
+        m = {'schema_version': '1.4', 'hash_version': 'v1', 'hash_algorithm': 'SHA-256', 'prefix': 'audit/proxy/',
+             'bucket': 'local-chain:pxy_self_test', 'evidence_class': cls, 'window': 'A', 'signing_deferred': True,
+             'source': {'store': 'local_chain', 'immutability': {'basis': 'not_write_once'}},
+             'from_sequence': 0, 'to_sequence': hi,
+             'claim': {'scope': CLAIM_CHAIN_TO_HEAD, 'from_sequence': 0, 'to_sequence': hi},
+             'anchoring': {'state': 'unanchored', 'chains': [{
+                 'chain': 'proxy', 'reason': 'no_anchors_found', 'anchored_through_seq': None,
+                 'unanchored_tail': {'from_seq': 0, 'to_seq': hi}, 'anchors': [], 'seals': []}]},
+             'events': [{'sequence': r['sequence_number'], 'event_id': r['event_id'],
+                         'stored_event_hash': r['event_hash'], 'recomputed_event_hash': r['event_hash']}
+                        for r in records]}
+        if restored:
+            m['restored_backup'] = section()
+        m.update(override)
+        return m
+
+    by_seq = {r['sequence_number']: r for r in records}
+    status, out = quietly(check_restored_backup, manifest(), by_seq)
+    check('46a', status == PASSED and f'RESTORED BACKUP: backup {backup_id}' in out and test_id in out
+          and restored_backup_suffix(manifest()) == f' [restored backup: {backup_id}, restore test {test_id}]'
+          and pack_store(manifest()) == 'local_chain' and claim_scope(manifest()) == CLAIM_CHAIN_TO_HEAD
+          and quietly(check_source, manifest())[0] == PASSED
+          and 'restored-backup-evidence-v1' in VERIFIER_CAPABILITIES,
+          "a restored-backup section reads and names the backup and the restore test; the pack is a local-chain "
+          "pack to its head, and restored-backup-evidence-v1 is advertised", out)
+
+    local = manifest(restored=False, cls=LOCAL_CHAIN_EVIDENCE_CLASS)
+    check('46b', restored_backup_suffix(local) == '' and quietly(check_restored_backup, local, by_seq) == (PASSED, '')
+          and restored_backup_suffix({}) == '',
+          "a live local-chain pack, and a pack of any other kind, carries no restored-backup label")
+
+    later = dict(section(), sealed_head={'sequence': hi - 1, 'event_hash': records[hi - 1]['event_hash']})
+    other_head = dict(section(), sealed_head={'sequence': hi, 'event_hash': records[0]['event_hash']})
+    contradictions = [
+        (manifest(restored=False), 'no restored_backup section'),
+        (manifest(cls=LOCAL_CHAIN_EVIDENCE_CLASS), 'does not carry the'),
+        (manifest(restored_backup=section(restore_test='passed', failures=['chain_walk_failed'])), 'recorded as passed'),
+        (manifest(restored_backup=section(restore_test='failed', failures=[])), 'recorded as failed'),
+        (manifest(restored_backup=later), 'but the pack ends at'),
+        (manifest(restored_backup=other_head), 'is not the chain head sealed for the backup'),
+        (manifest(restored_backup=section(restore_test='failed', failures=['chain_walk_failed'])),
+         'restore test of this copy failed'),
+    ]
+    failed = []
+    for m, words in contradictions:
+        status, out = quietly(check_restored_backup, m, by_seq)
+        if status != FAILED or words not in out or 'FAIL restored backup:' not in out:
+            failed.append((m.get('evidence_class'), m.get('restored_backup'), status, out))
+    check('46c', not failed,
+          "a section without its class or the class without a section, a result its failures contradict, a sealed "
+          "head that is not the pack's last record, and a restore test recorded as failed each fail", failed)
+
+    unreadable = [section(backup_id='not-a-uuid'), section(test_id=7), section(backup_sha256='AB' * 32),
+                  section(restore_test='skipped'), section(failures='chain_walk_failed'),
+                  section(sealed_head={'sequence': -1, 'event_hash': 'ab' * 32}),
+                  dict(section(), extra=True), {k: v for k, v in section().items() if k != 'tested_at'}]
+    cannot = [quietly(check_restored_backup, manifest(restored_backup=u), by_seq)[0] for u in unreadable]
+    check('46d', all(c == CANNOT_EVALUATE for c in cannot),
+          "a section this verifier cannot read (an id that is not a UUID, a digest that is not lowercase hex, an "
+          "unknown result, failures that are not a list of codes, a bad sealed head, an extra or missing key) "
+          "cannot be evaluated", cannot)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        packs = [0]
+
+        def pack(m, recs=records):
+            packs[0] += 1
+            root = tmp / f'pack{packs[0]}'
+            rdir = root / 'records'
+            rdir.mkdir(parents=True)
+            for r in recs:
+                (rdir / record_file_name(r['sequence_number'])).write_bytes(json.dumps(r).encode('utf-8'))
+            (root / 'manifest.json').write_text(json.dumps(m, indent=2), encoding='utf-8')
+            return root
+
+        def cli(root):
+            run = subprocess.run([sys.executable, str(Path(__file__).resolve()), '--manifest',
+                                  str(root / 'manifest.json'), '--records', str(root / 'records'), '--allow-unsigned'],
+                                 capture_output=True, text=True)
+            return run.returncode, run.stdout + run.stderr
+
+        code, out = cli(pack(manifest()))
+        label = (f' [evidence class: {RESTORED_BACKUP_EVIDENCE_CLASS}] [source: local_chain, not_write_once]'
+                 f' [restored backup: {backup_id}, restore test {test_id}]')
+        check('46e', code == EXIT_OK and f'OK: all 3 events verified. Authenticity not established (unsigned pack, '
+              f'accepted with --allow-unsigned).{label}' in out,
+              "a restored-backup pack verifies (exit 0) and its verdict line names the class, the source, the backup "
+              "and the restore test", out[-600:])
+
+        code, out = cli(pack(manifest(restored=False, cls=LOCAL_CHAIN_EVIDENCE_CLASS)))
+        check('46f', code == EXIT_OK and 'restored backup' not in out and out.rstrip().endswith(
+            f'[evidence class: {LOCAL_CHAIN_EVIDENCE_CLASS}] [source: local_chain, not_write_once]'),
+              "a live local-chain pack's verdict line is unchanged", out[-400:])
+
+        tampered = [dict(r) for r in records]
+        tampered[1]['input_tokens'] = 12
+        code, out = cli(pack(manifest(), tampered))
+        check('46g', code == EXIT_FAIL and label in out,
+              "a restored-backup pack whose record was changed after it was built fails (exit 1)", out[-600:])
+
+        code, out = cli(pack(manifest(restored_backup=section(restore_test='failed', failures=['chain_walk_failed']))))
+        check('46h', code == EXIT_FAIL and 'restore test of this copy failed' in out,
+              "a pack of a copy whose restore test failed fails (exit 1), whatever its records show", out[-600:])
+
+        code, out = cli(pack(manifest(restored_backup=section(restore_test='skipped'))))
+        check('46i', code == EXIT_CANNOT_EVALUATE,
+              "a restored-backup section this verifier cannot read is exit 2", out[-400:])
+    return ok
+
+
+# The retention_policy.v1 known-answer vector. Paired with
+# tests/fixtures/retention-retirement/retention_policy_v1_vector.json: two
+# linked revisions and one hold, each signed under bundle_signature.v1 with a
+# test key whose private part was discarded when the fixture was made, so
+# nothing else can be signed with it. The digests are over the policy bodies;
+# neither side may drift on its own.
+RETENTION_POLICY_VECTOR_PROJECT = '5b1f8e2a-3c4d-4e6f-9a0b-1c2d3e4f5a6b'
+RETENTION_POLICY_VECTOR_JWK = {'kty': 'EC', 'crv': 'P-256', 'x': 'lQcbnz61RN6lAgKYMMQmmOeAsJ8VSlbuXBC4yn8-AcM',
+                               'y': 'iSp-TRuMJjvMc0HkFIXRo9oO3Z835u5YoEejk3k0R6E'}
+RETENTION_POLICY_VECTOR_KEY_ID = 'A9DlwO5lK5mzWedY5fOQ-BXfTkK4vugolOFpkB2iklM'
+RETENTION_POLICY_VECTOR_REVISIONS = (
+    dict(format_version='retention_policy.v1', project_id=RETENTION_POLICY_VECTOR_PROJECT, revision=1,
+         previous_sha256=None, issued_at='2026-01-01T00:00:00Z', retention_rule='monotone', retention_days=30,
+         retention_schedule=[dict(revision=1, effective_from='2026-01-01T00:00:00Z', retention_days=30)],
+         holds=[]),
+    dict(format_version='retention_policy.v1', project_id=RETENTION_POLICY_VECTOR_PROJECT, revision=2,
+         previous_sha256='7949b40fd14f9b5737637c439833d4f82cb23d1aecad64c7d0d4277450f0ac42',
+         issued_at='2026-03-01T00:00:00Z', retention_rule='monotone', retention_days=60,
+         retention_schedule=[dict(revision=1, effective_from='2026-01-01T00:00:00Z', retention_days=30),
+                             dict(revision=2, effective_from='2026-03-01T00:00:00Z', retention_days=60)],
+         holds=[dict(hold_id='hold-litigation-1', reason_code='litigation', chain_id='proxy',
+                     sequences=dict(first=20, last=29), occurred=None)]),
+)
+RETENTION_POLICY_VECTOR_SHA256 = ('7949b40fd14f9b5737637c439833d4f82cb23d1aecad64c7d0d4277450f0ac42',
+                                  'e855141a49cc2b1abdf82374e987415b39ac4d8cff60184319b5cf183e61713a')
+RETENTION_POLICY_VECTOR_SIGNATURES = (
+    'tHl6INLc2kooAkaUs44cT+RpLaGvgQO1rXCU2KoU4+NlHIg62nKK29Phuy9qt4uZsk2tBZgWM1kdsVKFXbdPPg==',
+    'tADtWGiQOeAwtfDbXPh9NPMNooXnfjtdi74c9LbXs8g9S0bYPOIFDW1AZ6WV2AlDamfR3bIrHR2xeMApZq+yVA==',
+)
+
+
+def retention_policy_self_test():
+    """Signed retention policies: the known-answer vector (body digests, the
+    link, signatures under the pinned key); a retired pack checked against
+    the policy; and each way a policy or a receipt must not pass: unsigned,
+    forged or under another key, another project, a digest the receipt does
+    not name, a span younger than the revision's retention, a hold over the
+    span by chain, by sequence and by time, a schedule that decreases,
+    revisions that do not link, a receipt that applied less than an earlier
+    revision, an unknown rule; a revision not supplied; witnessed heads in a
+    retired span; and the command line's exit codes."""
+    import contextlib
+    import io
+    import subprocess
+    import tempfile
+    ok = True
+
+    def check(label, passed, what, detail=''):
+        nonlocal ok
+        if passed:
+            print(f'SELF-TEST assertion {label} PASS: {what}')
+        else:
+            print(f'SELF-TEST assertion {label} FAIL: {what} {detail}', file=sys.stderr)
+            ok = False
+
+    def body_sha(body):
+        return hashlib.sha256(jcs_dumps(body).encode('utf-8')).hexdigest()
+
+    project = RETENTION_POLICY_VECTOR_PROJECT
+    v1, v2 = (json.loads(json.dumps(b)) for b in RETENTION_POLICY_VECTOR_REVISIONS)
+    vkey = load_policy_key(json.dumps({'keyId': RETENTION_POLICY_VECTOR_KEY_ID, 'jwk': RETENTION_POLICY_VECTOR_JWK}))
+
+    def vector_copy(i):
+        return {'policy': (v1, v2)[i], 'signature': {
+            'format_version': BUNDLE_SIGNATURE_FORMAT, 'key_id': RETENTION_POLICY_VECTOR_KEY_ID,
+            'public_key_jwk': RETENTION_POLICY_VECTOR_JWK, 'signature': RETENTION_POLICY_VECTOR_SIGNATURES[i]}}
+
+    vector = [('revision-1.json', vector_copy(0)), ('revision-2.json', vector_copy(1))]
+
+    # 47a — the vector: each body digest, revision 2 naming revision 1's
+    # digest, and both signatures under the pinned key over the statement the
+    # verifier builds; an edited body no longer verifies.
+    quiet = io.StringIO()
+    with contextlib.redirect_stdout(quiet):
+        revs, fails, unknown = judge_retention_policies(vector, [vkey], project)
+        edited = dict(vector_copy(1), policy=dict(v2, retention_days=61))
+        _, edited_fails, _ = check_retention_policy_copy('edited', edited, [vkey])
+    statement = retention_policy_statement(project, RETENTION_POLICY_VECTOR_SHA256[1])
+    check('47a', tuple(body_sha(b) for b in (v1, v2)) == RETENTION_POLICY_VECTOR_SHA256
+          and v2['previous_sha256'] == RETENTION_POLICY_VECTOR_SHA256[0]
+          and sorted(revs or {}) == [1, 2] and not fails and not unknown and vkey[1] == RETENTION_POLICY_VECTOR_KEY_ID
+          and statement == ('{"artifact":"retention_policy","format_version":"bundle_signature.v1","project_id":"'
+                            + project + '","sha256":"' + RETENTION_POLICY_VECTOR_SHA256[1] + '"}').encode('utf-8')
+          and any('does not verify' in f for f in edited_fails),
+          'the retention policy vector: body digests, the link, and both signatures under the pinned key over '
+          'the bundle_signature.v1 statement; an edited body does not verify', f'{fails} {unknown} {edited_fails}')
+
+    # Self-test signing keys (TEST-ONLY): the reader pins `own`.
+    d = 0x3E7A1C5F9B2D4E6A8C0F1B3D5E7A9C2E4B6D8F0A1C3E5B7D9F2A4C6E8B0D1F37
+    own = load_policy_key(json.dumps(_p256_self_test_jwk(d)))
+
+    def signed(body, private=d, fmt=BUNDLE_SIGNATURE_FORMAT):
+        raw = _p256_self_test_sign(private, retention_policy_statement(body['project_id'], body_sha(body)))
+        return {'policy': body, 'signature': {'format_version': fmt, 'key_id': 'self-test',
+                                              'signature': base64.b64encode(raw).decode('ascii')}}
+
+    def revision2(**changes):
+        return dict(v2, **changes)
+
+    # The chain: a signing boundary at 0, records dated New Year 2026 before
+    # seq 10 and June after, one receipt at seq 10 retiring 0..9.
+    public, sign = _ed25519_self_test_keypair(b'\x2b' * 32)
+
+    def build(**receipt):
+        records, prev, hashes = [], genesis_hash(), {}
+        for seq in range(13):
+            if seq == 10:
+                payload = dict(
+                    run_id='3f1c2b7a-9d4e-4c1a-8b6f-2e5d7a9c0b47', run_started_at='2026-06-01T00:00:00Z',
+                    chain_id='proxy', store='local_chain', first_sequence=0, last_sequence=9, count=10,
+                    oldest_occurred_at='2026-01-01T00:00:00Z', newest_occurred_at='2026-01-01T00:00:09Z',
+                    first_previous_hash=genesis_hash(), last_event_hash=hashes[9],
+                    policy_sha256=RETENTION_POLICY_VECTOR_SHA256[1], policy_revision=2, retention_rule='monotone',
+                    retention_applied_days=60, hold_ids=[], gcs=None)
+                payload.update(receipt)
+                r = {'schema_version': 'v1.27', 'event_kind': 'retention_retirement', 'source': 'proxy',
+                     'event_id': 'evt-10', 'request_id': '', 'timestamp_utc': '2026-06-01T00:00:10Z',
+                     'model_requested': '', 'action': 'allow', 'input_tokens': 0, 'output_tokens': 0,
+                     'retention_retirement': payload}
+            else:
+                when = f'2026-01-01T00:00:{seq:02d}Z' if seq < 10 else f'2026-06-01T00:00:{seq:02d}Z'
+                r = {'schema_version': 'v1.1', 'source': 'proxy', 'event_id': f'evt-{seq}', 'request_id': f'req-{seq}',
+                     'timestamp_utc': when, 'model_requested': 'gpt-6-luna', 'action': 'allow',
+                     'input_tokens': 1, 'output_tokens': 2}
+                if seq == 0:
+                    r.update(schema_version='v1.3', event_kind='admin_action', model_requested='', admin_action={
+                        'action_type': CHAIN_SIGNING_STARTED, 'actor': 'system:self-test', 'description': 'boundary',
+                        'metadata_json': json.dumps({'algorithm': 'ed25519', 'public_key': public.hex(),
+                                                     'public_key_fingerprint': chain_key_fingerprint(public)},
+                                                    sort_keys=True)})
+            r['sequence_number'], r['previous_hash'] = seq, prev
+            r['event_hash'] = recompute_event_hash(r, seq, prev)
+            r['record_sig'] = sign(record_sig_message('proxy', seq, r['event_hash'])).hex()
+            prev = hashes[seq] = r['event_hash']
+            records.append(r)
+        kept = records[10:]
+        p = records[10]['retention_retirement']
+        manifest = {
+            'schema_version': '1.6', 'window': 'A', 'signing_deferred': True, 'hash_version': 'v1',
+            'hash_algorithm': 'SHA-256', 'prefix': 'audit/proxy/', 'evidence_class': LOCAL_CHAIN_EVIDENCE_CLASS,
+            'project_id': project, 'proxy_id': 'pxy_self_test', 'from_sequence': 10, 'to_sequence': 12,
+            'anchoring': {'state': 'unanchored', 'chains': [{
+                'chain': 'proxy', 'reason': 'no_anchors_found', 'anchored_through_seq': None,
+                'unanchored_tail': {'from_seq': 10, 'to_seq': 12}, 'anchors': [], 'seals': []}]},
+            'claim': {'scope': CLAIM_CHAIN_TO_HEAD, 'from_sequence': 10, 'to_sequence': 12},
+            'retirements': [dict({'sequence': 10, 'recomputed_event_hash': records[10]['event_hash']},
+                                 **{k: p[k] for k in RETIREMENT_LEDGER_SEALED})],
+            'events': [{'sequence': r['sequence_number'], 'recomputed_event_hash': r['event_hash']} for r in kept]}
+        return kept, manifest
+
+    def write(tmp, kept):
+        rdir = Path(tmp) / 'records'
+        rdir.mkdir()
+        for r in kept:
+            (rdir / record_file_name(r['sequence_number'])).write_bytes(json.dumps(r).encode('utf-8'))
+        return rdir
+
+    def walk(copies, keys=(own, vkey), **receipt):
+        kept, manifest = build(**receipt)
+        out, cannot, retired = io.StringIO(), [], {}
+        with tempfile.TemporaryDirectory() as tmp:
+            rdir = write(tmp, kept)
+            with contextlib.redirect_stdout(out):
+                passed = verify_manifest_with(local_fetcher(rdir), manifest, chain_keys=[public],
+                                              cannot_evaluate_out=cannot, retired_out=retired,
+                                              retention_policies=copies, policy_keys=list(keys))
+        return passed, out.getvalue().splitlines(), cannot, retired
+
+    def has(lines, text):
+        return any(text in line for line in lines)
+
+    # 47b — the retired pack against the vector: checked.
+    passed, lines, cannot, retired = walk(vector)
+    check('47b', passed and not cannot and retired.get('policy') == {2: 'checked'}
+          and has(lines, 'RETENTION POLICY: revision 1, 2 signed under the bundle signing key you pinned')
+          and has(lines, 'RETIREMENTS: 10 record(s) retired under 1 sealed retirement(s), policy revision 2; '
+                         'policy checked'),
+          'a retired span whose receipt names a supplied, signed revision that allows it reads as retired with '
+          'the policy checked', f'{passed} {cannot} {lines}')
+
+    # 47c — an unsigned copy fails.
+    unsigned = [vector[0], ('revision-2.json', {'policy': v2})]
+    passed, lines, _, _ = walk(unsigned)
+    nulled = [vector[0], ('revision-2.json', {'policy': v2, 'signature': None})]
+    passed2, lines2, _, _ = walk(nulled)
+    check('47c', not passed and has(lines, 'FAIL retention policy revision-2.json: the copy is unsigned')
+          and not passed2 and has(lines2, 'the copy is unsigned'),
+          'a supplied policy copy without a signature fails', f'{lines}')
+
+    # 47d — forged: an edited body, a signature under another key, and one
+    # that is not 64 bytes; the key the copy names is never trusted.
+    forged = dict(vector_copy(1), policy=revision2(retention_days=90, retention_schedule=v2['retention_schedule'][:1]
+                                                    + [dict(v2['retention_schedule'][1], retention_days=90)]))
+    passed, lines, _, _ = walk([vector[0], ('forged.json', forged)])
+    other = signed(v2, private=d + 1)
+    other['signature']['public_key_jwk'] = _p256_self_test_jwk(d + 1)
+    passed2, lines2, _, _ = walk([vector[0], ('other-key.json', other)])
+    short = dict(vector_copy(1), signature=dict(vector_copy(1)['signature'], signature='AAAA'))
+    passed3, lines3, _, _ = walk([vector[0], ('short.json', short)])
+    check('47d', not passed and has(lines, 'FAIL retention policy forged.json: the signature does not verify under '
+                                           'the bundle signing key you pinned')
+          and not passed2 and has(lines2, 'other-key.json: the signature does not verify')
+          and not passed3 and has(lines3, 'the signature is not 64 bytes'),
+          'a forged copy, one signed by a key the reader did not pin, and a malformed signature fail',
+          f'{lines} {lines2} {lines3}')
+
+    # 47e — a policy of another project fails, even signed by the pinned key.
+    foreign = [('foreign.json', signed(dict(v1, project_id='0f0f0f0f-0000-4000-8000-000000000000')))]
+    passed, lines, _, _ = walk(foreign)
+    check('47e', not passed and has(lines, 'FAIL retention policy revision 1: it is the policy of project '
+                                           '0f0f0f0f-0000-4000-8000-000000000000, and the pack is of project'),
+          "a policy for another project than the pack's fails", f'{lines}')
+
+    # 47f — the receipt names another digest than the supplied revision's.
+    passed, lines, _, _ = walk(vector, policy_sha256='cd' * 32)
+    check('47f', not passed and has(lines, 'FAIL retirement seq=10: the receipt names policy digest cdcdcdcdcdcdcdcd..., '
+                                           'and policy revision 2 is e855141a49cc2b1a...'),
+          "a receipt whose policy_sha256 is not the supplied revision's digest fails", f'{lines}')
+
+    # 47g — a revision not supplied: retired, that revision not supplied.
+    passed, lines, cannot, retired = walk(vector, policy_revision=3, policy_sha256='ab' * 32)
+    check('47g', passed and not cannot and retired.get('policy') == {3: 'not_supplied'}
+          and has(lines, 'policy revision 3 not supplied') and not has(lines, 'FAIL'),
+          'a receipt naming a revision that was not supplied reads as retired with that revision not supplied, '
+          'never as checked', f'{passed} {lines}')
+
+    # 47h — the span is younger than the revision's retention when sealed.
+    passed, lines, _, _ = walk(vector, run_started_at='2026-02-15T00:00:00Z', retention_applied_days=30)
+    check('47h', not passed and has(lines, "the span's newest record (2026-01-01T00:00:09Z) is not older than policy "
+                                           "revision 2's retention of 60 days when the receipt was sealed"),
+          "a span younger than the named revision's retention at the receipt's sealing fails", f'{lines}')
+
+    # 47i — a hold of the named revision over the span: by chain, by
+    # sequence and by time (each alone), re-signed with the pinned key.
+    results = []
+    expected = {'chain': 'by chain proxy', 'sequence': 'by chain proxy, sequence seq=5..7',
+                'time': 'by time from 2026-01-01T00:00:03Z to 2026-01-01T00:00:04Z'}
+    for name, hold in (('chain', dict(hold_id='hold-c', reason_code='regulatory', chain_id='proxy', sequences=None,
+                                      occurred=None)),
+                       ('sequence', dict(hold_id='hold-s', reason_code='litigation', chain_id='proxy',
+                                         sequences=dict(first=5, last=7), occurred=None)),
+                       ('time', dict(hold_id='hold-t', reason_code='litigation', chain_id=None, sequences=None,
+                                     occurred={'from': '2026-01-01T00:00:03Z', 'until': '2026-01-01T00:00:04Z'}))):
+        held = revision2(holds=[hold])
+        passed, lines, _, _ = walk([vector[0], (f'{name}.json', signed(held))], policy_sha256=body_sha(held))
+        results.append(not passed and has(lines, f"hold {hold['hold_id']} of policy revision 2 overlaps the span it "
+                                                 f"retires ({expected[name]}); a held record ends the prefix"))
+    clear = revision2(holds=[dict(hold_id='hold-later', reason_code='litigation', chain_id=None, sequences=None,
+                                  occurred={'from': '2026-01-01T00:00:10Z', 'until': None})])
+    passed_clear, _, _, _ = walk([vector[0], ('clear.json', signed(clear))], policy_sha256=body_sha(clear))
+    check('47i', all(results) and passed_clear,
+          'a hold of the named revision over the span fails by chain, by sequence and by time, and a hold that '
+          'begins after the span does not', f'{results} {passed_clear}')
+
+    # 47j — the schedule decreases: inside a revision; a later revision with
+    # less retention than the earlier one; and one whose schedule does not
+    # begin with the earlier one's.
+    lower = revision2(retention_days=20, retention_schedule=[v2['retention_schedule'][0],
+                                                             dict(v2['retention_schedule'][1], retention_days=20)])
+    passed, lines, _, _ = walk([vector[0], ('lower.json', signed(lower))], policy_sha256=body_sha(lower),
+                               retention_applied_days=20)
+    dropped = revision2(retention_days=20, retention_schedule=[dict(v2['retention_schedule'][1], retention_days=20)])
+    passed2, lines2, _, _ = walk([vector[0], ('dropped.json', signed(dropped))], policy_sha256=body_sha(dropped),
+                                 retention_applied_days=20)
+    rewritten = revision2(retention_schedule=[dict(v2['retention_schedule'][0], effective_from='2025-12-01T00:00:00Z'),
+                                              v2['retention_schedule'][1]])
+    passed3, lines3, _, _ = walk([vector[0], ('rewritten.json', signed(rewritten))], policy_sha256=body_sha(rewritten))
+    check('47j', not passed and has(lines, 'the retention schedule decreases at retention_schedule[1] (from 30 to 20 '
+                                           'days); retention never decreases')
+          and not passed2 and has(lines2, "retention_days (20) is lower than revision 1's (30); retention never "
+                                          "decreases")
+          and not passed3 and has(lines3, "its retention_schedule does not begin with revision 1's"),
+          'a schedule that decreases inside a revision, a revision with less retention than the one before, and a '
+          'schedule a later revision rewrites, fail', f'{lines} {lines2} {lines3}')
+
+    # 47k — revisions that do not link, and two policies under one revision.
+    unlinked = revision2(previous_sha256='ab' * 32)
+    passed, lines, _, _ = walk([vector[0], ('unlinked.json', signed(unlinked))], policy_sha256=body_sha(unlinked))
+    twin = revision2(issued_at='2026-03-02T00:00:00Z')
+    passed2, lines2, _, _ = walk(vector + [('twin.json', signed(twin))])
+    check('47k', not passed and has(lines, "previous_sha256 is not the digest of revision 1's policy")
+          and not passed2 and has(lines2, 'are two different policies under one revision'),
+          'consecutive revisions that do not link fail, and so do two different policies under one revision',
+          f'{lines} {lines2}')
+
+    # 47l — a receipt that applied less than an earlier revision states fails,
+    # even when the revision it names was not supplied.
+    passed, lines, _, _ = walk(vector, policy_revision=3, policy_sha256='ab' * 32, retention_applied_days=30)
+    check('47l', not passed and has(lines, 'retention_applied_days (30) is below the 60 days policy revision 2 states'),
+          "a receipt whose retention_applied_days is below an earlier revision's fails", f'{lines}')
+
+    # 47m — a retention rule or a signature format this verifier does not
+    # read is cannot evaluate, and no receipt reads as checked.
+    future = revision2(retention_rule='two_person_future')
+    passed, lines, cannot, retired = walk([vector[0], ('future.json', signed(future))], policy_sha256=body_sha(future))
+    newer = signed(v2, fmt='bundle_signature.v2')
+    passed2, _, cannot2, _ = walk([vector[0], ('newer.json', newer)])
+    check('47m', passed and any('retention_rule' in p for _, p in cannot) and retired.get('policy') == {2: 'not_checked'}
+          and has(lines, 'CANNOT EVALUATE retention policy future.json')
+          and passed2 and any('signature format' in p for _, p in cannot2),
+          'an unknown retention rule or signature format in a supplied policy is cannot evaluate, never checked',
+          f'{cannot} {retired} {cannot2}')
+
+    # 47n — witnessed heads: one inside the retired span reads as retired and
+    # is not counted; a head inside the pack still counts; a file whose only
+    # heads are retired establishes no coverage.
+    dw = 0x6B2D4F8A1C3E5B7D9F0A2C4E6B8D1F3A5C7E9B0D2F4A6C8E1B3D5F7A9C2E4B61
+    wpin = load_attestation_pin(json.dumps(_p256_self_test_jwk(dw)))
+    kept, manifest = build()
+    hashes = {r['sequence_number']: r['event_hash'] for r in kept}
+    hidden = 'ee' * 32
+
+    def witness_dir(tmp, heads):
+        m = {'chains': [{'chain': 'proxy', 'heads': [
+                 {'basis': WITNESS_BASIS_REPORTED, 'seq': seq, 'event_hash': h, 'observed_at': '2026-06-02T00:00:00Z',
+                  'received_at': '2026-06-02T00:00:01Z', 'signed_head': None} for seq, h in heads],
+                 'omitted_earlier_heads': 0}],
+             'contradictions': [], 'disclosure': 'self-test', 'format': WITNESS_MANIFEST_FORMAT,
+             'generated_at': '2026-06-03T00:00:00Z', 'omitted_chains': 0, 'org_id': 'org', 'project_id': project,
+             'proxy_id': 'pxy_self_test', 'signing': {'key_id': wpin[1], 'reason': 'attestation_key', 'state': 'signed'}}
+        m['signature'] = {'alg': 'ES256', 'key_id': wpin[1], 'scheme': WITNESS_MANIFEST_FORMAT,
+                          'value': base64.b64encode(_p256_self_test_sign(dw, witness_manifest_message(m))).decode()}
+        path = Path(tmp) / 'witness'
+        path.mkdir()
+        (path / WITNESS_MANIFEST_NAME).write_text(json.dumps(m), encoding='utf-8')
+        return path
+
+    _, _, _, retired = walk(vector)
+    _, _, _, unchecked = walk(None)
+    records = {r['sequence_number']: r for r in kept}
+    with tempfile.TemporaryDirectory() as tmp:
+        (Path(tmp) / 'mixed').mkdir()
+        (Path(tmp) / 'only').mkdir()
+        both, alone = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(both):
+            mixed = judge_witness(witness_dir(Path(tmp) / 'mixed', [(5, hidden), (12, hashes[12])]),
+                                  manifest, records, [wpin], lambda _: None, None, retired=retired)
+        with contextlib.redirect_stdout(alone):
+            only = judge_witness(witness_dir(Path(tmp) / 'only', [(5, hidden)]),
+                                 manifest, records, [wpin], lambda _: None, None, retired=unchecked)
+    check('47n', mixed.status == PASSED and mixed.retired == 1 and mixed.counted == 1 and mixed.through['seq'] == 12
+          and 'NOTICE witness seq=5 (reported): retired under policy revision 2 (seq=0..9); not counted'
+          in both.getvalue()
+          and only.status == COVERAGE_NOT_ESTABLISHED and only.counted == 0 and only.through is None
+          and 'retired under policy revision 2 (policy not checked)' in alone.getvalue()
+          and '1 witnessed head(s) are in retired spans' in alone.getvalue(),
+          'a witnessed head in a retired span reads as retired, is never counted or the head the pack is witnessed '
+          'through, and a witness file whose only heads are retired establishes no coverage',
+          f'{mixed.status} {mixed.retired} {mixed.counted} {only.status} {both.getvalue()} {alone.getvalue()}')
+
+    # 47o — the command line: 0 with the policy checked (never "complete"),
+    # 0 with a revision not supplied, 1 for a forged copy, 2 for a policy
+    # with no key and for an unknown rule, 4 for a witness file whose only
+    # head is retired; the capability and the version.
+    def cli(copies, keys, receipt=None, witness=None):
+        kept, manifest = build(**(receipt or {}))
+        with tempfile.TemporaryDirectory() as tmp:
+            rdir = write(tmp, kept)
+            (Path(tmp) / 'manifest.json').write_text(json.dumps(manifest), encoding='utf-8')
+            args = [sys.executable, str(Path(__file__).resolve()), '--manifest', str(Path(tmp) / 'manifest.json'),
+                    '--records', str(rdir), '--allow-unsigned', '--chain-signing-key', public.hex()]
+            pdir = Path(tmp) / 'policies'
+            pdir.mkdir()
+            for name, doc in copies:
+                (pdir / name).write_text(json.dumps(doc), encoding='utf-8')
+            if copies:
+                args += ['--retention-policy', str(pdir)]
+            for i, key in enumerate(keys):
+                (Path(tmp) / f'key{i}.json').write_text(json.dumps(key), encoding='utf-8')
+                args += ['--retention-policy-key', str(Path(tmp) / f'key{i}.json')]
+            if witness is not None:
+                (Path(tmp) / 'wkey.json').write_text(json.dumps(_p256_self_test_jwk(dw)), encoding='utf-8')
+                args += ['--witness', str(witness_dir(tmp, witness)), '--witness-key', str(Path(tmp) / 'wkey.json')]
+            run = subprocess.run(args, capture_output=True, text=True)
+            return run.returncode, run.stdout + run.stderr
+
+    served = {'keyId': RETENTION_POLICY_VECTOR_KEY_ID, 'algorithm': 'ES256', 'jwk': RETENTION_POLICY_VECTOR_JWK}
+    code_ok, out_ok = cli(vector, [served])
+    code_missing, out_missing = cli(vector, [served], receipt={'policy_revision': 3, 'policy_sha256': 'ab' * 32})
+    code_forged, _ = cli([vector[0], ('forged.json', forged)], [served])
+    code_nokey, out_nokey = cli(vector, [])
+    code_rule, _ = cli([vector[0], ('future.json', signed(future))], [_p256_self_test_jwk(d), served],
+                       receipt={'policy_sha256': body_sha(future)})
+    code_witness, out_witness = cli(vector, [served], witness=[(5, hidden)])
+    check('47o', code_ok == EXIT_OK and '10 earlier record(s) retired under 1 sealed retirement(s) under policy '
+                                         'revision 2 (retired, policy checked)' in out_ok
+          and not any(l.startswith('OK:') and 'complete' in l.lower() for l in out_ok.splitlines())
+          and code_missing == EXIT_OK and '(retired, policy revision 3 not supplied)' in out_missing
+          and code_forged == EXIT_FAIL and code_nokey == EXIT_CANNOT_EVALUATE
+          and '--retention-policy needs --retention-policy-key' in out_nokey
+          and code_rule == EXIT_CANNOT_EVALUATE and code_witness == EXIT_COVERAGE_NOT_ESTABLISHED
+          and 'retention-policy-v1' in VERIFIER_CAPABILITIES and VERIFIER_VERSION == '0.19.0',
+          'the command line exits 0 with the policy checked or a revision not supplied and never says complete, 1 '
+          'for a forged policy, 2 for a policy with no key or an unknown rule, and 4 for a witness file whose only '
+          'head is retired; VERIFIER_CAPABILITIES advertises retention-policy-v1',
+          f'{code_ok} {code_missing} {code_forged} {code_nokey} {code_rule} {code_witness} {out_ok[-800:]} '
+          f'{out_witness[-800:]}')
+    return ok
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Meilynx Integrity Pack reproducer: independently verifies an audit chain read from a GCS '
@@ -20413,6 +21575,31 @@ def main():
         ),
     )
     parser.add_argument(
+        '--retention-policy',
+        action='append',
+        default=[],
+        metavar='PATH',
+        help=(
+            "A signed retention policy revision (retention_policy.v1) the pack's retirement receipts name, as a "
+            "file, or a directory whose .json files are each one. Repeat it to give several revisions. Each "
+            "revision's signature is checked under --retention-policy-key, the revisions against each other, and "
+            "every receipt against the revision it names: its digest, its retention when the receipt was sealed "
+            "and its holds. A policy that is unsigned, does not verify or does not allow a receipt fails (exit 1); "
+            "a receipt whose revision is not given reads as retired with that revision not supplied."
+        ),
+    )
+    parser.add_argument(
+        '--retention-policy-key',
+        action='append',
+        default=[],
+        metavar='FILE',
+        help=(
+            "The project's bundle signing key, which signs its retention policy (a P-256 JWK, bare or as the "
+            "console's identity bundle public key download serves it, or a PEM public key). It is not the "
+            "attestation key."
+        ),
+    )
+    parser.add_argument(
         '--receipt',
         metavar='FILE',
         help=(
@@ -20452,6 +21639,8 @@ def main():
         ok = witness_self_test() and ok
         ok = retirement_self_test() and ok
         ok = pack_source_self_test() and ok
+        ok = restored_backup_self_test() and ok
+        ok = retention_policy_self_test() and ok
         sys.exit(0 if ok else 1)
 
     if not (args.bucket or args.records or args.s3_bucket) or not args.manifest:
@@ -20484,6 +21673,20 @@ def main():
     except (OSError, ValueError, KeyError, TypeError, binascii.Error) as exc:
         parser.error(f"--witness-key must be a file holding the project's P-256 attestation key as a JWK ({exc})")
     witness_pins += [p for p in attestation_pins if p[1] not in {w[1] for w in witness_pins}]
+    if args.retention_policy and not args.retention_policy_key:
+        parser.error("--retention-policy needs --retention-policy-key: a retention policy counts only checked "
+                     "under the project's bundle signing key you pin")
+    if args.retention_policy_key and not args.retention_policy:
+        parser.error("--retention-policy-key needs --retention-policy")
+    try:
+        policy_keys = [load_policy_key(Path(k).read_text(encoding='utf-8')) for k in args.retention_policy_key]
+    except (OSError, ValueError, KeyError, TypeError, binascii.Error) as exc:
+        parser.error(f"--retention-policy-key must be a file holding the project's P-256 bundle signing key as a "
+                     f"JWK or PEM public key ({exc})")
+    try:
+        retention_policies = load_retention_policy_copies(args.retention_policy) if args.retention_policy else None
+    except (OSError, ValueError) as exc:
+        parser.error(f"--retention-policy: cannot read a signed retention policy ({exc})")
     supplied_acceptance = None
     if args.conditions_acceptance:
         try:
@@ -20551,7 +21754,8 @@ def main():
     source_status = check_source(manifest)
     # A stripped Exchange pack says so before the records and on
     # every verdict line, and is verified from its own records only.
-    label = evidence_class_suffix(manifest) + source_suffix(manifest) + content_suffix(manifest)
+    label = (evidence_class_suffix(manifest) + source_suffix(manifest) + restored_backup_suffix(manifest)
+             + content_suffix(manifest))
     for line in content_lines(manifest):
         print(line)
     stripped = frozenset(STRIPPED_FIELDS) if pack_is_stripped(manifest) else frozenset()
@@ -20670,6 +21874,7 @@ def main():
                                       stripped=stripped, cannot_evaluate_out=stripped_problems,
                                       stubs=manifest_stubs(manifest), chain_keys=evidence_keys.walk_keys(),
                                       signatures_out=signatures, retired_out=retired,
+                                      retention_policies=retention_policies, policy_keys=policy_keys,
                                       chain_keys_label=('the keys the attestations name'
                                                         if evidence_keys.mode == 'attested' else None))
         # The gateway evidence key: attestations, evidence-key seals, signed
@@ -20707,7 +21912,9 @@ def main():
                 print("NOTICE: --witness was not judged: the pack's records could not be evaluated")
             else:
                 witness_outcome = judge_witness(args.witness, manifest, pack_full_records, witness_pins,
-                                                tsa_roots.get, evidence_keys)
+                                                tsa_roots.get, evidence_keys, retired=retired)
+    # The backup and the restore test a restored-backup pack was read from.
+    restored_status = check_restored_backup(manifest, pack_full_records)
     count = len(manifest.get('events', []))
     # The verdict counts the hash-only stubs it linked through.
     stub_count = len(manifest_stubs(manifest))
@@ -20717,15 +21924,15 @@ def main():
     if retired:
         stubbed += (f"; {retired['records']} earlier record(s) retired under {retired['receipts']} sealed "
                     f"retirement(s) under policy revision {', '.join(map(str, retired['revisions']))} "
-                    f"(retired, policy not checked)")
+                    f"(retired, {retired_policy_phrase(retired.get('policy') or {})})")
     # The gateway evidence-key verdict (attestations, seals, signed heads)
     # combines with the chain's by the same precedence.
     witness_status = witness_outcome.status if witness_outcome is not None else (
         CANNOT_EVALUATE if args.witness else PASSED)
-    code = final_exit_code(combine_with_anchor_status(combine_with_anchor_status(
+    code = final_exit_code(combine_with_anchor_status(combine_with_anchor_status(combine_with_anchor_status(
         combine_with_anchor_status(combine_with_anchor_status(combine_with_anchor_status(chain_status, claim_status),
                                                               source_status), anchor_status),
-        evidence_status or PASSED), witness_status), signature_status, bool(args.allow_unsigned))
+        evidence_status or PASSED), witness_status), restored_status), signature_status, bool(args.allow_unsigned))
     # The OCSF export beside the pack. Its verdict
     # combines with the pack's by the same precedence (1 > 2 > 4 > 3 > 0).
     if args.ocsf_export:
@@ -20789,6 +21996,9 @@ def main():
         if source_status == FAILED:
             print(f"\nFAIL: the manifest's source section contradicts the manifest (see above).{label}",
                   file=sys.stderr)
+        if restored_status == FAILED:
+            print(f"\nFAIL: the restored backup's section contradicts the pack, or its restore test failed "
+                  f"(see above).{label}", file=sys.stderr)
         if signature_status == FAILED:
             print(f"\nFAIL: the manifest signature did not verify (see above).{label}", file=sys.stderr)
         if evidence_status == FAILED:
